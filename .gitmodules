@@ -1,0 +1,6 @@
+[submodule "mimalloc"]
+	path = mimalloc
+	url = https://github.com/microsoft/mimalloc
+[submodule "NBHM"]
+	path = NBHM
+	url = https://github.com/RealNeGate/NBHM

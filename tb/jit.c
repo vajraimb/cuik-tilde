@@ -1,0 +1,560 @@
+#include "tb_internal.h"
+#include "host.h"
+
+void* tb_jit_stack_create(size_t size);
+
+#ifdef EMSCRIPTEN
+void* tb_jit_wasm_obj(TB_Arena* arena, TB_Function* f) {
+    TB_Arena* arena = get_temporary_arena(m);
+    TB_ArenaSavepoint sp = tb_arena_save(arena);
+
+    // Construct type section (with the function and anything it references)
+    size_t func_type_count = 0;
+    size_t func_type_size  = 0;
+
+    DynArray(TB_FunctionOutput*) funcs = sections[i].funcs;
+    dyn_array_for(j, funcs) {
+        funcs[j]->wasm_type = func_type_count++;
+        TB_FunctionPrototype* proto = funcs[j]->parent->prototype;
+
+        func_type_size += 1;
+        func_type_size += len_uint(proto->param_count)  + proto->param_count;
+        func_type_size += len_uint(proto->return_count) + proto->return_count;
+    }
+
+    tb_arena_restore(arena, sp);
+    return NULL;
+}
+#else
+#include <setjmp.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <ucontext.h>
+#endif
+
+enum {
+    ALLOC_COOKIE = 0xBAADF00D,
+    ALLOC_GRANULARITY = 16,
+    STACK_SIZE = 2*1024*1024
+};
+
+typedef struct {
+    uint8_t* pos;
+
+    // when we insert a breakpoint, we're
+    // replacing some byte with an INT3 (at
+    // least on x86), we need to restore it
+    // before continuing execution.
+    uint8_t prev_byte;
+} TB_Breakpoint;
+
+typedef struct {
+    uint32_t cookie;
+    uint32_t size; // if low bit is set, we're in use.
+    char data[];
+} FreeList;
+
+// addr -> symbol
+typedef struct {
+    uint32_t k;
+    void* v;
+} Tag;
+
+struct TB_JIT {
+    size_t capacity;
+    mtx_t lock;
+    NL_Strmap(void*) loaded_funcs;
+
+    DynArray(TB_Breakpoint) breakpoints;
+    DynArray(Tag) tags;
+
+    // PC -> safepoint
+    NL_Table safepoints;
+
+    FreeList heap;
+};
+
+static const char* prot_names[] = {
+    "RO", "RW", "RX", "RXW",
+};
+
+void tb_jit_tag_object(TB_JIT* jit, void* ptr, void* tag) {
+    assert(tag);
+    uint32_t offset = (char*) ptr - (char*) jit;
+
+    size_t i = 0, count = dyn_array_length(jit->tags);
+    for (; i < count; i++) {
+        if (offset < jit->tags[i].k) break;
+    }
+
+    // we know where to insert
+    dyn_array_put_uninit(jit->tags, 1);
+    memmove(&jit->tags[i + 1], &jit->tags[i], (count - i) * sizeof(Tag));
+    jit->tags[i] = (Tag){ offset, tag };
+}
+
+void* tb_jit_resolve_addr(TB_JIT* jit, void* ptr, uint32_t* out_offset) {
+    mtx_lock(&jit->lock);
+    ptrdiff_t offset = (char*) ptr - (char*) jit;
+    if (offset < 0 || offset >= jit->capacity) goto bad;
+
+    size_t left = 0;
+    size_t right = dyn_array_length(jit->tags);
+    if (right == 0) goto bad;
+
+    Tag* tags = jit->tags;
+    while (left < right) {
+        size_t middle = (left + right) / 2;
+        if (tags[middle].k > offset) {
+            right = middle;
+        } else {
+            left = middle + 1;
+        }
+    }
+
+    size_t i = right - 1;
+    *out_offset = offset - tags[i].k;
+    return tags[i].v;
+
+    bad:
+    mtx_unlock(&jit->lock);
+    return NULL;
+}
+
+void* tb_jit_alloc_obj(TB_JIT* jit, size_t size, size_t align) {
+    mtx_lock(&jit->lock);
+    size = (size + ALLOC_GRANULARITY - 1) & ~(ALLOC_GRANULARITY - 1);
+
+    FreeList* l = &jit->heap;
+    FreeList* end = (FreeList*) ((char*) jit + jit->capacity);
+    for (;;) {
+        assert(l->cookie == ALLOC_COOKIE);
+
+        // free slot, let's see if it's big enough
+        if ((l->size & 1) == 0 && (l->size >> 1) >= size) {
+            // if the node is bigger than one alloc, we need to split it
+            size_t whole_size = l->size >> 1;
+            size_t split_size = sizeof(FreeList) + size;
+            if (whole_size > split_size) {
+                // split
+                l->size = (size << 1) | 1;
+
+                // free leftovers
+                FreeList* rest = (FreeList*) &l->data[l->size >> 1];
+                rest->cookie = ALLOC_COOKIE;
+                rest->size = (whole_size - split_size) << 1;
+            } else {
+                // take entire piece
+                l->size |= 1;
+            }
+
+            mtx_unlock(&jit->lock);
+            return l->data;
+        }
+
+        FreeList* next = (FreeList*) &l->data[l->size >> 1];
+        if (next == end) {
+            break;
+        }
+
+        // coalesce free regions when we see them here, it'll
+        // make later walks faster
+        while ((l->size & 1) == 0 && (next->size & 1) == 0) {
+            size_t new_size = (l->size >> 1) + sizeof(FreeList) + (next->size >> 1);
+            l->size = (new_size << 1);
+
+            next = (FreeList*) &l->data[new_size];
+        }
+
+        l = next;
+    }
+
+    mtx_unlock(&jit->lock);
+    return NULL;
+}
+
+void tb_jit_free_obj(TB_JIT* jit, void* ptr) {
+    FreeList* obj = ((FreeList*) ptr) - 1;
+    assert(obj->cookie == ALLOC_COOKIE);
+    obj->size &= ~1;
+}
+
+void tb_jit_dump_heap(TB_JIT* jit) {
+    mtx_lock(&jit->lock);
+
+    FreeList* l = &jit->heap;
+    FreeList* next;
+    FreeList* end = (FreeList*) ((char*) jit + jit->capacity);
+
+    printf("HEAP:\n");
+    size_t tag = 0, tag_count = dyn_array_length(jit->tags);
+    char* base = (char*) jit;
+    for (;;) {
+        if (l->size & 1) {
+            printf("* ALLOC [%p %u", l->data, l->size >> 1);
+
+            // found the next tag here
+            if (tag < tag_count && l->data == &base[jit->tags[tag].k]) {
+                printf(" TAG=%p", jit->tags[tag].v);
+                tag += 1;
+            }
+
+            printf("]\n");
+        }
+
+        next = (FreeList*) &l->data[l->size >> 1];
+        if (next == end) {
+            break;
+        }
+        l = next;
+    }
+    mtx_unlock(&jit->lock);
+}
+
+static void* get_proc(TB_JIT* jit, const char* name) {
+    #ifdef _WIN32
+    static HMODULE kernel32, user32, gdi32, opengl32, msvcrt;
+    if (user32 == NULL) {
+        kernel32 = LoadLibrary("kernel32.dll");
+        user32   = LoadLibrary("user32.dll");
+        gdi32    = LoadLibrary("gdi32.dll");
+        opengl32 = LoadLibrary("opengl32.dll");
+        msvcrt   = LoadLibrary("msvcrt.dll");
+    }
+
+    // check cache first
+    ptrdiff_t search = nl_map_get_cstr(jit->loaded_funcs, name);
+    if (search >= 0) return jit->loaded_funcs[search].v;
+
+    void* addr = GetProcAddress(NULL, name);
+    if (addr == NULL) addr = GetProcAddress(kernel32, name);
+    if (addr == NULL) addr = GetProcAddress(user32, name);
+    if (addr == NULL) addr = GetProcAddress(gdi32, name);
+    if (addr == NULL) addr = GetProcAddress(opengl32, name);
+    if (addr == NULL) addr = GetProcAddress(msvcrt, name);
+
+    // printf("JIT: loaded %s (%p)\n", name, addr);
+    nl_map_put_cstr(jit->loaded_funcs, name, addr);
+    return addr;
+    #else
+    return NULL;
+    #endif
+}
+
+static void* get_symbol_address(const TB_Symbol* s) {
+    if (s->tag == TB_SYMBOL_GLOBAL) {
+        return ((TB_Global*) s)->address;
+    } else if (s->tag == TB_SYMBOL_FUNCTION) {
+        return ((TB_Function*) s)->compiled_pos;
+    } else {
+        tb_todo();
+    }
+}
+
+void* tb_jit_place_function(TB_JIT* jit, TB_Function* f) {
+    TB_FunctionOutput* func_out = f->output;
+    if (f->compiled_pos != NULL) {
+        return f->compiled_pos;
+    }
+
+    // copy machine code
+    char* dst = tb_jit_alloc_obj(jit, func_out->code_size, 16);
+    memcpy(dst, func_out->code, func_out->code_size);
+    f->compiled_pos = dst;
+
+    log_debug("jit: apply function %s (%p)", f->super.name, dst);
+
+    if (func_out->safepoints) {
+        mtx_lock(&jit->lock);
+        aarray_for(i, func_out->safepoints) {
+            void* pc = dst + func_out->safepoints[i]->ip;
+            nl_table_put(&jit->safepoints, (void*) pc, func_out->safepoints[i]);
+        }
+        mtx_unlock(&jit->lock);
+    }
+
+    // apply relocations, any leftovers are mapped to thunks
+    for (TB_SymbolPatch* p = func_out->first_patch; p; p = p->next) {
+        size_t actual_pos = p->pos;
+        TB_SymbolTag tag = p->target->tag;
+
+        int32_t* patch = (int32_t*) &dst[actual_pos];
+        if (tag == TB_SYMBOL_FUNCTION) {
+            TB_Function* f = (TB_Function*) p->target;
+            void* addr = tb_jit_place_function(jit, f);
+
+            int32_t rel32 = (intptr_t)addr - ((intptr_t)patch + 4);
+            *patch += rel32;
+        } else if (tag == TB_SYMBOL_EXTERNAL) {
+            TB_External* e = (TB_External*) p->target;
+
+            void* addr = e->thunk ? e->thunk : p->target->address;
+            if (addr == NULL) {
+                addr = get_proc(jit, p->target->name);
+                if (addr == NULL) {
+                    tb_panic("Could not find procedure: %s", p->target->name);
+                }
+            }
+
+            ptrdiff_t rel = (intptr_t)addr - ((intptr_t)patch + 4);
+            int32_t rel32 = rel;
+            if (rel == rel32) {
+                memcpy(dst + actual_pos, &rel32, sizeof(int32_t));
+            } else {
+                // generate thunk to make far call
+                char* thunk = tb_jit_alloc_obj(jit, 6 + sizeof(void*), 1);
+                thunk[0] = 0xFF; // jmp qword [rip]
+                thunk[1] = 0x25;
+                thunk[2] = 0x00;
+                thunk[3] = 0x00;
+                thunk[4] = 0x00;
+                thunk[5] = 0x00;
+
+                // write final address into the thunk
+                memcpy(thunk + 6, &addr, sizeof(void*));
+                e->thunk = thunk;
+
+                int32_t rel32 = (intptr_t)thunk - ((intptr_t)patch + 4);
+                *patch += rel32;
+            }
+        } else if (tag == TB_SYMBOL_GLOBAL) {
+            TB_Global* g = (TB_Global*) p->target;
+            void* addr = tb_jit_place_global(jit, g);
+
+            int32_t* patch = (int32_t*) &dst[actual_pos];
+            int32_t rel32 = (intptr_t)addr - ((intptr_t)patch + 4);
+            *patch += rel32;
+        } else {
+            tb_todo();
+        }
+    }
+
+    return dst;
+}
+
+void* tb_jit_place_global(TB_JIT* jit, TB_Global* g) {
+    if (g->address != NULL) {
+        return g->address;
+    }
+
+    char* data = tb_jit_alloc_obj(jit, g->size, g->align);
+    g->address = data;
+
+    log_debug("jit: apply global %s (%p)", g->super.name ? g->super.name : "<unnamed>", data);
+
+    memset(data, 0, g->size);
+    FOR_N(k, 0, g->obj_count) {
+        if (g->objects[k].type == TB_INIT_OBJ_REGION) {
+            memcpy(&data[g->objects[k].offset], g->objects[k].region.ptr, g->objects[k].region.size);
+        }
+    }
+
+    FOR_N(k, 0, g->obj_count) {
+        if (g->objects[k].type == TB_INIT_OBJ_RELOC) {
+            uintptr_t addr = (uintptr_t) get_symbol_address(g->objects[k].reloc);
+
+            uintptr_t* dst = (uintptr_t*) &data[g->objects[k].offset];
+            *dst += addr;
+        }
+    }
+
+    return data;
+}
+
+TB_JIT* tb_jit_begin(TB_Module* m, size_t jit_heap_capacity) {
+    if (jit_heap_capacity == 0) {
+        jit_heap_capacity = 2*1024*1024;
+    }
+
+    TB_JIT* jit = tb_platform_valloc(jit_heap_capacity);
+    mtx_init(&jit->lock, mtx_plain);
+    jit->capacity = jit_heap_capacity;
+    jit->heap.cookie = ALLOC_COOKIE;
+    jit->heap.size = (jit_heap_capacity - sizeof(TB_JIT)) << 1;
+    jit->safepoints = nl_table_alloc(32);
+
+    // a lil unsafe... im sorry momma
+    tb_platform_vprotect(jit, jit_heap_capacity, TB_PAGE_RXW);
+    return jit;
+}
+
+void tb_jit_end(TB_JIT* jit) {
+    mtx_destroy(&jit->lock);
+    tb_platform_vfree(jit, jit->capacity);
+}
+
+void* tb_jit_get_code_ptr(TB_Function* f) {
+    return f->compiled_pos;
+}
+
+////////////////////////////////
+// Debugger
+////////////////////////////////
+#ifdef CUIK__IS_X64
+struct TB_Stacklet {
+    // used for stack locking mechanism
+    void* pc;
+    void* sp;
+
+    // if you have segmented stacks
+    TB_Stacklet* prev;
+    uint32_t ud_size, limit;
+
+    TB_JIT* jit;
+    void* except;
+
+    char user_data[];
+};
+
+typedef struct {
+    // win64: rcx rdx r8  r9
+    // sysv:  rdi rsi rdx rcx r8 r9
+    uint64_t gprs[6];
+} X64Params;
+
+typedef uint64_t (*JIT_Trampoline)(void* sp, void* pc, X64Params* params, TB_Stacklet* stack);
+
+// win64/sysv trampoline ( sp pc params ctx -- rax )
+#ifdef _WIN32
+__declspec(allocate(".text")) __declspec(align(16))
+#else
+__attribute__((section (".text")))
+#endif
+static const uint8_t tb_jit__trampoline[] = {
+    #if _WIN32
+    0x48, 0x87, 0xCC,           // xchg rsp, rcx
+    0x51,                       // push rdi
+    // shuffle some params into win64 volatile regs
+    0x48, 0x89, 0xD0,           // mov rax, rdx
+    0x4D, 0x89, 0xC2,           // mov r10, r8
+    // fill GPR params
+    0x49, 0x8B, 0x4A, 0x00,     // mov rcx, [r10 + 0x00]
+    0x49, 0x8B, 0x52, 0x08,     // mov rdx, [r10 + 0x08]
+    0x4D, 0x8B, 0x42, 0x10,     // mov r8,  [r10 + 0x10]
+    0x4D, 0x8B, 0x4A, 0x18,     // mov r9,  [r10 + 0x18]
+    #else
+    // use new SP and save old SP
+    0x48, 0x87, 0xFC,           // xchg rsp, rdi
+    0x56,                       // push rdi
+    // shuffle some params into sysv volatile regs
+    0x48, 0x89, 0xF0,           // mov rax, rsi
+    0x49, 0x89, 0xD2,           // mov r10, rdx
+    // fill GPR params
+    0x49, 0x8B, 0x3A,           // mov rdi, [r10 + 0x00]
+    0x49, 0x8B, 0x72, 0x08,     // mov rsi, [r10 + 0x08]
+    0x49, 0x8B, 0x52, 0x10,     // mov rdx, [r10 + 0x10]
+    0x49, 0x8B, 0x4A, 0x18,     // mov rcx, [r10 + 0x18]
+    0x4D, 0x8B, 0x42, 0x20,     // mov r8,  [r10 + 0x20]
+    0x4D, 0x8B, 0x4A, 0x28,     // mov r9,  [r10 + 0x28]
+    #endif
+    0xFF, 0xD0,                 // call rax
+    // restore stack & return normally
+    0x5C,                       // pop rsp
+    0xC3,                       // ret
+};
+
+_Static_assert(sizeof(TB_Stacklet) <= 0x40, "TODO? tb_jit_thread_userdata");
+size_t tb_jit_thread_userdata(void) { return 0x40; }
+
+TB_Safepoint* tb_jit_get_safepoint(TB_JIT* jit, void* pc) {
+    mtx_lock(&jit->lock);
+    TB_Safepoint* sp = nl_table_get(&jit->safepoints, pc);
+    mtx_unlock(&jit->lock);
+    return sp;
+}
+
+#ifdef _WIN32
+static _Thread_local TB_Stacklet* active_stack;
+static LONG except_handler(EXCEPTION_POINTERS* e) {
+    TB_Stacklet* cpu = active_stack;
+    switch (e->ExceptionRecord->ExceptionCode) {
+        case EXCEPTION_ACCESS_VIOLATION: {
+            void* accessed = (void*) e->ExceptionRecord->ExceptionInformation[1];
+            void* pc = (void*) e->ContextRecord->Rip;
+
+            printf("FAULTING @ %p (ACCESS %p)\n", pc, accessed);
+
+            mtx_lock(&cpu->jit->lock);
+            TB_Safepoint* sp = nl_table_get(&cpu->jit->safepoints, pc);
+            mtx_unlock(&cpu->jit->lock);
+
+            if (sp) {
+                // continue at this new safepoint
+                // e->ContextRecord->Rip += sp->target - sp->ip;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            break;
+        }
+
+        default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
+TB_Stacklet* tb_jit_thread_create(TB_JIT* jit, size_t ud_size, size_t limit) {
+    TB_Stacklet* stack = tb_platform_valloc(limit*2);
+    uintptr_t addr = (uintptr_t) stack;
+    stack = (TB_Stacklet*) ((addr + limit - 1) & -limit);
+
+    stack->ud_size = ud_size;
+    stack->limit = limit;
+    stack->jit = jit;
+    return stack;
+}
+
+void tb_jit_thread_init(TB_JIT* jit, TB_Stacklet* stack, size_t ud_size, size_t limit) {
+    stack->ud_size = ud_size;
+    stack->limit = limit;
+    stack->jit = jit;
+}
+
+void tb_jit_breakpoint(TB_JIT* jit, void* addr) {
+    TB_Breakpoint bp = { addr };
+    dyn_array_for(i, jit->breakpoints) {
+        if (jit->breakpoints[i].pos == addr) {
+            return;
+        }
+    }
+
+    dyn_array_put(jit->breakpoints, bp);
+}
+
+bool tb_jit_thread_call(TB_Stacklet* stack, void* pc, uint64_t* ret, size_t arg_count, void** args) {
+    // continue in JITted code
+    X64Params params;
+
+    #ifdef _WIN32
+    enum { ABI_GPR_COUNT = 4 };
+    #else
+    enum { ABI_GPR_COUNT = 6 };
+    #endif
+
+    size_t i = 0;
+    for (; i < arg_count && i < ABI_GPR_COUNT; i++) {
+        memcpy(&params.gprs[i], &args[i], sizeof(uint64_t));
+    }
+
+    size_t stack_usage = 8 + align_up((arg_count > 0 && arg_count < 4 ? 4 : arg_count) * 8, 16);
+
+    // go to stack top (minus whatever alloc'd param space)
+    uint8_t* sp = ((uint8_t*) stack) + (stack->limit - stack_usage);
+
+    // fill param slots
+    for (; i < arg_count; i++) {
+        memcpy(&sp[i*8], &args[i], sizeof(uint64_t));
+    }
+
+    uint64_t r = ((JIT_Trampoline)tb_jit__trampoline)(sp, pc, &params, stack);
+    if (ret) { *ret = r; }
+    return true;
+}
+#endif // CUIK__IS_X64
+#endif // EMSCRIPTEN
+
+
