@@ -124,7 +124,11 @@ static TB_DataType reg_class_to_tb(TB_ABI abi, RegClass rg, TB_DebugType* type) 
                 case 2:  return TB_TYPE_I16;
                 case 4:  return TB_TYPE_I32;
                 case 8:  return TB_TYPE_I64;
-                default: TB_ASSERT(0); return TB_TYPE_VOID;
+                default: {
+                    fprintf(stderr, "[tb] reg_class_to_tb: RG_INTEGER with bad size %d (type tag %d)\n", debug_type_size(abi, type), type->tag);
+                    fflush(stderr);
+                    TB_ASSERT(0); return TB_TYPE_VOID;
+                }
             }
         }
 

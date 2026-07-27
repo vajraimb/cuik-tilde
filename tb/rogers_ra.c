@@ -163,7 +163,15 @@ static double rogers_get_spill_cost(Ctx* restrict ctx, Rogers* restrict ra, VReg
     }
 
     // printf("spill_cost(%zu) = %f\n", vreg - ctx->vregs, vreg->spill_cost / vreg->area);
-    return vreg->spill_cost - vreg->area*0.2;
+    double score = vreg->spill_cost - vreg->area*0.2;
+    // PATCH(odin-tilde): penalize repeatedly-split vregs so choose_best_spill
+    // stops evicting the same pinned reload/copy lineage forever (evicting it
+    // just recreates it on the same conflict point) and picks a vreg whose
+    // split actually makes progress instead.
+    if (vreg->was_spilled >= 2) {
+        score += 1e6;
+    }
+    return score;
 }
 
 static void rogers_print_vreg(Ctx* restrict ctx, Rogers* restrict ra, VReg* vreg) {
@@ -591,7 +599,8 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                         printf("\n  ^^^^^  this node has no vreg even though it's used by %%%u[%zu] in BB%zu:\n  ", n->gvn, k, i);
                         tb_print_dumb_node(NULL, n);
                         printf("\n");
-                        tb_integrated_dbg(f, n);
+                        fflush(stdout);
+                        abort(); // PATCH(odin-tilde): was tb_integrated_dbg(f, n); which hangs on stdin
                     }
                     #endif
 
@@ -702,12 +711,17 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                         TB_OPTDEBUG(REGALLOC)(printf("CISC OP %%%u (-> %%%u) has conflict\n", n->gvn, in->gvn));
 
                         TB_Node* copy = rogers_hard_split(ctx, &ra, n, in, in_mask, vreg_id);
-                        // any other inputs which use the original edge could use the copy for simplicity
-                        FOR_N(k, 0, n->input_count) {
-                            if (n->inputs[k] == in) {
-                                set_input(f, n, copy, k);
-                            }
-                        }
+                        // PATCH(odin-tilde): only rewire the shared 2addr edge.
+                        // Upstream rewired every input equal to `in` "for
+                        // simplicity", but when the same node also feeds
+                        // another operand with a tighter constraint (e.g.
+                        // `shl x, x` where the amount input is pinned to
+                        // RCX), that use was moved onto the fresh copy whose
+                        // vreg never had the RCX pin met into it (the
+                        // legalizing-moves pass already ran), so the group
+                        // could be assigned a register that violates the
+                        // pin and the emitter would assert on shl-by-non-CL.
+                        set_input(f, n, copy, shared_edge);
                         tb__insert_before(ctx, ctx->f, copy, n);
 
                         if (in->user_count == 0) {
@@ -1011,6 +1025,7 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
         }
 
         // printf("  %zu\n", dyn_array_length(ra.splits));
+
 
         size_t num_spills = dyn_array_length(ra.splits);
         if (num_spills) {
@@ -1379,6 +1394,23 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
 
     if (sparse_set_test(&ra->future_active[def_class], n->gvn)) {
         // we're done with some lifetime hole, time to lock in
+        //
+        // TILDE FIX: split insertion between rounds can extend an interval
+        // (e.g. remat/coalesce rewiring) while keeping its old assignment,
+        // so a sleeping node's reserved register may now be held by a live
+        // node of a different vreg. Instead of asserting in mark_active,
+        // evict the current holder and force its vreg to be split around
+        // this region on the next round.
+        if (vreg->assigned >= 0 && vreg->class > 0 && vreg->class < ctx->num_classes) {
+            int old = ra->active[vreg->class][vreg->assigned];
+            if (old != 0 && old != n->gvn && ctx->vreg_map[old] != vreg_id) {
+                int old_vreg = ctx->vreg_map[old];
+                TB_ASSERT(!set_get(&ra->been_spilled, old_vreg));
+                evict_vreg(ctx, ra, def_class, old_vreg);
+                SplitDecision s = { .target = old_vreg };
+                dyn_array_put(ra->splits, s);
+            }
+        }
         wake_up_node(ctx, ra, def_class, n->gvn);
         return true;
     }
@@ -1810,6 +1842,7 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
 
     size_t uf_len = ctx->f->node_count;
     FOR_REV_N(bb_id, 0, ctx->bb_count) {
+        ra->where_bb = bb_id;
         TB_BasicBlock* bb = &ctx->cfg.blocks[bb_id];
         Set* live_in      = &bb->live_in;
         Set* live_out     = &bb->live_out;
@@ -2039,7 +2072,10 @@ static void rogers_remat(Ctx* ctx, Rogers* ra, TB_Node* n, bool kill_node) {
 
         VReg* reload_vreg;
         TB_Node* remat = NULL;
-        if (use_n->type == TB_MACH_COPY && src_mask) {
+        // PATCH(odin-tilde): the hard-split path in tb__rogers calls remat
+        // before ra->uf is allocated; without a union-find there are no
+        // coalesced groups, so the copy-fusion branch cannot apply.
+        if (ra->uf != NULL && use_n->type == TB_MACH_COPY && src_mask) {
             TB_NodeMachCopy* cpy = TB_NODE_GET_EXTRA(use_n);
             if (!reg_mask_is_stack(cpy->def) || !reg_mask_is_stack(src_mask)) {
                 // gotta be in separate coalesced groups

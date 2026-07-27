@@ -102,7 +102,10 @@ struct VReg {
     // BRIGGS: when coalesced this number will go up
     int uses;
 
-    int  was_spilled : 2;
+    // PATCH(odin-tilde): was "int was_spilled : 2" (signed, range -2..1) —
+    // the counter wrapped 1->-2 and the "was_spilled == 2" anti-loop penalty
+    // in get_spill_cost could never fire. Widen so repeat-spill detection works.
+    int  was_spilled : 4;
     bool was_reload  : 1;
 };
 
@@ -348,7 +351,9 @@ static double get_spill_cost(Ctx* restrict ctx, VReg* vreg) {
     }
 
     double score = vreg->spill_cost / vreg->area;
-    if (vreg->was_spilled == 2) {
+    // PATCH(odin-tilde): was "== 2" but the counter now saturates at 3,
+    // so compare >= 2 or the anti-loop penalty never fires.
+    if (vreg->was_spilled >= 2) {
         score += 1e6;
     }
 

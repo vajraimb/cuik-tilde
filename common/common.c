@@ -342,11 +342,15 @@ void futex_wait(Futex* addr, int64_t val) {
 
 #include <errno.h>
 
-enum {
-    UL_COMPARE_AND_WAIT = 0x00000001,
-    ULF_WAKE_ALL        = 0x00000100,
-    ULF_NO_ERRNO        = 0x01000000
-};
+#ifndef UL_COMPARE_AND_WAIT
+#define UL_COMPARE_AND_WAIT 0x00000001
+#endif
+#ifndef ULF_WAKE_ALL
+#define ULF_WAKE_ALL        0x00000100
+#endif
+#ifndef ULF_NO_ERRNO
+#define ULF_NO_ERRNO        0x01000000
+#endif
 
 /* timeout is specified in microseconds */
 int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout);
@@ -370,23 +374,8 @@ void futex_signal(Futex* addr) {
     }
 }
 
-void _tpool_broadcast(Futex* addr) {
-    for (;;) {
-        int ret = __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO | ULF_WAKE_ALL, addr, 0);
-        if (ret >= 0) {
-            return;
-        }
-        ret = -ret;
-        if (ret == EINTR || ret == EFAULT) {
-            continue;
-        }
-        if (ret == ENOENT) {
-            return;
-        }
-        printf("futex wake fail?\n");
-        __builtin_trap();
-    }
-}
+// NOTE(macos-fix): _tpool_broadcast removed here — pool.c's __APPLE__ branch
+// already defines _tpool_broadcast(TPool_Futex*) and nothing else calls this one.
 
 void futex_wait(Futex* addr, int32_t val) {
     for (;;) {
@@ -406,6 +395,27 @@ void futex_wait(Futex* addr, int32_t val) {
         }
 
         printf("futex wait fail?\n");
+    }
+}
+
+// NOTE(macos-fix): futex_broadcast was missing from the __APPLE__ branch;
+// implemented via __ulock_wake(ULF_WAKE_ALL). futex_wait_eq already exists
+// in the shared tail below.
+void futex_broadcast(Futex* addr) {
+    for (;;) {
+        int ret = __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO | ULF_WAKE_ALL, addr, 0);
+        if (ret >= 0) {
+            return;
+        }
+        ret = -ret;
+        if (ret == EINTR || ret == EFAULT) {
+            continue;
+        }
+        if (ret == ENOENT) {
+            return;
+        }
+        printf("futex wake fail?\n");
+        __builtin_trap();
     }
 }
 

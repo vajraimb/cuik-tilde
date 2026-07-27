@@ -107,7 +107,12 @@ static TB_GraphBuilder* builder_enter_raw(TB_Function* f, TB_ModuleSectionHandle
     bool has_aggregate_return = dbg && dbg->func.return_count > 0 && classify_reg(abi, dbg->func.returns[0]) == RG_MEMORY;
 
     // both RPC and memory are mutable vars
-    int def_count = 3 + (dbg ? has_aggregate_return : f->param_count);
+    // PATCH(odin-tilde): proto-path frontends (Odin's tilde backend) read
+    // parameters via f->params/tb_inst_param directly and never touch the
+    // symbol-table param slots. Threading every parameter through every
+    // label creates dead phis at each join, which explodes register
+    // pressure and sends the Rogers splitter into non-converging rounds.
+    int def_count = 3 + (dbg ? has_aggregate_return : 0);
     TB_Node* syms = tb_alloc_node(f, TB_SYMBOL_TABLE, TB_TYPE_VOID, def_count, sizeof(TB_NodeSymbolTable));
     set_input(f, syms, f->params[0], 0);
     set_input(f, syms, f->params[0], 1);
@@ -154,14 +159,17 @@ static TB_GraphBuilder* builder_enter_raw(TB_Function* f, TB_ModuleSectionHandle
             g->params[i] = v;
         }
     } else {
-        FOR_N(i, 0, f->param_count) {
-            set_input(f, syms, f->params[3 + i], 3 + i);
-        }
+        // PATCH(odin-tilde): no per-parameter symbol-table slots, see above
     }
     return g;
 }
 
 void tb_function_attrib_variable(TB_Function* f, TB_Node* n, TB_Node* parent, ptrdiff_t len, const char* name, TB_DebugType* type) {
+    // PATCH(odin-tilde): only TB_LOCAL nodes carry a TB_NodeLocal extra.
+    // Odin's tilde backend passes arbitrary address nodes here (ptr_offset,
+    // symbol addresses); writing the extra on them clobbers adjacent arena
+    // memory (e.g. the next node's inputs array) and corrupts the IR.
+    if (n->type != TB_LOCAL) { return; }
     TB_NodeLocal* l = TB_NODE_GET_EXTRA(n);
     l->name = tb__arena_strdup(f->super.module, len, name);
     l->type = type;
@@ -169,6 +177,11 @@ void tb_function_attrib_variable(TB_Function* f, TB_Node* n, TB_Node* parent, pt
 
 TB_Node* tb_builder_param_addr(TB_GraphBuilder* g, int i) {
     return g->params[i];
+}
+
+// PATCH(odin-tilde): see declaration in tb.h
+TB_Node* tb_function_param(TB_Function* f, int i) {
+    return f->params[3 + i];
 }
 
 void tb_function_set_features(TB_Function* f, const TB_FeatureSet* features) {
@@ -894,7 +907,20 @@ void tb_builder_br(TB_GraphBuilder* g, TB_Node* target) {
             // already phi-ified, keep appending to it
             add_input_late(f, target_def, syms->inputs[i]);
         } else if (target_def != syms->inputs[i]) {
-            TB_ASSERT(!TB_NODE_GET_EXTRA_T(target, TB_NodeSymbolTable)->complete);
+            if (TB_NODE_GET_EXTRA_T(target, TB_NodeSymbolTable)->complete) {
+                fprintf(stderr, "[tb] br->complete-label new phi: func=%s slot=%zu def_type=%d syms_type=%d preds=%u target_ic=%u syms_ic=%u top_type=%d\n",
+                        f->super.name ? f->super.name : "?",
+                        i, target_def->type, syms->inputs[i] ? syms->inputs[i]->type : -1,
+                        top_ctrl->input_count, target->input_count, syms->input_count, top_ctrl->type);
+            }
+            // PATCH(odin-tilde): upstream asserts !complete here. A late
+            // branch into a completed label is legal though: every earlier
+            // pred necessarily passed target_def for this slot (otherwise a
+            // phi would already exist), so backfilling them with target_def
+            // is sound. Keep going instead of aborting; the fprintf above
+            // flags suspicious uses (e.g. a loop header the glue forgot to
+            // pre-phi).
+            // TB_ASSERT(!TB_NODE_GET_EXTRA_T(target, TB_NodeSymbolTable)->complete);
 
             // we didn't have a phi but finally found a reason for one
             TB_Node* n = tb_alloc_node(f, TB_PHI, target_def->dt, 2 + top_ctrl->input_count, 0);

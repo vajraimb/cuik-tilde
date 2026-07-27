@@ -385,17 +385,27 @@ static uint64_t update_phi_edges(Ctx* ctx, Rogers* ra, RegSplitter* splitter, ui
         if (backedge) {
             // we know there's a phi so there's no need for the rest of this goop
             if (bb_phis[k]) {
-                set_input(f, bb_phis[k], pred_def, 1+pred_path);
+                // PATCH(odin-tilde): pred_def can be NULL when slot k has no
+                // split def on this edge (the phi-input use itself sets the
+                // live_out bit); keep the program-specified input instead of
+                // writing NULL into the phi
+                if (pred_def != NULL) {
+                    set_input(f, bb_phis[k], pred_def, 1+pred_path);
+                }
             }
         } else {
             if (bb_defs[k] == NULL) {
                 bb_defs[k] = pred_def;
             } else if (bb_defs[k]->type == TB_PHI && bb_defs[k]->inputs[0] == header) {
-                if (bb_defs[k]->dt.type == TB_TAG_VOID) {
+                if (pred_def != NULL && bb_defs[k]->dt.type == TB_TAG_VOID) {
                     // just in case...
                     bb_defs[k]->dt = pred_def->dt;
                 }
-                set_input(f, bb_defs[k], pred_def, 1+pred_path);
+                // PATCH(odin-tilde): see above — never write NULL over the
+                // phi's existing edge value
+                if (pred_def != NULL) {
+                    set_input(f, bb_defs[k], pred_def, 1+pred_path);
+                }
             } else if (bb_defs[k] != pred_def) {
                 if ((splitter->remat_all >> k) & 1) {
                     // this value is single-def, there's no variants of it so no phis
@@ -573,7 +583,15 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
         if (cnt == 1) {
             splitter.single_def |= 1ull << spill_i;
-            if (can_remat(ctx, arr[0])) {
+            // PATCH(odin-tilde): only remat on the FIRST split of a vreg.
+            // Remat-ing a node that's pinned to a fixed register (e.g. an
+            // ICONST/MACH_COPY forced into RCX for rep-movs/call args)
+            // recreates an identical node on the exact same conflict point
+            // every round and the RA never converges (HRP regions that would
+            // split the occupant are written but never read in this version).
+            // On repeat splits, fall through to the normal spill path so the
+            // value actually leaves the pinned register for a stack slot.
+            if (can_remat(ctx, arr[0]) && splitter.was_spilled[spill_i] == 0) {
                 splitter.remat_all |= 1ull << spill_i;
             }
 
@@ -919,6 +937,9 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
                     vvv++;
                     TB_Node* def = bb_defs[spill];
+                    if (def == NULL) { // PATCH(odin-tilde): no split def reaches this use; keep the original input
+                        continue;
+                    }
                     if ((W >> spill) & 1) {
                         // the reload mask might not overlap with the use mask if we clobbered
                         // a reg and realized we couldn't maintain the old mask, this might force a copy right before the
@@ -1061,8 +1082,43 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                             should_spill_immediately = false;
                             delay_spill |= 1ull << spill;
                         } else if (has_immediate_use(bb->items[t], n)) {
-                            should_spill_immediately = false;
-                            delay_spill |= 1ull << spill;
+                            // don't delay the spill past a use which clobbers the
+                            // registers this value might be sitting in (e.g. a call
+                            // whose arg copy is pinned to a caller-saved register).
+                            // The value is dead right after such a use, so a
+                            // spill-store placed after it reads garbage and the RA
+                            // would keep re-splitting the same range forever.
+                            RegMask* def_rm = NULL;
+                            if (n->type == TB_MACH_COPY) {
+                                def_rm = TB_NODE_GET_EXTRA_T(n, TB_NodeMachCopy)->def;
+                            } else if (ctx->constraint) {
+                                def_rm = ctx->constraint(ctx, n, NULL);
+                            }
+
+                            bool use_clobbers = false;
+                            if (def_rm != NULL) {
+                                RegMask** kills = ctx->ins;
+                                int kill_count = ctx->constraint_kill(ctx, bb->items[t], kills);
+                                FOR_N(kk, 0, kill_count) {
+                                    if (kills[kk]->class != def_rm->class) {
+                                        continue;
+                                    }
+                                    FOR_N(w, 0, def_rm->count) {
+                                        if (w < kills[kk]->count && (kills[kk]->mask[w] & def_rm->mask[w])) {
+                                            use_clobbers = true;
+                                            break;
+                                        }
+                                    }
+                                    if (use_clobbers) {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (!use_clobbers) {
+                                should_spill_immediately = false;
+                                delay_spill |= 1ull << spill;
+                            }
                         }
                     }
 
@@ -1201,6 +1257,24 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
         int post_split = 0;
         FOR_N(j, 1, n->input_count) {
+            if (n->inputs[j] == NULL) { // PATCH(odin-tilde): diagnose NULL phi input
+                fprintf(stderr, "[ra_split] NULL phi input: func=%s phi=%%%u slot=%zu input_count=%u region=%%%u region_type=%d region_ic=%u spill=%d\n",
+                        ctx->f->super.name ? ctx->f->super.name : "?",
+                        n->gvn, j, n->input_count,
+                        n->inputs[0] ? n->inputs[0]->gvn : 0,
+                        n->inputs[0] ? n->inputs[0]->type : -1,
+                        n->inputs[0] ? n->inputs[0]->input_count : 9999u,
+                        spill);
+                FOR_N(k2, 1, n->input_count) {
+                    if (n->inputs[k2]) {
+                        fprintf(stderr, "  in[%zu] = gvn=%u type=%d\n", k2, n->inputs[k2]->gvn, n->inputs[k2]->type);
+                    } else {
+                        fprintf(stderr, "  in[%zu] = NULL\n", k2);
+                    }
+                }
+                fflush(stderr);
+                abort();
+            }
             post_split += (n->inputs[j]->gvn >= old_node_count);
         }
 
@@ -1334,7 +1408,9 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
         int spill = spill_map_get2(&splitter.spill_map, n);
         if (spill >= 0) {
-            new_vreg->was_spilled = splitter.was_spilled[spill] + 1;
+            // PATCH(odin-tilde): saturate so the counter never wraps
+            int ws = splitter.was_spilled[spill] + 1;
+            new_vreg->was_spilled = ws > 3 ? 3 : ws;
         }
     }
 

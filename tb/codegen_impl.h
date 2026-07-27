@@ -655,6 +655,57 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
             TB_OPTDEBUG(ISEL)(printf("\n=== T=%d ===\n", ++f->stats.time));
             TB_OPTDEBUG(ISEL)(printf("Match? "), tb_print_dumb_node(NULL, n), printf("\n"));
 
+            // PATCH(odin-tilde): fold constant rep-movs operands into the node.
+            // Pinning ICONSTs to RCX (count) / RAX (memset fill) sent Rogers
+            // RA into non-converging split loops (the remat copy lands on the
+            // same conflict point every round), so materialize constants in
+            // the emitter instead and drop the inputs.
+            if (n->type == TB_MEMSET || n->type == TB_MEMCPY) {
+                bool fill_folded = false, count_folded = false;
+                TB_NodeMemAccessImm* old_a = NULL;
+                if (n->input_count < 5) {
+                    old_a = TB_NODE_GET_EXTRA(n);
+                    fill_folded  = old_a->has_fill;
+                    count_folded = old_a->has_count;
+                }
+
+                int size_idx = fill_folded ? 3 : 4;
+                bool new_fill = fill_folded, new_count = count_folded;
+                uint64_t fill_imm = 0, count_imm = 0;
+
+                // rep stosb only reads AL, so any constant fill byte folds
+                if (n->type == TB_MEMSET && !fill_folded && n->inputs[3]->type == TB_ICONST) {
+                    new_fill = true;
+                    fill_imm = TB_NODE_GET_EXTRA_T(n->inputs[3], TB_NodeInt)->value & 0xFF;
+                }
+                if (!count_folded && n->inputs[size_idx]->type == TB_ICONST &&
+                    TB_NODE_GET_EXTRA_T(n->inputs[size_idx], TB_NodeInt)->value <= UINT32_MAX) {
+                    new_count = true;
+                    count_imm = TB_NODE_GET_EXTRA_T(n->inputs[size_idx], TB_NodeInt)->value;
+                }
+
+                if (new_fill != fill_folded || new_count != count_folded) {
+                    TB_Node* keep[5];
+                    int nk = 0;
+                    FOR_N(i, 0, n->input_count) {
+                        if (i == 3 && new_fill && !fill_folded) { continue; }
+                        if (i == size_idx && new_count && !count_folded) { continue; }
+                        keep[nk++] = n->inputs[i];
+                    }
+
+                    TB_Node* k = tb_alloc_node(f, n->type, n->dt, nk, sizeof(TB_NodeMemAccessImm));
+                    TB_NodeMemAccessImm* a = TB_NODE_GET_EXTRA(k);
+                    a->align = old_a ? old_a->align : TB_NODE_GET_EXTRA_T(n, TB_NodeMemAccess)->align;
+                    a->imm_count = count_imm;
+                    a->imm_fill  = fill_imm;
+                    a->has_count = new_count;
+                    a->has_fill  = new_fill;
+                    FOR_N(i, 0, nk) { set_input(f, k, keep[i], i); }
+                    subsume_node(f, n, k);
+                    n = k;
+                }
+            }
+
             // create new nodes in the new-space
             bool progress, added = false;
             do {

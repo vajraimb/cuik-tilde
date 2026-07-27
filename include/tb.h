@@ -360,6 +360,18 @@ typedef struct {
     TB_CharUnits align;
 } TB_NodeMemAccess;
 
+// PATCH(odin-tilde): extended extra for TB_MEMSET/TB_MEMCPY after the isel
+// folds constant rep-movs operands into the node (the emitter materializes
+// RCX/RAX itself). Keeps align first so generic code reading
+// TB_NodeMemAccess still works.
+typedef struct {
+    TB_CharUnits align;
+    uint64_t imm_count; // folded count (valid when has_count)
+    uint64_t imm_fill;  // folded fill byte (valid when has_fill, memset only)
+    uint8_t has_count;
+    uint8_t has_fill;
+} TB_NodeMemAccessImm;
+
 typedef struct { // TB_DEBUG_LOCATION
     TB_SourceFile* file;
     int line, column;
@@ -914,6 +926,11 @@ TB_API TB_GraphBuilder* tb_builder_enter_from_dbg(TB_Function* f, TB_ModuleSecti
 
 TB_API void tb_builder_exit(TB_GraphBuilder* g);
 TB_API TB_Node* tb_builder_param_addr(TB_GraphBuilder* g, int i);
+
+// PATCH(odin-tilde): direct access to the ROOT parameter projections
+// (f->params[3+i]); used by frontends whose entry symbol table does not
+// carry per-parameter slots.
+TB_API TB_Node* tb_function_param(TB_Function* f, int i);
 
 TB_API TB_Node* tb_builder_bool(TB_GraphBuilder* g, bool x);
 TB_API TB_Node* tb_builder_uint(TB_GraphBuilder* g, TB_DataType dt, uint64_t x);

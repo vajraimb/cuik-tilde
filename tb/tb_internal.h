@@ -98,17 +98,18 @@
 #endif
 #else
 #if TB_DEBUG_BUILD
-#define tb_todo()            __builtin_trap()
+#define tb_todo()            (fprintf(stderr, "%s:%d: tb_todo\n", __FILE__, __LINE__), fflush(stderr), __builtin_trap())
 #define tb_unreachable()     (assert(0), 0)
 #else
-#define tb_todo()            __builtin_trap()
+#define tb_todo()            (fprintf(stderr, "%s:%d: tb_todo\n", __FILE__, __LINE__), fflush(stderr), __builtin_trap())
 #define tb_unreachable()     (__builtin_unreachable(), 0)
 #endif
 #endif
 
 #ifndef NDEBUG
-#define TB_ASSERT_MSG(cond, ...) ((cond) ? 0 : (printf("\n" __FILE__ ":" STR(__LINE__) ": assertion failed: " #cond "\n  "), printf(__VA_ARGS__), __builtin_trap(), 0))
-#define TB_ASSERT(cond)          ((cond) ? 0 : (printf("\n" __FILE__ ":" STR(__LINE__) ": assertion failed: " #cond "\n  "), __builtin_trap(), 0))
+// PATCH(odin-tilde): stderr+fflush so batch/automated runs always capture the message
+#define TB_ASSERT_MSG(cond, ...) ((cond) ? 0 : (fprintf(stderr, "\n" __FILE__ ":" STR(__LINE__) ": assertion failed: " #cond "\n  "), fprintf(stderr, __VA_ARGS__), fflush(stderr), __builtin_trap(), 0))
+#define TB_ASSERT(cond)          ((cond) ? 0 : (fprintf(stderr, "\n" __FILE__ ":" STR(__LINE__) ": assertion failed: " #cond "\n  "), fflush(stderr), __builtin_trap(), 0))
 #else
 #define TB_ASSERT_MSG(cond, ...) ((cond) ? 0 : (__builtin_unreachable(), 0))
 #define TB_ASSERT(cond)          ((cond) ? 0 : (__builtin_unreachable(), 0))

@@ -148,6 +148,8 @@ static TB_Node* binop_imm(TB_Function* f, int type, TB_Node* lhs, int64_t imm) {
 static TB_Node* unary_reg(TB_Function* f, int type, TB_DataType dt, TB_Node* src) {
     TB_Node* op = tb_alloc_node(f, type, dt, 4, sizeof(X86MemOp));
     set_input(f, op, src, 2);
+    // movzx/movsx emission legalizes extra_dt; default it to the result type
+    TB_NODE_SET_EXTRA(op, X86MemOp, .extra_dt = dt);
     return tb_opt_gvn_node(f, op);
 }
 
@@ -208,6 +210,21 @@ static uint32_t phash_fn(uint32_t h, uint32_t k, uint32_t mod) {
     h = (((h^k) << 13) | ((h^k) >> 19))*5 + 0xe6546b64;
     // grab the top bits
     return h >> (32 - mod);
+}
+
+// PATCH(odin-tilde): 64-bit variant used when the switch key type is wider
+// than 32 bits (e.g. typeid switches). The old path truncated keys to 32
+// bits, which made keys that only differ in the high half collide for every
+// seed (reseeding could never help) and compared only 32 bits at runtime.
+// Uses the murmur3 fmix64 finalizer; must match the runtime node chain in
+// isel_multi_way_branch exactly.
+static uint32_t phash_fn64(uint32_t h, uint64_t k, uint32_t mod) {
+    uint64_t x = k ^ h;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ull;
+    x ^= x >> 33;
+    return (uint32_t)(x >> (64 - mod));
 }
 
 static int phash_bucket_cmp(const void* a, const void* b) {
@@ -271,6 +288,15 @@ static TB_Node* insert_range_check(Ctx* ctx, TB_Function* f, TB_Node* n, TB_Node
     return into_table;
 }
 
+// like mach_symbol() but without the walker worklist touch (not available
+// during multi-way-branch isel)
+static TB_Node* mach_symbol_nowalk(TB_Function* f, TB_Symbol* s) {
+    TB_Node* n = tb_alloc_node(f, TB_MACH_SYMBOL, TB_TYPE_PTR, 1, sizeof(TB_NodeMachSymbol));
+    set_input(f, n, f->root_node, 0);
+    TB_NODE_SET_EXTRA(n, TB_NodeMachSymbol, .sym = s);
+    return tb__gvn(f, n, sizeof(TB_NodeMachSymbol));
+}
+
 static TB_Node* isel_multi_way_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
     TB_ASSERT(n->type == TB_BRANCH);
 
@@ -293,11 +319,17 @@ static TB_Node* isel_multi_way_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
 
     TB_Node* src = n->inputs[1];
 
-    int32_t limit;
-    TB_ASSERT(try_for_imm32_2(TB_TYPE_I64, (max - min) + 1, &limit));
+    int32_t limit = 0;
+    // PATCH(odin-tilde): was TB_ASSERT(try_for_imm32_2(...)). Huge sparse
+    // switches (e.g. Odin type switches whose case keys are 64-bit typeid
+    // hashes) can span a key range that never fits an imm32 linear table;
+    // that's fine because the density check would send them to the perfect
+    // hash path anyway, so only gate on it instead of asserting.
+    bool range_fits = try_for_imm32_2(TB_TYPE_I64, (max - min) + 1, &limit);
 
     TB_ModuleSectionHandle data_sec = tb_module_get_data(f->super.module);
-    double density = ((double)br->succ_count) / ((double) (max - min));
+    double density = range_fits ? ((double)br->succ_count) / ((double) (max - min)) : 0.0;
+build_linear_table:
     if (density > 0.25f) {
         if (src->dt.type == TB_TAG_I32) {
             src = unary_reg(f, TB_x86_mov, TB_TYPE_I64, src);
@@ -337,21 +369,21 @@ static TB_Node* isel_multi_way_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
             }
         }
 
-        TB_Node* tmp = tb_alloc_node(f, TB_MACH_TEMP, TB_TYPE_I64, 1, sizeof(TB_NodeMachTemp));
-        set_input(f, tmp, f->root_node, 0);
-        TB_NODE_SET_EXTRA(tmp, TB_NodeMachTemp, .def = ctx->normie_mask[REG_CLASS_GPR]);
-
         TB_Global* table = tb_global_create(f->super.module, 0, NULL, NULL, TB_LINKAGE_PRIVATE);
         tb_global_set_storage(f->super.module, data_sec, table, limit * sizeof(uint64_t), sizeof(uint64_t), 1 + limit);
 
-        TB_Node* sym = tb_alloc_node(f, TB_SYMBOL, TB_TYPE_PTR, 1, sizeof(TB_NodeSymbol));
-        set_input(f, sym, f->root_node, 0);
-        TB_NODE_SET_EXTRA(sym, TB_NodeSymbol, .sym = &table->super);
+        TB_Node* sym = mach_symbol_nowalk(f, &table->super);
+
+        // PATCH(odin-tilde): materialize the table address into a GPR via lea;
+        // the raw MACH_SYMBOL has no vreg and cannot be a jmp_multi input.
+        TB_Node* lea = tb_alloc_node(f, TB_x86_lea, TB_TYPE_PTR, 5, sizeof(X86MemOp));
+        set_input(f, lea, sym, 2);
+        TB_NODE_SET_EXTRA(lea, X86MemOp, .mode = MODE_LD, .disp = 0);
 
         TB_Node* op = tb_alloc_node(f, TB_x86_jmp_MULTI, TB_TYPE_TUPLE, 3, sizeof(X86JmpMulti));
         set_input(f, op, prev_ctrl, 0);
         set_input(f, op, src, 1);
-        set_input(f, op, sym, 2);
+        set_input(f, op, lea, 2);
         TB_NODE_SET_EXTRA(op, X86JmpMulti, .succ_count = br->succ_count, .table = table, .entry_count = limit, .entries = entries);
         return op;
     }
@@ -362,12 +394,29 @@ static TB_Node* isel_multi_way_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
     int count = 0, cap = 1ull << shift;
     TB_ASSERT(cap < UINT32_MAX);
 
+    // PATCH(odin-tilde): hash the full 64-bit key when the switch key type
+    // is wider than 32 bits instead of truncating (see phash_fn64).
+    bool wide_keys = src->dt.type > TB_TAG_I32 || src->dt.type == TB_TAG_PTR;
+
     TB_ArenaSavepoint sp = tb_arena_save(&f->tmp_arena);
     uint32_t hash = PHASH_DEFAULT;
     int* entries   = tb_arena_alloc(&f->arena, cap * sizeof(int));
     uint64_t* keys = tb_arena_alloc(&f->arena, cap * sizeof(uint64_t));
 
     FOR_N(tries, 0, 32) {
+        // PATCH(odin-tilde): grow the table when a collision-free placement
+        // is statistically unlikely. cap starts at the next pow2 above the
+        // case count (load factor up to 1), where big switches (e.g. type
+        // switches over `any` with dozens of cases) almost never place
+        // collision-free; doubling the table every few tries makes success
+        // near-certain while keeping small switches compact.
+        if (tries && (tries % 4) == 0 && shift < 16) {
+            shift  += 1;
+            cap     = 1ull << shift;
+            entries = tb_arena_alloc(&f->arena, cap * sizeof(int));
+            keys    = tb_arena_alloc(&f->arena, cap * sizeof(uint64_t));
+        }
+
         // printf("Trying hash=%#"PRIx32"...\n", hash);
         FOR_N(i, 0, cap) {
             entries[i] = 0;
@@ -381,7 +430,8 @@ static TB_Node* isel_multi_way_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
             if (IS_PROJ(un)) {
                 TB_NodeBranchProj* p = TB_NODE_GET_EXTRA(un);
                 if (p->index != 0) {
-                    uint32_t h = phash_fn(hash, p->key, shift);
+                    uint32_t h = wide_keys ? phash_fn64(hash, p->key, shift)
+                                           : phash_fn(hash, (uint32_t)p->key, shift);
                     if (entries[h]) {
                         good = false;
                         break;
@@ -395,42 +445,63 @@ static TB_Node* isel_multi_way_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
         }
 
         if (good) {
-            // k = rol(k, 15) * 0x1b873593
-            // h = rol(h ^ k, 13) * 5
-            // h = (h + 0xe6546b64) >> (32 - shift)
-            if (src->dt.type < TB_TAG_I32) {
-                // zero extend
-                src = unary_reg(f, src->dt.type == TB_TAG_I16 ? TB_x86_movzx16 : TB_x86_movzx8, TB_TYPE_I32, src);
-            } else if (src->dt.type > TB_TAG_I32) {
-                // truncate
-                src = unary_reg(f, TB_x86_mov, TB_TYPE_I32, src);
+            TB_Node* h;
+            if (wide_keys) {
+                // 64-bit variant (must match phash_fn64 exactly):
+                // x = k ^ seed; x *= C1; x ^= x >> 33; x *= C2; x ^= x >> 33;
+                // h = x >> (64 - shift)
+                // The 64-bit multiplicands can't be imul immediates (imm32
+                // only), so they go through registers.
+                TB_Node* x = src;
+                TB_Node* t;
+                x = binop_reg(f, TB_x86_xor,  x, make_int_node(f, TB_TYPE_I64, hash));
+                x = binop_reg(f, TB_x86_imul, x, make_int_node(f, TB_TYPE_I64, 0xff51afd7ed558ccdull));
+                t = binop_imm(f, TB_x86_shr,  x, 33);
+                x = binop_reg(f, TB_x86_xor,  x, t);
+                x = binop_reg(f, TB_x86_imul, x, make_int_node(f, TB_TYPE_I64, 0xc4ceb9fe1a85ec53ull));
+                t = binop_imm(f, TB_x86_shr,  x, 33);
+                x = binop_reg(f, TB_x86_xor,  x, t);
+                h = binop_imm(f, TB_x86_shr,  x, 64 - shift);
+            } else {
+                // k = rol(k, 15) * 0x1b873593
+                // h = rol(h ^ k, 13) * 5
+                // h = (h + 0xe6546b64) >> (32 - shift)
+                if (src->dt.type < TB_TAG_I32) {
+                    // zero extend
+                    src = unary_reg(f, src->dt.type == TB_TAG_I16 ? TB_x86_movzx16 : TB_x86_movzx8, TB_TYPE_I32, src);
+                }
+
+                TB_Node* k = src;
+                k = binop_imm(f, TB_x86_rol,  k, 15);
+                k = binop_imm(f, TB_x86_imul, k, 0x1b873593);
+
+                h = make_int_node(f, TB_TYPE_I32, hash);
+                h = binop_reg(f, TB_x86_xor,  k, h);
+                h = binop_imm(f, TB_x86_rol,  h, 13);
+                h = binop_imm(f, TB_x86_imul, h, 5);
+                h = binop_imm(f, TB_x86_add,  h, 0xe6546b64);
+                h = binop_imm(f, TB_x86_shr,  h, 32 - shift);
             }
-
-            TB_Node* k = src;
-            k = binop_imm(f, TB_x86_rol,  k, 15);
-            k = binop_imm(f, TB_x86_imul, k, 0x1b873593);
-
-            TB_Node* h = make_int_node(f, TB_TYPE_I32, hash);
-            h = binop_reg(f, TB_x86_xor,  k, h);
-            h = binop_imm(f, TB_x86_rol,  h, 13);
-            h = binop_imm(f, TB_x86_imul, h, 5);
-            h = binop_imm(f, TB_x86_add,  h, 0xe6546b64);
-            h = binop_imm(f, TB_x86_shr,  h, 32 - shift);
 
             TB_Global* table = tb_global_create(f->super.module, 0, NULL, NULL, TB_LINKAGE_PRIVATE);
             tb_global_set_storage(f->super.module, data_sec, table, cap * sizeof(uint64_t[2]), sizeof(uint64_t), 2 + cap);
 
-            TB_Node* sym = tb_alloc_node(f, TB_SYMBOL, TB_TYPE_PTR, 1, sizeof(TB_NodeSymbol));
-            set_input(f, sym, f->root_node, 0);
-            TB_NODE_SET_EXTRA(sym, TB_NodeSymbol, .sym = &table->super);
-            sym = tb_opt_gvn_node(f, sym);
+            TB_Node* sym = mach_symbol_nowalk(f, &table->super);
+
+            // PATCH(odin-tilde): materialize the table address into a GPR via lea
+            // (same as the linear table case); RIP-relative addressing cannot
+            // have an index register, so both the key-check cmp and the
+            // jmp_multi need a real base register.
+            TB_Node* lea = tb_alloc_node(f, TB_x86_lea, TB_TYPE_PTR, 5, sizeof(X86MemOp));
+            set_input(f, lea, sym, 2);
+            TB_NODE_SET_EXTRA(lea, X86MemOp, .mode = MODE_LD, .disp = 0);
 
             // key check
             TB_Node* prev_ctrl = n->inputs[0];
             size_t key_offset = cap * sizeof(uint64_t);
             if (1) {
                 TB_Node* cmp = tb_alloc_node(f, TB_x86_cmp, TB_TYPE_I64, 5, sizeof(X86MemOp));
-                set_input(f, cmp, sym, 2);
+                set_input(f, cmp, lea, 2);
                 set_input(f, cmp, h,   3);
                 set_input(f, cmp, src, 4);
                 TB_NODE_SET_EXTRA(cmp, X86MemOp, .disp = key_offset, .scale = SCALE_X8, .flags = OP_INDEXED, .mode = MODE_LD, .extra_dt = TB_TYPE_I64);
@@ -444,7 +515,7 @@ static TB_Node* isel_multi_way_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
             TB_Node* op = tb_alloc_node(f, TB_x86_jmp_MULTI, TB_TYPE_TUPLE, 3, sizeof(X86JmpMulti));
             set_input(f, op, prev_ctrl, 0);
             set_input(f, op, h, 1);
-            set_input(f, op, sym, 2);
+            set_input(f, op, lea, 2);
             TB_NODE_SET_EXTRA(op, X86JmpMulti, .succ_count = br->succ_count, .table = table, .entry_count = cap, .entries = entries);
             return op;
         }
@@ -452,7 +523,16 @@ static TB_Node* isel_multi_way_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
         hash = ((uint64_t) hash * 11400714819323198485llu) >> 32llu;
     }
 
-    return NULL;
+    // PATCH(odin-tilde): perfect hashing can fail for dense small switches
+    // (load factor near 1); fall back to the linear jump table instead of
+    // returning NULL (the isel caller cannot handle a failed match).
+    // If the key range can't fit a linear table at all (huge sparse keys,
+    // e.g. typeids), the 64-bit hash above must keep retrying instead —
+    // with full-width keys distinct seeds resolve collisions in practice.
+    tb_arena_restore(&f->tmp_arena, sp);
+    TB_ASSERT(range_fits && "perfect hash failed and key range cannot fit a linear jump table");
+    density = 1.0;
+    goto build_linear_table;
 }
 
 static float edge_prob(TB_Node* n) {
@@ -1223,14 +1303,22 @@ static int node_constraint_kill(Ctx* restrict ctx, TB_Node* n, RegMask** kills) 
         kills[kill_count++] = ctx->normie_mask[REG_CLASS_FLAGS];
         return kill_count;
     } else if (n->type == TB_ICONST) {
-        uint64_t x = TB_NODE_GET_EXTRA_T(n, TB_NodeInt)->value;
-        if (x != 0) {
-            return 0;
+        // TILDE: iconst 0 is emitted as "mov reg, 0" (see the emitter below) which
+        // does NOT clobber FLAGS. Declaring a FLAGS kill here (for xor) caused an
+        // infinite Rogers RA ping-pong: a rematerialized iconst 0 landing between
+        // an x86_cmp and its cmov/jcc use kept evicting the live FLAGS vreg.
+        return 0;
+    } else if ((n->type == TB_MEMSET || n->type == TB_MEMCPY) && n->input_count < 5) {
+        // PATCH(odin-tilde): folded immediates are materialized into RCX/RAX
+        // inside the emitter, so those regs die here even though they're no
+        // longer inputs. (RDI/RSI/RCX used by the rep string instruction
+        // itself are preserved with push/pop in the emitter — see TB_MEMSET
+        // in the emitter — so they are NOT kills.)
+        TB_NodeMemAccessImm* a = TB_NODE_GET_EXTRA(n);
+        if (a->has_fill) {
+            kills[kill_count++] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
         }
-
-        // xor DST, DST causes a reg to be clobbered
-        kills[kill_count++] = ctx->normie_mask[REG_CLASS_FLAGS];
-        return 1;
+        return kill_count;
     } else {
         return 0;
     }
@@ -1353,6 +1441,12 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
         case TB_FLOAT_TRUNC:
         if (ins) { ins[1] = ctx->normie_mask[REG_CLASS_XMM]; }
         return ctx->normie_mask[REG_CLASS_XMM];
+
+        // PATCH(odin-tilde): bswap has an emitter below but no constraint;
+        // treat it as a simple GPR unary op (the emitter MOVes src->dst first).
+        case TB_BSWAP:
+        if (ins) { ins[1] = ctx->normie_mask[REG_CLASS_GPR]; }
+        return ctx->normie_mask[REG_CLASS_GPR];
 
         case TB_PROJ: {
             if (n->dt.type == TB_TAG_MEMORY || n->dt.type == TB_TAG_CONTROL) {
@@ -1520,8 +1614,21 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
             if (ins) {
                 ins[1] = &TB_REG_EMPTY;
                 ins[2] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RDI);
-                ins[3] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
-                ins[4] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RCX);
+                // PATCH(odin-tilde): reduced-input forms carry folded
+                // immediates (see TB_NodeMemAccessImm)
+                if (n->input_count == 5) {
+                    ins[3] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
+                    ins[4] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RCX);
+                } else if (n->input_count == 4) {
+                    TB_NodeMemAccessImm* a = TB_NODE_GET_EXTRA(n);
+                    if (a->has_fill) {
+                        // (ctrl, mem, dst, size)
+                        ins[3] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RCX);
+                    } else {
+                        // (ctrl, mem, dst, val)
+                        ins[3] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
+                    }
+                }
             }
             return &TB_REG_EMPTY;
         }
@@ -1532,7 +1639,10 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
                 ins[1] = &TB_REG_EMPTY;
                 ins[2] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RDI);
                 ins[3] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RSI);
-                ins[4] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RCX);
+                // PATCH(odin-tilde): 4-input form has a folded immediate count
+                if (n->input_count == 5) {
+                    ins[4] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RCX);
+                }
             }
             return &TB_REG_EMPTY;
         }
@@ -1937,9 +2047,10 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
 
             TB_X86_DataType dt = legalize_int(n->dt);
             GPR dst = op_gpr_at(ctx, n);
-            if (x == 0) {
-                __(XOR, TB_X86_DWORD, Vgpr(dst), Vgpr(dst));
-            } else if (hi == 0 || dt == TB_X86_QWORD) {
+            // TILDE: no xor-zeroing for x == 0 (see node_constraint_kill): emit
+            // "mov reg, 0" so the materialization never clobbers FLAGS. This keeps
+            // rematerialized iconst 0 nodes placement-invariant w.r.t. live FLAGS.
+            if (hi == 0 || dt == TB_X86_QWORD) {
                 // "movabs"
                 EMIT1(e, rex(dt == TB_X86_QWORD, 0, dst, 0));
                 EMIT1(e, 0xB8 + (dst & 0b111));
@@ -1994,6 +2105,13 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 } else if (dst.type == VAL_XMM && src.type == VAL_GPR) {
                     TB_X86_DataType src_dt = legalize(n->inputs[1]->dt);
                     __(MOV_I2F, src_dt, &dst, &src);
+                } else if (dst.type == VAL_MEM && src.type == VAL_XMM) {
+                    // PATCH(odin-tilde): spilled cross-class copy (e.g. an
+                    // f32->i32 bitcast whose GPR def was spilled) — an integer
+                    // MOV cannot name an XMM source, store the float instead;
+                    // the slot holds the same bits either way.
+                    TB_X86_DataType src_dt = legalize(n->inputs[1]->dt);
+                    __(FP_MOV, src_dt, &dst, &src);
                 } else {
                     int op = dt < TB_X86_F32x1 ? MOV : FP_MOV;
                     __(op, dt, &dst, &src);
@@ -2545,14 +2663,49 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         }
 
         case TB_MEMSET: {
+            // PATCH(odin-tilde): rep stosb advances RDI/RCX, which would
+            // destroy any value the RA keeps in those registers across the
+            // memset (e.g. a local's address that is also a later call's
+            // argument). Save/restore them so the node has no GPR side
+            // effects at all. The pushes must precede the folded-immediate
+            // materialization below so the ORIGINAL register values are
+            // saved.
+            EMIT1(e, 0x57); // push rdi
+            EMIT1(e, 0x51); // push rcx
+            // PATCH(odin-tilde): reduced-input forms carry folded immediates
+            if (n->input_count < 5) {
+                TB_NodeMemAccessImm* a = TB_NODE_GET_EXTRA(n);
+                if (a->has_fill) {
+                    EMIT1(e, 0xB8); EMIT4(e, (uint32_t) a->imm_fill); // mov eax, imm32
+                }
+                if (a->has_count) {
+                    EMIT1(e, 0xB9); EMIT4(e, (uint32_t) a->imm_count); // mov ecx, imm32
+                }
+            }
             EMIT1(e, 0xF3);
             EMIT1(e, 0xAA);
+            EMIT1(e, 0x59); // pop rcx
+            EMIT1(e, 0x5F); // pop rdi
             break;
         }
 
         case TB_MEMCPY: {
+            // PATCH(odin-tilde): save/restore RDI/RSI/RCX (see TB_MEMSET)
+            EMIT1(e, 0x57); // push rdi
+            EMIT1(e, 0x56); // push rsi
+            EMIT1(e, 0x51); // push rcx
+            // PATCH(odin-tilde): reduced-input forms carry folded immediates
+            if (n->input_count < 5) {
+                TB_NodeMemAccessImm* a = TB_NODE_GET_EXTRA(n);
+                if (a->has_count) {
+                    EMIT1(e, 0xB9); EMIT4(e, (uint32_t) a->imm_count); // mov ecx, imm32
+                }
+            }
             EMIT1(e, 0xF3);
             EMIT1(e, 0xA4);
+            EMIT1(e, 0x59); // pop rcx
+            EMIT1(e, 0x5E); // pop rsi
+            EMIT1(e, 0x5F); // pop rdi
             break;
         }
 
