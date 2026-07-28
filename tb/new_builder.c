@@ -273,7 +273,9 @@ TB_Node* tb_builder_bool(TB_GraphBuilder* g, bool x) {
 }
 
 TB_Node* tb_builder_uint(TB_GraphBuilder* g, TB_DataType dt, uint64_t x) {
-    TB_ASSERT(TB_IS_INT_OR_PTR(dt) || dt.type == TB_TAG_BOOL);
+    // PATCH(odin-tilde): include the function name in the assert for
+    // frontend debugging.
+    TB_ASSERT_MSG(TB_IS_INT_OR_PTR(dt) || dt.type == TB_TAG_BOOL, "bad uint dt %d (in %s)", dt.type, g->f->super.name);
     int bits = tb_data_type_bit_size(g->f->super.module, dt.type);
     if (bits < 64) {
         uint64_t mask = ~UINT64_C(0) >> (64 - bits);
@@ -380,6 +382,24 @@ TB_Node* tb_builder_binop_int(TB_GraphBuilder* g, int type, TB_Node* a, TB_Node*
     set_input(f, n, b, 2);
     TB_NODE_SET_EXTRA(n, TB_NodeBinopInt, .ab = ab);
     return g->peep(f, n);
+}
+
+// PATCH(odin-tilde): public widening-multiply builder for frontends.
+// Returns the low half (proj 0, RAX on x64) and stores the high half
+// (proj 1, RDX on x64) into *out_hi.
+TB_Node* tb_builder_umulpair(TB_GraphBuilder* g, TB_Node* a, TB_Node* b, TB_Node** out_hi) {
+    TB_ASSERT_MSG(TB_DATA_TYPE_EQUALS(a->dt, b->dt), "datatype mismatch");
+    TB_ASSERT_MSG(TB_IS_INTEGER_TYPE(a->dt), "datatype wasn't an integer");
+
+    TB_Function* f = g->f;
+    TB_Node* n = tb_alloc_node(f, TB_UMULPAIR, TB_TYPE_TUPLE, 3, 0);
+    set_input(f, n, a, 1);
+    set_input(f, n, b, 2);
+    n = g->peep(f, n);
+    TB_ASSERT(n->type == TB_UMULPAIR);
+
+    *out_hi = tb__make_proj(f, a->dt, n, 1);
+    return tb__make_proj(f, a->dt, n, 0);
 }
 
 TB_Node* tb_builder_binop_float(TB_GraphBuilder* g, int type, TB_Node* a, TB_Node* b) {
@@ -646,6 +666,25 @@ TB_Node* tb_builder_atomic_rmw(TB_GraphBuilder* g, int mem_var, int op, TB_Node*
     set_input(f, n, xfer_mem(g, mproj, mem_var), 1);
 
     return tb__make_proj(f, val->dt, n, 1);
+}
+
+// PATCH(odin-tilde): CAS builder. Node layout: (ctrl, mem, addr, expected,
+// new_val) -> (mem, old_value); the old value proj is pinned to RAX on x64.
+TB_Node* tb_builder_atomic_cas(TB_GraphBuilder* g, int mem_var, TB_Node* addr, TB_Node* expected, TB_Node* new_val, TB_MemoryOrder order) {
+    TB_Function* f = g->f;
+    TB_ASSERT(addr->dt.type == TB_TAG_PTR);
+
+    TB_Node* n = tb_alloc_node(f, TB_ATOMIC_CAS, TB_TYPE_TUPLE, 5, sizeof(TB_NodeAtomic));
+    set_input(f, n, g->curr->inputs[0], 0);
+    set_input(f, n, addr,     2);
+    set_input(f, n, expected, 3);
+    set_input(f, n, new_val,  4);
+    TB_NODE_SET_EXTRA(n, TB_NodeAtomic, .order = order, .order2 = TB_MEM_ORDER_SEQ_CST);
+
+    TB_Node* mproj = tb__make_proj(f, TB_TYPE_MEMORY, n, 0);
+    set_input(f, n, xfer_mem(g, mproj, mem_var), 1);
+
+    return tb__make_proj(f, expected->dt, n, 1);
 }
 
 int tb_builder_decl(TB_GraphBuilder* g, TB_Node* label) {

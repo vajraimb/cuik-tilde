@@ -571,6 +571,75 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
     ra.splits = dyn_array_create(SplitDecision, 32);
     bool cisc_stuff = false;
 
+    // PATCH(odin-tilde): wrap every pinned (fixed-mask, non-stack) input
+    // edge in a dedicated single-use copy BEFORE any mask meets happen.
+    // Stock TB meets pinned use masks (e.g. a SysV call argument forced
+    // into RSI) into the value's vreg, so the whole live range becomes
+    // fixed to one register; when that range spans a clobbering call or
+    // a register-pressure region, the splitter cannot satisfy it (several
+    // stock TODOs) and miscompiles or spins forever. The wrapper copy's
+    // vreg is fixed but lives for a single point — no clobber or pressure
+    // region can span it — while the value vreg stays in a normal mask
+    // and is spilled/split by the usual machinery. MACH_COPY nodes are
+    // exempt from 2addr coalescing below, so the wrapper cannot merge
+    // back into its source.
+    CUIK_TIMED_BLOCK("pinned input copies") {
+        bool pinned_changes = false;
+        FOR_N(i, 0, ctx->bb_count) {
+            TB_BasicBlock* bb = &ctx->cfg.blocks[i];
+            // snapshot item pointers: insertions shift the array, so
+            // indexing into bb->items would skip or reprocess nodes.
+            size_t item_count = aarray_length(bb->items);
+            TB_Node** items_snapshot = tb_arena_alloc(&f->tmp_arena, item_count * sizeof(TB_Node*));
+            memcpy(items_snapshot, bb->items, item_count * sizeof(TB_Node*));
+            FOR_N(j, 0, item_count) {
+                TB_Node* n = items_snapshot[j];
+                if (n->type == TB_PHI || n->type == TB_MACH_COPY ||
+                    n->type == TB_MACH_TEMP || n->type == TB_MACH_PROJ ||
+                    n->type == TB_MACH_SYMBOL) {
+                    continue;
+                }
+
+                RegMask** ins = ctx->ins;
+                ctx->constraint(ctx, n, ins);
+
+                size_t in_count = n->input_count;
+                FOR_N(k, 1, in_count) {
+                    TB_Node* in = n->inputs[k];
+                    if (in == NULL) { continue; }
+                    RegMask* in_mask = ins[k];
+                    if (in_mask == NULL || in_mask == &TB_REG_EMPTY) { continue; }
+                    if (in_mask->class == REG_CLASS_STK) { continue; }
+                    // Classes with no spill mask at all (e.g. FLAGS on
+                    // x64) are inherently single-register, their producer
+                    // is pinned by its own def constraint, and the splitter
+                    // has no spill path for them — wrapping such an edge
+                    // only manufactures a pinned, unspillable copy that
+                    // crashes mach_copy (NULL spill mask).
+                    if (ctx->mayspill_mask[in_mask->class] == NULL) { continue; }
+                    if (fixed_reg_mask(in_mask) < 0) { continue; }
+                    if (in->type == TB_MACH_TEMP) { continue; }
+                    if (in->gvn >= aarray_length(ctx->vreg_map) || ctx->vreg_map[in->gvn] <= 0) { continue; }
+
+                    TB_Node* cpy = tb_alloc_node(f, TB_MACH_COPY, in->dt, 2, sizeof(TB_NodeMachCopy));
+                    set_input(f, cpy, in, 1);
+                    TB_NODE_SET_EXTRA(cpy, TB_NodeMachCopy, .def = in_mask, .use = ctx->normie_mask[in_mask->class]);
+
+                    VReg* v = tb__set_node_vreg(ctx, cpy);
+                    v->mask = in_mask;
+                    v->reg_width = tb__reg_width_from_dt(in_mask->class, in->dt);
+
+                    set_input(f, n, cpy, k);
+                    tb__insert_before(ctx, f, cpy, n);
+                    pinned_changes = true;
+                }
+            }
+        }
+        if (pinned_changes) {
+            redo_dataflow(ctx, arena);
+        }
+    }
+
     // create timeline & insert moves
     CUIK_TIMED_BLOCK("insert legalizing moves") {
         FOR_N(i, 0, ctx->bb_count) {
@@ -611,6 +680,11 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
 
                     // intersect use masks with the vreg's mask, if it becomes empty we've
                     // got a hard-split (not necessarily spilling to the stack)
+                    if (getenv("TB_RA_SPIN_DEBUG") && fixed_reg_mask(ins[k]) >= 0 &&
+                        in_vreg->mask != NULL && fixed_reg_mask(in_vreg->mask) < 0) { // DEBUG(odin-tilde)
+                        printf("LEGAL-FIX: %%%u(%s) pinned by %%%u(%s):%zu\n",
+                            in->gvn, tb_node_get_name(in->type), n->gvn, tb_node_get_name(n->type), k);
+                    }
                     RegMask* new_mask = tb__reg_mask_meet(ctx, in_vreg->mask, ins[k]);
                     if (in_vreg->mask != &TB_REG_EMPTY && new_mask == &TB_REG_EMPTY) {
                         TB_OPTDEBUG(REGALLOC)(printf("HARD-SPLIT on V%td\n", in_vreg - ctx->vregs));
@@ -848,7 +922,185 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
 
         rounds++;
         TB_OPTDEBUG(REGALLOC)(printf("# ========= Round %d =========\n", rounds));
-        TB_ASSERT(rounds < 50);
+        // PATCH(odin-tilde): the pinned-wrapper IR this port generates can
+        // legitimately need a few hundred rounds on large functions (the
+        // loop resolves about one conflict wave per round; e.g. Odin's
+        // reflect@write_type_writer needs 283). Keep the assert as an
+        // infinite-loop guard but with ample headroom.
+        TB_ASSERT(rounds < 2048);
+
+        // PATCH(odin-tilde): global zombie fixed-mask sweep. Splitting can
+        // leave a vreg pinned to a single register after the use that
+        // required the pin was rewired away; since mask meets are monotone
+        // the pin never fades on its own, and a fixed vreg that keeps
+        // losing its register spins the split loop forever. Intrinsically
+        // pinned defs (projections, temps, pinned copies, stack slots)
+        // keep their masks: their own constraint legitimately fixes them.
+        if (rounds > 1) {
+            // Build per-vreg member lists from vreg_map. The coalesce_set
+            // table is NOT authoritative here: split re-rooting scrubs
+            // nodes out of it (ra_split.c) while vreg_map still maps those
+            // nodes to the same vreg. A call-result projection scrubbed
+            // this way is invisible to a coalesce_set scan, so the pin it
+            // imposes looks like a relaxable zombie — relaxing it detaches
+            // the projection from the register the hardware actually
+            // writes (observed: F1's call result "assigned" to RBX with no
+            // copy ever moving it out of RAX — sha256 silently wrong).
+            size_t sweep_nv = aarray_length(ctx->vregs);
+            ArenaArray(TB_Node*)* sweep_members = tb_arena_alloc(&ctx->f->tmp_arena, sweep_nv * sizeof(ArenaArray(TB_Node*)));
+            memset(sweep_members, 0, sweep_nv * sizeof(ArenaArray(TB_Node*)));
+            {
+                size_t vmap_len = aarray_length(ctx->vreg_map);
+                FOR_N(bi, 0, ctx->bb_count) {
+                    TB_BasicBlock* sbb = &ctx->cfg.blocks[bi];
+                    aarray_for(sj, sbb->items) {
+                        TB_Node* gn = sbb->items[sj];
+                        if (gn->gvn >= vmap_len) { continue; }
+                        int vid = ctx->vreg_map[gn->gvn];
+                        if (vid <= 0 || vid >= (int)sweep_nv) { continue; }
+                        if (sweep_members[vid] == NULL) {
+                            sweep_members[vid] = aarray_create(&ctx->f->tmp_arena, TB_Node*, 4);
+                        }
+                        aarray_push(sweep_members[vid], gn);
+                    }
+                }
+            }
+
+            // NOTE: start at V1 — V0 is the "no vreg" dummy slot. Its data
+            // is never initialized by the constraint phase (nothing maps to
+            // vreg 0), so it holds uninitialized arena garbage; reading its
+            // ->mask dereferences a wild pointer (nondeterministic crashes).
+            for (ptrdiff_t vi = 1, vi_end__ = aarray_length(ctx->vregs); vi < vi_end__; ++vi) {
+                VReg* v = &ctx->vregs[vi];
+                if (v->n == NULL || v->mask == NULL || v->mask == &TB_REG_EMPTY) { continue; }
+                if (((uintptr_t)v->mask & 0xFFFF000000000000ull) != 0) { // DEBUG(odin-tilde)
+                    printf("MASK-SMASH: V%zu n=%%%u(%s) mask=%p\n", vi,
+                        v->n->gvn, tb_node_get_name(v->n->type), (void*)v->mask);
+                    fflush(stdout);
+                    abort();
+                }
+                int fx = fixed_reg_mask(v->mask);
+                if (getenv("TB_RA_SPIN_DEBUG") && (v->n->gvn == 51 || v->n->gvn == 55)) { // DEBUG(odin-tilde)
+                    printf("SWEEP-SEE: V%zu %%%u(%s) fixed=%d owner=V%d\n",
+                        vi, v->n->gvn, tb_node_get_name(v->n->type), fx,
+                        ctx->vreg_map[v->n->gvn]);
+                }
+                if (fx < 0) { continue; }
+
+                // intrinsically pinned defs (projections, temps, stack
+                // slots) keep their masks; pinned wrapper copies are only
+                // kept while a use actually requires the pin.
+                // PATCH(odin-tilde): check EVERY member of the coalesce set,
+                // not just the representative v->n — a call-result
+                // projection pinned to RAX can be coalesced into a vreg
+                // whose leader is an unpinned node (e.g. a 2addr add), and
+                // relaxing that vreg's mask detaches the projection from the
+                // register the hardware actually writes (observed: F1's
+                // call result "assigned" to RBX with no copy ever moving it
+                // out of RAX — sha256 round computation silently wrong).
+                bool intrinsic = false;
+                if (sweep_members[vi] != NULL) {
+                    aarray_for(gi, sweep_members[vi]) {
+                        TB_Node* gn = sweep_members[vi][gi];
+                        if (gn->type != TB_MACH_COPY &&
+                            fixed_reg_mask(ctx->constraint(ctx, gn, NULL)) >= 0) {
+                            intrinsic = true;
+                            break;
+                        }
+                    }
+                }
+                if (intrinsic) {
+                    if (getenv("TB_RA_SPIN_DEBUG")) { // DEBUG(odin-tilde)
+                        printf("ZOMBIE-KEEP: %s V%zu %%%u(%s) fixed=%d (intrinsic def constraint)\n",
+                            ctx->f->super.name, vi, v->n->gvn, tb_node_get_name(v->n->type), fx);
+                    }
+                    continue;
+                }
+
+                bool needed = false;
+                TB_Node* needed_by = NULL;
+                int needed_idx = 0;
+                if (sweep_members[vi] != NULL) {
+                    aarray_for(gi, sweep_members[vi]) {
+                        FOR_USERS(u, sweep_members[vi][gi]) {
+                            if (USERI(u) > 0 && USERI(u) < USERN(u)->input_count) {
+                                RegMask* um = constraint_in(ctx, USERN(u), USERI(u));
+                                if (um && um->class == v->mask->class && fixed_reg_mask(um) == fx) {
+                                    needed = true;
+                                    needed_by = USERN(u);
+                                    needed_idx = USERI(u);
+                                    break;
+                                }
+                            }
+                        }
+                        if (needed) { break; }
+                    }
+                }
+                if (needed && getenv("TB_RA_SPIN_DEBUG")) { // DEBUG(odin-tilde)
+                    printf("ZOMBIE-KEEP: %s V%zu %%%u(%s) fixed=%d needed by %%%u(%s):%d\n",
+                        ctx->f->super.name, vi, v->n->gvn, tb_node_get_name(v->n->type), fx,
+                        needed_by->gvn, tb_node_get_name(needed_by->type), needed_idx);
+                }
+                if (!needed) {
+                    if (getenv("TB_RA_SPIN_DEBUG")) { // DEBUG(odin-tilde)
+                        printf("ZOMBIE-RELAX: %s V%zu %%%u(%s) fixed=%d -> normie\n",
+                            ctx->f->super.name, vi, v->n->gvn, tb_node_get_name(v->n->type), fx);
+                        // DEBUG(odin-tilde): why did the intrinsic check miss
+                        // this node? Dump membership diagnostics.
+                        size_t vmap_len2 = aarray_length(ctx->vreg_map);
+                        printf("  RELAX-WHY: v->n=%%%u vreg_map[n]=%d members=%zu",
+                            v->n->gvn,
+                            v->n->gvn < vmap_len2 ? ctx->vreg_map[v->n->gvn] : -999,
+                            sweep_members[vi] ? aarray_length(sweep_members[vi]) : (size_t)0);
+                        bool found_self = false;
+                        if (sweep_members[vi] != NULL) {
+                            aarray_for(gi, sweep_members[vi]) {
+                                if (sweep_members[vi][gi] == v->n) { found_self = true; }
+                                printf(" %%%u(%s)", sweep_members[vi][gi]->gvn,
+                                    tb_node_get_name(sweep_members[vi][gi]->type));
+                            }
+                        }
+                        printf(" self=%d in_items=", found_self);
+                        bool in_items = false;
+                        FOR_N(bi2, 0, ctx->bb_count) {
+                            TB_BasicBlock* sbb2 = &ctx->cfg.blocks[bi2];
+                            aarray_for(sj2, sbb2->items) {
+                                if (sbb2->items[sj2] == v->n) { in_items = true; break; }
+                            }
+                            if (in_items) { break; }
+                        }
+                        printf("%d\n", in_items);
+                        // DEBUG(odin-tilde): dump the vreg that vreg_map
+                        // currently associates with this node, if different.
+                        int other = v->n->gvn < vmap_len2 ? ctx->vreg_map[v->n->gvn] : 0;
+                        if (other > 0 && other != (int)vi && other < (int)aarray_length(ctx->vregs)) {
+                            VReg* ov = &ctx->vregs[other];
+                            printf("  RELAX-WHY2: V%d n=%%%u(%s) mask_fixed=%d\n",
+                                other, ov->n ? ov->n->gvn : 0,
+                                ov->n ? tb_node_get_name(ov->n->type) : "?",
+                                ov->mask ? fixed_reg_mask(ov->mask) : -9);
+                        }
+                        // DEBUG(odin-tilde): which nodes still resolve to THIS
+                        // vreg? If any exist, relaxing it corrupts them.
+                        printf("  RELAX-WHY3: V%zu claimed by", vi);
+                        FOR_N(g2, 0, vmap_len2) {
+                            if (ctx->vreg_map[g2] == (int)vi) {
+                                printf(" %%%u", (unsigned)g2);
+                            }
+                        }
+                        printf("\n");
+                    }
+                    bool is_copy = v->n->type == TB_MACH_COPY;
+                    if (is_copy) {
+                        TB_NodeMachCopy* mc = TB_NODE_GET_EXTRA(v->n);
+                        if (fixed_reg_mask(mc->def) >= 0) {
+                            mc->def = ctx->normie_mask[mc->def->class];
+                        }
+                    }
+                    v->mask = ctx->normie_mask[v->mask->class];
+                }
+            }
+        }
 
         // tb_opt__REGALLOC  = rounds == 1;
         // tb_opt__REGALLOC5 = rounds == 2;
@@ -867,6 +1119,56 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
         // rogers_dump_sched(ctx, f->node_count);
         cuikperf_region_end();
 
+        if (!done && rounds >= 40 && getenv("TB_RA_SPIN_DEBUG")) { // DEBUG(odin-tilde)
+            if (rounds == 45) {
+                printf("=== SCHED DUMP %s ===\n", f->super.name);
+                rogers_dump_sched(ctx, f->node_count);
+            }
+            printf("RA SPIN round %d: %zu splits\n", rounds, dyn_array_length(ra.splits));
+            FOR_N(si, 0, dyn_array_length(ra.splits)) {
+                int t = ra.splits[si].target;
+                VReg* v = &ctx->vregs[t];
+                printf("  split V%u node=%%%u type=%s fixed=%d class=%d may_spill=%d clb=%s was_spilled=%d cost=%f\n",
+                    t, v->n ? v->n->gvn : 0, v->n ? tb_node_get_name(v->n->type) : "?",
+                    v->mask ? fixed_reg_mask(v->mask) : -2,
+                    v->mask ? v->mask->class : -1,
+                    v->mask ? v->mask->may_spill : -1,
+                    ra.splits[si].clobber ? "Y" : "n", v->was_spilled,
+                    rogers_get_spill_cost(ctx, &ra, v));
+                size_t cnt = 0;
+                TB_Node** arr = coalesce_set_array(ctx, &ra, &v->n, &cnt);
+                FOR_N(ci, 0, cnt) {
+                    printf("    member %%%u(%s)\n", arr[ci]->gvn, tb_node_get_name(arr[ci]->type));
+                    FOR_USERS(u, arr[ci]) {
+                        if (USERI(u) > 0 && USERI(u) < USERN(u)->input_count) {
+                            RegMask* um = constraint_in(ctx, USERN(u), USERI(u));
+                            printf("      used by %%%u(%s):%d fixed=%d class=%d\n",
+                                USERN(u)->gvn, tb_node_get_name(USERN(u)->type), USERI(u),
+                                um ? fixed_reg_mask(um) : -3, um ? um->class : -1);
+                        }
+                    }
+                }
+                if (v->mask && fixed_reg_mask(v->mask) >= 0) {
+                    int cls = v->mask->class, fx = fixed_reg_mask(v->mask);
+                    uint32_t occ = ra.active[cls][fx];
+                    printf("    occupant reg%d: %%%u", fx, occ);
+                    if (occ) {
+                        int ov = ctx->vreg_map[occ];
+                        if (ov > 0) {
+                            VReg* ovr = &ctx->vregs[ov];
+                            printf(" V%d(%s) fixed=%d cost=%f been_spilled=%d\n", ov,
+                                ovr->n ? tb_node_get_name(ovr->n->type) : "?",
+                                ovr->mask ? fixed_reg_mask(ovr->mask) : -9,
+                                rogers_get_spill_cost(ctx, &ra, ovr),
+                                set_get(&ra.been_spilled, ov));
+                        }
+                    }
+                    printf("\n");
+                }
+            }
+            fflush(stdout);
+        }
+
         if (0) {
             printf("=== ROUND %d === (%zu)\n", rounds, f->node_count);
             for (int i = 0; i < 10000; i++) {
@@ -878,6 +1180,10 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
         }
 
         if (done) {
+            if (rounds > 50 && getenv("TB_RA_ROUNDS_DEBUG")) { // DEBUG(odin-tilde)
+                printf("RA-ROUNDS: %s converged in %d rounds\n", f->super.name, rounds);
+                fflush(stdout);
+            }
             // printf("STATS: %d\n", stats_aaa);
             TB_OPTDEBUG(REGALLOC3)(rogers_dump_sched(ctx, f->node_count));
 
@@ -983,6 +1289,30 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
 
             ctx->num_spills += ra.num_spills - starting_spills;
             // printf("ROUNDS ON %s: %d\n", f->super.name, rounds);
+            {   // DEBUG(odin-tilde): TB_POSTRA_DUMP=<name substring> dumps
+                // the final post-RA IR (spill/reload copies included) with
+                // each node's final vreg class/slot assignment.
+                const char* pd = getenv("TB_POSTRA_DUMP");
+                if (pd != NULL && f->super.name != NULL && strstr(f->super.name, pd) != NULL) {
+                    printf("== POST-RA %s ==\n", f->super.name);
+                    FOR_N(bi, 0, ctx->bb_count) {
+                        TB_BasicBlock* bb = &ctx->cfg.blocks[bi];
+                        printf("BB%zu:\n", bi);
+                        aarray_for(ni, bb->items) {
+                            TB_Node* n = bb->items[ni];
+                            int vid = (n->gvn < aarray_length(ctx->vreg_map)) ? ctx->vreg_map[n->gvn] : -1;
+                            printf("  ");
+                            ctx->print_pretty(ctx, n);
+                            if (vid > 0) {
+                                VReg* v = &ctx->vregs[vid];
+                                printf("   [V%d class=%d assigned=%d]", vid, v->class, v->assigned);
+                            }
+                            printf("\n");
+                        }
+                    }
+                    fflush(stdout);
+                }
+            }
             return;
         }
 
@@ -1007,6 +1337,24 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
         for (size_t i = 0; i < dyn_array_length(ra.splits);) {
             SplitDecision split = ra.splits[i];
             VReg* v = &ctx->vregs[split.target];
+            if (v->mask == NULL || v->mask == &TB_REG_EMPTY) { // DEBUG(odin-tilde): defensive
+                dyn_array_remove(ra.splits, i);
+                continue;
+            }
+            // PATCH(odin-tilde): a split decision on a vreg whose class has
+            // NO spill mask (e.g. FLAGS) and which cannot be rematerialized
+            // can never be executed by the splitter — it would manufacture
+            // a NULL-mask spill copy and crash (reg_mask_is_stack(NULL)).
+            // Drop it; the conflicting party will move instead.
+            if (ctx->mayspill_mask[v->mask->class] == NULL && !can_remat(ctx, v->n)) {
+                if (getenv("TB_RA_SPIN_DEBUG")) { // DEBUG(odin-tilde)
+                    printf("DROP-UNSPLITTABLE: V%d %%%u(%s) class=%d\n",
+                        split.target, v->n ? v->n->gvn : 0,
+                        v->n ? tb_node_get_name(v->n->type) : "?", v->mask->class);
+                }
+                dyn_array_remove(ra.splits, i);
+                continue;
+            }
             if (v->mask->may_spill) {
                 TB_OPTDEBUG(REGALLOC)(printf("  * V%u is now a proper spill\n", split.target));
 
@@ -1281,9 +1629,22 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
     VReg* attempted_vreg = node_vreg(ctx, attempted_n);
     RegMask* useful_mask = attempted_vreg->mask;
     int useful_class = attempted_vreg->mask->class;
+    int us = ctx->vreg_map[attempted_n->gvn];
+    int fx_attempted = fixed_reg_mask(useful_mask);
     FOR_N(i, 0, ctx->num_regs[useful_class]) {
         // TODO(NeGate): this is bit math & tests, we can speed this process up
         if (ra->active[useful_class][i] > 0 && bits64_member(ra->mask, i)) {
+            // PATCH(odin-tilde): never offer the attempted vreg itself as an
+            // eviction candidate. It can be active already when two defs of
+            // the same vreg (e.g. two coalesced projections pinned to the
+            // same register) overlap: evicting "ourselves" just marks the
+            // vreg been_spilled without separating the overlapping defs, so
+            // the identical self-conflict recurs every round. With self
+            // excluded the allocator falls through to a real self-split,
+            // which does separate the defs.
+            if (ctx->vreg_map[ra->active[useful_class][i]] == us) {
+                continue;
+            }
             dyn_array_put(ra->potential_spills, ra->active[useful_class][i]);
         }
     }
@@ -1301,6 +1662,23 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
         TB_ASSERT(ctx->vreg_map[gvn] > 0);
         VReg* vreg = &ctx->vregs[ctx->vreg_map[gvn]];
         if (!within_reg_mask(useful_mask, vreg->assigned)) {
+            continue;
+        }
+        // PATCH(odin-tilde): when the attempted vreg is NOT itself pinned,
+        // a pinned occupant (fixed single-register mask) can never be freed
+        // by eviction — its split clones re-inherit the pin at the same
+        // program point (call argument, rep-movs operand) and the identical
+        // conflict recurs next round, spinning the split loop forever while
+        // the pinned vreg's tiny spill cost always wins as the eviction
+        // target. For a non-pinned attempter such occupants are simply
+        // never candidates: it must evict a non-pinned neighbor or split
+        // itself. (A PINNED attempter keeps them as candidates: evicting a
+        // range-pinned occupant is the only way to free its register, since
+        // the occupant's tail can bridge out — see the occ_pinned_same
+        // logic below.)
+        if (fx_attempted < 0 &&
+            vreg->mask != NULL && vreg->mask != &TB_REG_EMPTY &&
+            fixed_reg_mask(vreg->mask) >= 0) {
             continue;
         }
 
@@ -1323,8 +1701,42 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
         }
     }
 
-    int us = ctx->vreg_map[attempted_n->gvn];
     float us_score = rogers_get_spill_cost(ctx, ra, &ctx->vregs[us]);
+    // PATCH(odin-tilde): self-splitting a fixed-mask vreg usually cannot
+    // resolve its allocation failure — the split def inherits the same
+    // single-register mask and fails identically next round (infinite
+    // remat/split loop on e.g. an iconst pinned to RSI). Evict the
+    // register's occupant instead whenever one is available.
+    // EXCEPTION: when the occupant is pinned to the SAME register, its pin
+    // is just as real — evicting it can never free the register (the split
+    // clones re-inherit the pin and the identical conflict recurs every
+    // round, e.g. a call-result projection pinned to RSI vs a rep-movs
+    // wrapper copy pinned to RSI). The attempted vreg must then split its
+    // own range: the def point stays pinned but the tail bridges out of
+    // the register through spill copies. A pinned attempted COPY is the
+    // mirror case — its range is a single point so self-splitting is
+    // futile, and evicting the range-pinned occupant is the only option.
+    int fx_us = fixed_reg_mask(ctx->vregs[us].mask);
+    bool occ_pinned_same = false;
+    if (fx_us >= 0 && best_spill > 0) {
+        RegMask* occ_mask = ctx->vregs[best_spill].mask;
+        occ_pinned_same = occ_mask != NULL && occ_mask != &TB_REG_EMPTY &&
+                          fixed_reg_mask(occ_mask) == fx_us;
+    }
+    if (best_spill > 0 && best_score != INFINITY && fx_us >= 0 &&
+        (!occ_pinned_same || attempted_n->type == TB_MACH_COPY ||
+         ctx->mayspill_mask[useful_class] == NULL)) {
+        // Evict the occupant. The mayspill_mask == NULL case (e.g. FLAGS,
+        // a single-register class): self-splitting can never resolve the
+        // conflict — the tail cannot bridge out of the register (no spill
+        // path, remat recreates the def at the same conflicting use
+        // point) — so the occupant must move instead: its forced remat
+        // shrinks ITS live range toward its own uses.
+        us_score = INFINITY;
+    } else if (occ_pinned_same && us_score != INFINITY) {
+        // force the self-split branch below
+        best_score = INFINITY;
+    }
     if (us_score < best_score) {
         // mark the second best as the HRP region to split around it
         if (best_spill > 0 && best_score != INFINITY) {
@@ -1352,8 +1764,25 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
 
     TB_ASSERT(best_score != INFINITY);
     TB_ASSERT(best_spill > 0);
+
+    // PATCH(odin-tilde): when a pinned vreg wins its register by evicting
+    // an occupant, the occupant's split clones must avoid that register —
+    // otherwise they get re-colored straight back into it (first-free or
+    // copy hint), the same conflict recurs next round, and the split loop
+    // never converges. The splitter treats `clobber` as the register set
+    // the split clones must avoid.
+    SplitDecision s = { best_spill };
+    if (best_spill != us) {
+        int fx = fixed_reg_mask(ctx->vregs[us].mask);
+        // single-register classes (e.g. FLAGS) have nothing to avoid into:
+        // the complement mask would be empty, so leave those to the normal
+        // split machinery.
+        if (fx >= 0 && ctx->num_regs[useful_class] > 1) {
+            s.clobber = intern_regmask(ctx, useful_class, false, 1ull << fx);
+        }
+    }
     cuikperf_region_end();
-    return (SplitDecision){ best_spill };
+    return s;
 }
 
 static int evict_vreg(Ctx* ctx, Rogers* ra, int evicted_class, int target) {
@@ -1405,9 +1834,40 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
             int old = ra->active[vreg->class][vreg->assigned];
             if (old != 0 && old != n->gvn && ctx->vreg_map[old] != vreg_id) {
                 int old_vreg = ctx->vreg_map[old];
+                // PATCH(odin-tilde): if the current holder is pinned to
+                // exactly this register, evicting it is futile — the split
+                // clone inherits the same pin and conflicts again next
+                // round (infinite wake/evict cycle). Split our own stale
+                // reservation instead so we get re-colored elsewhere.
+                VReg* holder = &ctx->vregs[old_vreg];
+                bool holder_pinned = holder->mask != NULL && fixed_reg_mask(holder->mask) == vreg->assigned;
+                bool self_pinned   = vreg->mask != NULL && fixed_reg_mask(vreg->mask) == vreg->assigned;
+                if (getenv("TB_RA_SPIN_DEBUG")) { // DEBUG(odin-tilde)
+                    printf("WAKE-CONFLICT: V%d %%%u(%s) reg%d holder=V%d %%%u(%s) holder_pin=%d self_pin=%d self_fixed=%d\n",
+                        vreg_id, n->gvn, tb_node_get_name(n->type), vreg->assigned,
+                        old_vreg, old, tb_node_get_name(ra->gvn2node[old]->type),
+                        holder_pinned, self_pinned, vreg->mask ? fixed_reg_mask(vreg->mask) : -9);
+                }
+                if (holder_pinned && !self_pinned) {
+                    evict_vreg(ctx, ra, def_class, vreg_id);
+                    // our split clones must avoid the holder's pinned
+                    // register or the same wake conflict recurs next round.
+                    // (only meaningful when the class has room to avoid into)
+                    SplitDecision s = { .target = vreg_id };
+                    if (ctx->num_regs[def_class] > 1) {
+                        s.clobber = intern_regmask(ctx, def_class, false, 1ull << fixed_reg_mask(holder->mask));
+                    }
+                    dyn_array_put(ra->splits, s);
+                    return false;
+                }
                 TB_ASSERT(!set_get(&ra->been_spilled, old_vreg));
                 evict_vreg(ctx, ra, def_class, old_vreg);
                 SplitDecision s = { .target = old_vreg };
+                if (self_pinned && ctx->num_regs[def_class] > 1) {
+                    // the holder's split clones must avoid our pinned
+                    // register or it retakes it and we evict it forever.
+                    s.clobber = intern_regmask(ctx, def_class, false, 1ull << vreg->assigned);
+                }
                 dyn_array_put(ra->splits, s);
             }
         }
@@ -1557,6 +2017,29 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
         }
 
         SplitDecision s = choose_best_spill(ctx, ra, n);
+        if (getenv("TB_RA_SPIN_DEBUG")) { // DEBUG(odin-tilde)
+            printf("BEST-SPILL: attempted V%d %%%u(%s) fixed=%d -> target V%d %%%u(%s) fixed=%d\n",
+                vreg_id, n->gvn, tb_node_get_name(n->type),
+                vreg->mask ? fixed_reg_mask(vreg->mask) : -9,
+                s.target, ctx->vregs[s.target].n ? ctx->vregs[s.target].n->gvn : 0,
+                ctx->vregs[s.target].n ? tb_node_get_name(ctx->vregs[s.target].n->type) : "?",
+                ctx->vregs[s.target].mask ? fixed_reg_mask(ctx->vregs[s.target].mask) : -9);
+        }
+        if (getenv("TB_RA_SPIN_DEBUG") && s.target == vreg_id && fixed_reg_mask(vreg->mask) >= 0) { // DEBUG(odin-tilde)
+            int fx = fixed_reg_mask(vreg->mask);
+            printf("SELF-SPLIT FIXED: V%d %%%u(%s) reg%d, class actives:", vreg_id, n->gvn, tb_node_get_name(n->type), fx);
+            FOR_N(ai, 0, ctx->num_regs[mask->class]) {
+                uint32_t ag = ra->active[mask->class][ai];
+                if (ag) {
+                    int av = ctx->vreg_map[ag];
+                    printf(" [%d]=%%%u(V%d f=%d bs=%d)", ai, ag, av,
+                        av > 0 && ctx->vregs[av].mask ? fixed_reg_mask(ctx->vregs[av].mask) : -9,
+                        av > 0 ? set_get(&ra->been_spilled, av) : -1);
+                }
+            }
+            printf("\n");
+            fflush(stdout);
+        }
         VReg* evicted   = &ctx->vregs[s.target];
         int evicted_reg = evict_vreg(ctx, ra, mask->class, s.target);
 
@@ -1793,7 +2276,22 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
                         // this value was colored by a previous allocation
                         // pass, we'll limit the mask accordingly, it's honestly
                         // unclear to me if we need to do this.
-                        ctx->vregs[vreg_id].mask = intern_regmask2(ctx, ctx->vregs[vreg_id].class, false, ctx->vregs[vreg_id].assigned);
+                        //
+                        // PATCH(odin-tilde): ...and it is actively harmful for
+                        // normally-masked vregs. Narrowing a wide mask to the
+                        // previously assigned register manufactures a fixed
+                        // mask out of a mere coloring decision; when that
+                        // vreg is later evicted (e.g. a pinned wrapper copy
+                        // legitimately needs its register), the split clones
+                        // inherit the artificial pin, fail identically, and
+                        // the split loop never converges. Intrinsically
+                        // pinned vregs keep their exact mask either way (the
+                        // constraint meets re-pin them), so only re-pin vregs
+                        // whose mask is already fixed to this register.
+                        RegMask* cur = ctx->vregs[vreg_id].mask;
+                        if (fixed_reg_mask(cur) == ctx->vregs[vreg_id].assigned) {
+                            ctx->vregs[vreg_id].mask = intern_regmask2(ctx, ctx->vregs[vreg_id].class, false, ctx->vregs[vreg_id].assigned);
+                        }
                     }
 
                     int class = ctx->vregs[vreg_id].class;
@@ -1976,6 +2474,79 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
                     }
                     #endif
                 }
+
+                // PATCH(odin-tilde): sleepers must respect clobbers too.
+                // A value in a lifetime hole sits in future_active with its
+                // register still reserved but does not occupy ra->active, so
+                // the BITS64_FOR scan above never sees it. Block-head "start
+                // interval" allocation also never inserts such nodes into
+                // ra->live, so liveness here must be tested against the
+                // block's live_out as well. A call clobber destroys the
+                // physical register regardless; evict any sleeper live
+                // across this point whose reserved register is clobbered
+                // and split it around the clobber, like an active occupant.
+                {
+                    SparseSet* fut = &ra->future_active[kill_class];
+                    // PATCH(odin-tilde): sized to the actual sleeper stack.
+                    // Was int sleepers[32] with a TB_ASSERT bound, justified
+                    // by "reserved registers are unique per vreg" — but split
+                    // insertion can leave stale duplicate reservations (the
+                    // TILDE FIX wake-conflict case), and in release builds
+                    // the assert compiles out, so the 33rd sleeper smashed
+                    // the stack and corrupted RA state nondeterministically.
+                    int* sleepers = tb_arena_alloc(&ctx->f->tmp_arena,
+                        (aarray_length(fut->stack) + 1) * sizeof(int));
+                    size_t num_sleepers = 0;
+                    aarray_for(i, fut->stack) {
+                        uint32_t gvn = fut->stack[i];
+                        if (!set_get(&ra->live, gvn) && !set_get(&bb->live_out, gvn)) {
+                            continue;
+                        }
+
+                        int svreg_id = ctx->vreg_map[gvn];
+                        if (svreg_id <= 0 || set_get(&ra->been_spilled, svreg_id)) {
+                            continue;
+                        }
+
+                        VReg* svreg = &ctx->vregs[svreg_id];
+                        if (svreg->class == kill_class && svreg->assigned >= 0 &&
+                            within_reg_mask(kills[k], svreg->assigned)) {
+                            bool dup = false;
+                            FOR_N(j, 0, num_sleepers) {
+                                if (sleepers[j] == svreg_id) { dup = true; break; }
+                            }
+                            if (!dup) {
+                                TB_ASSERT(num_sleepers < aarray_length(fut->stack) + 1);
+                                sleepers[num_sleepers++] = svreg_id;
+                            }
+                        }
+                    }
+
+                    FOR_N(i, 0, num_sleepers) {
+                        TB_OPTDEBUG(REGALLOC)(printf("#       \x1b[33mSPILLING SLEEPER V%u (CLOBBERED BY %%%u)\x1b[0m\n", sleepers[i], n->gvn));
+                        if (!hrp_point) {
+                            hrp_point = true;
+                            mark_point_as_hrp(ctx, ra, n, kill_class);
+                        }
+
+                        evict_vreg(ctx, ra, kill_class, sleepers[i]);
+
+                        // escalate past the remat-hard split path: remat
+                        // copies get their node's natural (fully clobberable)
+                        // mask, and their block-granular ranges can span this
+                        // same call, which made RA oscillate forever. With
+                        // was_spilled != 0 the splitter does a plain spill
+                        // into non-clobbered (or stack) masks instead, which
+                        // is guaranteed to terminate.
+                        VReg* svreg = &ctx->vregs[sleepers[i]];
+                        if (svreg->was_spilled == 0) {
+                            svreg->was_spilled = 1;
+                        }
+
+                        SplitDecision s = { .target = sleepers[i], .clobber = kills[k] };
+                        dyn_array_put(ra->splits, s);
+                    }
+                }
             }
 
             // start intervals
@@ -2133,7 +2704,18 @@ static void rogers_remat(Ctx* ctx, Rogers* ra, TB_Node* n, bool kill_node) {
 
         // insert copy because the mask can't be represented
         RegMask* mask = tb__reg_mask_meet(ctx, in_mask, reload_vreg->mask);
-        if (mask == &TB_REG_EMPTY) {
+        // PATCH(odin-tilde): also route fixed (pinned) use masks through a
+        // copy. Wiring the remat straight into a pinned use re-pins the
+        // remat's vreg through the mask meet, so the next round splits it
+        // again and the remat/split cycle never converges (infinite clone
+        // churn on e.g. a mov pinned to RCX).
+        bool remat_needs_copy = (mask == &TB_REG_EMPTY);
+        if (!remat_needs_copy && use_n->type != TB_PHI &&
+            fixed_reg_mask(in_mask) >= 0 &&
+            fixed_reg_mask(reload_vreg->mask) != fixed_reg_mask(in_mask)) {
+            remat_needs_copy = true;
+        }
+        if (remat_needs_copy) {
             reload_vreg->reg_width = tb__reg_width_from_dt(reload_vreg->mask->class, remat->dt);
             reload_vreg->spill_bias = 1e6;
 

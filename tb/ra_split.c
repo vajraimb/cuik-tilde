@@ -208,6 +208,24 @@ static TB_Node* insert_reload(Ctx* ctx, Rogers* ra, RegSplitter* splitter, TB_Ba
         n = splitter->leaders[spill];
     }
 
+    // PATCH(odin-tilde): a remat_all range is available everywhere by
+    // rematerialization — the splitter builds no phis for it and does NOT
+    // guarantee a spill store dominating this block. If bb_defs[spill] is a
+    // spill-store copy that only some predecessor paths wrote, a slot reload
+    // here reads an unwritten slot on the other paths (fmt@fmt_value crashed
+    // on exactly this: a reload of STACK89 whose only store sat in a sibling
+    // branch). Unwrap copy chains back to the remat-able producer so the
+    // remat branch below clones it next to this use instead.
+    if ((splitter->remat_all >> spill) & 1) {
+        TB_Node* src = n;
+        while (src->type == TB_MACH_COPY && src->inputs[1] != NULL) {
+            src = src->inputs[1];
+        }
+        if (!is_spill_store(src) && can_remat(ctx, src)) {
+            n = src;
+        }
+    }
+
     TB_Node* cpy;
     if (!is_spill_store(n) && can_remat(ctx, n)) {
         size_t extra = extra_bytes(n);
@@ -288,6 +306,55 @@ static TB_Node* insert_reload(Ctx* ctx, Rogers* ra, RegSplitter* splitter, TB_Ba
     }
 
     nl_table_put(&splitter->spill_map, cpy, (void*) ((uintptr_t) spill + 1));
+    return cpy;
+}
+
+// PATCH(odin-tilde): mask of the register a split def currently resides in.
+static RegMask* split_def_mask(Ctx* ctx, Rogers* ra, RegSplitter* splitter, TB_Node* def) {
+    if (def->type == TB_MACH_COPY) {
+        return TB_NODE_GET_EXTRA_T(def, TB_NodeMachCopy)->def;
+    }
+    if (ra->uf != NULL && def->gvn < splitter->old_node_count) {
+        int leader = uf_find(ra->uf, ra->uf_len, def->gvn);
+        int vid = leader < aarray_length(ctx->vreg_map) ? ctx->vreg_map[leader] : 0;
+        if (vid > 0 && ctx->vregs[vid].mask != NULL) {
+            return ctx->vregs[vid].mask;
+        }
+    }
+    return ctx->constraint(ctx, def, NULL);
+}
+
+// PATCH(odin-tilde): implements the stock TODO at the use-reconnect site.
+// After a clobber split, the resident def's mask can exclude a register a
+// "tight" (fixed) use requires — e.g. a call argument pinned to RSI whose
+// value was reloaded outside the clobbered set. Insert a bridging copy
+// right before the use: reads the resident def, writes the pinned mask.
+// Its live range is a single point so no clobber can span it.
+static TB_Node* insert_bridge_copy(Ctx* ctx, Rogers* ra, RegSplitter* splitter, TB_BasicBlock* bb, size_t* j_ptr, TB_Node* def, RegMask* def_mask, TB_Node* n, int k, RegMask* in_mask) {
+    TB_Function* f = ctx->f;
+    size_t bb_id = bb - ctx->cfg.blocks;
+    size_t j = *j_ptr;
+
+    TB_Node* cpy = tb_alloc_node(f, TB_MACH_COPY, n->inputs[k]->dt, 2, sizeof(TB_NodeMachCopy));
+    set_input(f, cpy, def, 1);
+    TB_NODE_SET_EXTRA(cpy, TB_NodeMachCopy, .def = in_mask, .use = def_mask);
+    aarray_push(splitter->all_defs, cpy);
+
+    // place above any temps belonging to the use
+    size_t t = j;
+    while (t > 0 && bb->items[t]->type == TB_MACH_TEMP) {
+        t--;
+    }
+    rogers_insert_op(ctx, bb_id, cpy, t);
+    *j_ptr += t <= j;
+
+    FOR_N(class, 1, ctx->num_classes) {
+        ra->hrp[bb_id].start[class] += t <= ra->hrp[bb_id].start[class];
+        ra->hrp[bb_id].end[class]   += t <= ra->hrp[bb_id].end[class];
+    }
+
+    TB_OPTDEBUG(REGSPLIT)(printf("  BB%zu: bridge %%%u (of %%%u) for pinned use %%%u:%d\n", bb_id, cpy->gvn, def->gvn, n->gvn, k));
+    set_input(f, n, cpy, k);
     return cpy;
 }
 
@@ -457,6 +524,12 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
     // bbb++;
     // tb_opt__REGSPLIT = bbb == 6 || bbb == 7;
+    {   // DEBUG(odin-tilde): env-gated per-function REGSPLIT dump.
+        // TB_REGSPLIT_DEBUG=<substring of mangled name> enables it.
+        const char* rsdbg = getenv("TB_REGSPLIT_DEBUG");
+        tb_opt__REGSPLIT = rsdbg != NULL && f->super.name != NULL &&
+                           strstr(f->super.name, rsdbg) != NULL;
+    }
 
     TB_OPTDEBUG(REGSPLIT)(printf("== INSERT NODES ==\n"));
 
@@ -498,6 +571,12 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
             uint64_t total_mask = UINT64_MAX >> (64 - ctx->num_regs[clobber->class]);
             splitter.spill_mask[i] = intern_regmask(ctx, clobber->class, true, ~clobber->mask[0] & total_mask);
+            // PATCH(odin-tilde): reloads of a clobber-split must avoid the
+            // clobbered registers too. Reloads are placed at block
+            // granularity, so a reload can still span the clobbering call;
+            // if it may take a clobbered register, the same conflict just
+            // reappears on the next round and RA never converges.
+            splitter.reload_mask[i] = splitter.spill_mask[i];
         } else {
             splitter.spill_mask[i] = ctx->mayspill_mask[class];
         }
@@ -591,7 +670,17 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             // split the occupant are written but never read in this version).
             // On repeat splits, fall through to the normal spill path so the
             // value actually leaves the pinned register for a stack slot.
-            if (can_remat(ctx, arr[0]) && splitter.was_spilled[spill_i] == 0) {
+            //
+            // PATCH(odin-tilde): classes with NO spill mask at all (e.g.
+            // FLAGS on x64, mayspill_mask[class] == NULL) can never take the
+            // spill path — it would manufacture a NULL-mask spill copy and
+            // crash in mach_copy (reg_mask_is_stack(NULL)). They must remat
+            // on every split: remat clones the producer (cmp) next to its
+            // uses, shrinking the live range, so this converges unlike the
+            // pinned-GPR remat loop described above.
+            int spill_class = splitter.reload_mask[spill_i]->class;
+            if (can_remat(ctx, arr[0]) &&
+                (splitter.was_spilled[spill_i] == 0 || ctx->mayspill_mask[spill_class] == NULL)) {
                 splitter.remat_all |= 1ull << spill_i;
             }
 
@@ -944,11 +1033,18 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                         // the reload mask might not overlap with the use mask if we clobbered
                         // a reg and realized we couldn't maintain the old mask, this might force a copy right before the
                         // "tight" uses.
-                        /* RegMask* in_mask = constraint_in(ctx, n, k);
-                        RegMask* meet = tb__reg_mask_meet(ctx, splitter.reload_mask[spill], in_mask);
-                        if (meet == &TB_REG_EMPTY) {
-                            __debugbreak();
-                        } */
+                        // PATCH(odin-tilde): implemented below (was a stock TODO).
+                        // A pinned use must never re-pin the resident def's
+                        // vreg through the mask meet — route it through a
+                        // single-point bridge copy unless the def already
+                        // lives in exactly the pinned register.
+                        RegMask* in_mask = constraint_in(ctx, n, k);
+                        if (fixed_reg_mask(in_mask) >= 0) {
+                            RegMask* def_mask = split_def_mask(ctx, ra, &splitter, def);
+                            if (def_mask != NULL && fixed_reg_mask(def_mask) != fixed_reg_mask(in_mask)) {
+                                insert_bridge_copy(ctx, ra, &splitter, bb, &j, def, def_mask, n, k, in_mask);
+                            }
+                        }
                     } else {
                         if (n->type == TB_MACH_COPY) {
                             TB_NodeMachCopy* dst = TB_NODE_GET_EXTRA(n);
@@ -976,7 +1072,20 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                                     dst->use = TB_NODE_GET_EXTRA_T(def, TB_NodeMachCopy)->use;
                                     set_input(f, n, def->inputs[1], k);
                                     continue;
-                                } else if (!reg_mask_is_stack(dst->def)) {
+                                } else if (!reg_mask_is_stack(dst->def) && is_spill_store(def)) {
+                                    // PATCH(odin-tilde): added the
+                                    // is_spill_store(def) requirement —
+                                    // only convert this copy into a stack
+                                    // reload when the value is genuinely
+                                    // spill-slot resident. Under the remat
+                                    // strategy (HRP "split remat") NO spill
+                                    // store is ever written, so converting
+                                    // here read an unwritten slot and the
+                                    // original range never shrank (the RA
+                                    // re-split the same vreg forever). The
+                                    // remat case now falls through to
+                                    // insert_reload, which rematerializes
+                                    // the def right next to this use.
                                     dst->use = splitter.spill_mask[spill];
                                     set_input(f, n, def, k);
 
@@ -997,7 +1106,12 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                         // if we could do a folded reload but the destination can't, we
                         // fail to do perform it (since we couldn't coalesce).
                         if (can_fold) {
-                            if (can_remat(ctx, def)) {
+                            // PATCH(odin-tilde): also refuse to fold when the
+                            // range is remat_all — def may be a spill-store
+                            // copy (can_remat false) whose store does not
+                            // dominate this use; folding would read an
+                            // unwritten slot. insert_reload remats instead.
+                            if (can_remat(ctx, def) || ((splitter.remat_all >> spill) & 1)) {
                                 // this would just neither spill or reload the original range and thus
                                 // not shrink it, so we force a "reload" here.
                                 can_fold = false;
@@ -1038,6 +1152,21 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                                 set_input(f, n, def, l);
                             }
                         }
+
+                        // PATCH(odin-tilde): a reload placed for a clobber
+                        // split avoids the clobbered registers, so it cannot
+                        // directly satisfy a use pinned to one of them; bridge
+                        // it (see the W-resident case above). Even when the
+                        // masks do meet, routing a pinned use straight onto a
+                        // normie/narrow def re-pins that def's vreg through
+                        // the mask meet and the split never converges.
+                        RegMask* in_mask = constraint_in(ctx, n, k);
+                        if (fixed_reg_mask(in_mask) >= 0) {
+                            RegMask* def_mask = split_def_mask(ctx, ra, &splitter, def);
+                            if (def_mask != NULL && fixed_reg_mask(def_mask) != fixed_reg_mask(in_mask)) {
+                                insert_bridge_copy(ctx, ra, &splitter, bb, &j, def, def_mask, n, k, in_mask);
+                            }
+                        }
                     }
 
                     TB_OPTDEBUG(REGSPLIT)(printf("  BB%zu: SPILL%d: use at %%%u:%zu (of %%%u)\n", bb_id, spill, n->gvn, k, def->gvn));
@@ -1062,7 +1191,16 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
                     TB_OPTDEBUG(REGSPLIT)(printf("  BB%zu: SPILL%d: def %%%u\n", bb_id, spill, n->gvn));
 
-                    bool should_spill_immediately = ((is_hrp_rn | spill_aggro | splitter.remat_all) >> spill) & 1;
+                    // PATCH(odin-tilde): include was_spilled_before — a
+                    // vreg that was already split in a previous round and
+                    // STILL failed allocation must not keep a long
+                    // register-resident range from its def to the first
+                    // HRP spill point (e.g. a pinned param projection
+                    // blocking an argument register across a whole block
+                    // of memcpys). Escalate to spilling immediately after
+                    // the def: the register range becomes [def, def+1],
+                    // the minimum possible, so this always converges.
+                    bool should_spill_immediately = ((is_hrp_rn | spill_aggro | splitter.remat_all | was_spilled_before) >> spill) & 1;
                     int class = splitter.reload_mask[spill]->class;
                     if (j >= ra->hrp[bb_id].start[class] && j <= ra->hrp[bb_id].end[class]) {
                         should_spill_immediately = true;
@@ -1347,6 +1485,12 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
         // make them all their own roots
         TB_ASSERT(n->gvn < ra->uf_len);
+        // PATCH(odin-tilde): scrub n from its old leader's coalesce array
+        // before re-rooting. Previously only the leader-keyed table entry was
+        // removed (below), leaving n listed in the old set's array; later
+        // put_to_sleep_vreg/evict_vreg walks of that array then saw n mapped
+        // to a different vreg and tripped their invariant asserts.
+        rogers_uncoalesce(ctx, ra, n->gvn);
         ra->uf[n->gvn] = n->gvn;
         ra->uf_size[n->gvn] = 1;
 
@@ -1417,6 +1561,33 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
     aarray_for(i, splitter.all_defs) {
         TB_Node* n = splitter.all_defs[i];
         int leader = uf_find(ra->uf, ra->uf_len, n->gvn);
+
+        // PATCH(odin-tilde): relax zombie pinned copies. A pinned wrapper
+        // copy whose pinned use was rewired away keeps its fixed def mask
+        // forever (its own constraint re-pins the vreg every round) and can
+        // deadlock the allocator against the register's occupant. If no
+        // remaining use requires the pin, drop the def mask back to the
+        // class normie mask.
+        if (n->type == TB_MACH_COPY) {
+            TB_NodeMachCopy* mc = TB_NODE_GET_EXTRA(n);
+            int fx = fixed_reg_mask(mc->def);
+            if (fx >= 0) {
+                bool needed = false;
+                FOR_USERS(u, n) {
+                    if (USERI(u) > 0 && USERI(u) < USERN(u)->input_count) {
+                        RegMask* um = constraint_in(ctx, USERN(u), USERI(u));
+                        if (um && um->class == mc->def->class && fixed_reg_mask(um) == fx) {
+                            needed = true;
+                            break;
+                        }
+                    }
+                }
+                if (!needed) {
+                    mc->def = ctx->normie_mask[mc->def->class];
+                }
+            }
+        }
+
         RegMask* mask = ctx->constraint(ctx, n, NULL);
 
         int vreg_id = ctx->vreg_map[leader];
@@ -1426,15 +1597,110 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             vreg->spill_bias = mask->may_spill ? -100.0f : 0.0f;
         }
         mask = tb__reg_mask_meet(ctx, mask, ctx->vregs[vreg_id].mask);
+        if (getenv("TB_RA_SPIN_DEBUG") && (n->gvn == 51 || n->gvn == 55)) { // DEBUG(odin-tilde)
+            printf("RECOMPUTE-SEE: %%%u(%s) V%d old_fixed=%d met_fixed=%d\n",
+                n->gvn, tb_node_get_name(n->type), vreg_id,
+                ctx->vregs[vreg_id].mask ? fixed_reg_mask(ctx->vregs[vreg_id].mask) : -9,
+                mask ? fixed_reg_mask(mask) : -9);
+        }
+        if (getenv("TB_RA_SPIN_DEBUG") && mask != NULL && fixed_reg_mask(mask) >= 0 &&
+            fixed_reg_mask(ctx->constraint(ctx, n, NULL)) < 0) { // DEBUG(odin-tilde)
+            printf("FIXED-OLD: %%%u(%s) vreg V%d old-mask-fixed\n",
+                n->gvn, tb_node_get_name(n->type), vreg_id);
+        }
 
         FOR_USERS(u, n) {
             if (USERI(u) > 0 && USERI(u) < USERN(u)->input_count) {
                 RegMask* in_mask = constraint_in(ctx, USERN(u), USERI(u));
+                if (getenv("TB_RA_SPIN_DEBUG") && fixed_reg_mask(in_mask) >= 0) { // DEBUG(odin-tilde)
+                    printf("FIXED-MEET: %%%u(%s) pinned by %%%u(%s):%d mask=%p\n",
+                        n->gvn, tb_node_get_name(n->type), USERN(u)->gvn,
+                        tb_node_get_name(USERN(u)->type), USERI(u), (void*)in_mask);
+                }
                 mask = tb__reg_mask_meet(ctx, mask, in_mask);
             }
         }
 
         // TB_ASSERT(mask != &TB_REG_EMPTY);
+        // PATCH(odin-tilde): relax zombie fixed masks. Meets are monotone,
+        // so once a vreg's mask was pinned by a use that has since been
+        // rewired away, it stays pinned forever even though no remaining
+        // use (across the whole coalesce group) requires it — and a fixed
+        // vreg that keeps losing its register spins the split loop.
+        // Intrinsically pinned defs (projections, temps, pinned copies)
+        // are exempt: their own constraint legitimately fixes the mask.
+        if (mask != &TB_REG_EMPTY && fixed_reg_mask(mask) >= 0 &&
+            fixed_reg_mask(ctx->constraint(ctx, n, NULL)) < 0) {
+            int fx = fixed_reg_mask(mask);
+            // PATCH(odin-tilde): intrinsically pinned DEFS anywhere in the
+            // coalesce group (e.g. a call-result projection 2addr-merged
+            // into this add) legitimately fix the mask — the hardware
+            // writes that register no matter what the uses look like.
+            // Checking only n's own def constraint misses them and drops
+            // the pin, detaching the projection from the register the call
+            // actually returns in (observed: sha256 round function — F1's
+            // RAX result "assigned" to EBP with no copy ever moving it out
+            // of RAX).
+            bool intrinsic = false;
+            size_t gcnt;
+            TB_Node** garr = coalesce_set_array(ctx, ra, &n, &gcnt);
+            FOR_N(gi, 0, gcnt) {
+                if (garr[gi]->type != TB_MACH_COPY &&
+                    fixed_reg_mask(ctx->constraint(ctx, garr[gi], NULL)) >= 0) {
+                    intrinsic = true;
+                    break;
+                }
+            }
+            bool needed = false;
+            if (!intrinsic) {
+                FOR_N(gi, 0, gcnt) {
+                    FOR_USERS(u, garr[gi]) {
+                        if (USERI(u) > 0 && USERI(u) < USERN(u)->input_count) {
+                            RegMask* um = constraint_in(ctx, USERN(u), USERI(u));
+                            if (um && um->class == mask->class && fixed_reg_mask(um) == fx) {
+                                needed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (needed) { break; }
+                }
+            }
+            if (!intrinsic && !needed) {
+                if (getenv("TB_RA_SPIN_DEBUG")) { // DEBUG(odin-tilde)
+                    printf("ZOMBIE-RELAX: %%%u(%s) vreg V%d fixed=%d -> normie\n",
+                        n->gvn, tb_node_get_name(n->type), vreg_id, fx);
+                }
+                mask = ctx->normie_mask[mask->class];
+            }
+        }
+        // PATCH(odin-tilde): for clobber/avoid splits the split def's own
+        // mask must also exclude the avoided registers — narrowing only the
+        // reload/spill copies still lets the def itself retake the avoided
+        // register (first-free or hint) and re-conflict on the next round.
+        {
+            int spill_i = spill_map_get2(&splitter.spill_map, n);
+            if (spill_i >= 0 && splits[spill_i].clobber != NULL &&
+                splitter.reload_mask[spill_i] != NULL &&
+                mask != NULL && mask != &TB_REG_EMPTY &&
+                mask->class == splitter.reload_mask[spill_i]->class) {
+                RegMask* narrowed = tb__reg_mask_meet(ctx, mask, splitter.reload_mask[spill_i]);
+                if (narrowed != NULL && narrowed != &TB_REG_EMPTY) {
+                    mask = narrowed;
+                }
+            }
+        }
+        if (getenv("TB_RA_SPIN_DEBUG") && (n->gvn == 51 || n->gvn == 55)) { // DEBUG(odin-tilde)
+            printf("RECOMPUTE-FINAL: %%%u(%s) V%d final_fixed=%d\n",
+                n->gvn, tb_node_get_name(n->type), vreg_id,
+                mask ? fixed_reg_mask(mask) : -9);
+        }
+        if (vreg_id == 0) { // DEBUG(odin-tilde)
+            printf("RECOMPUTE-V0: n=%%%u(%s) leader=%%%u\n",
+                n->gvn, tb_node_get_name(n->type), leader);
+            fflush(stdout);
+            abort();
+        }
         ctx->vregs[vreg_id].mask = mask;
         ctx->vreg_map[n->gvn] = vreg_id;
     }

@@ -35,7 +35,12 @@ static int macho_put_symbol(TB_Emitter* stab, TB_Emitter* strtbl, const char* na
     size_t strx = strtbl->count;
     if (name != NULL) {
         tb_out1b(strtbl, '_');
-        tb_outstr_nul_UNSAFE(strtbl, name);
+        // PATCH(odin-tilde): was tb_outstr_nul_UNSAFE — the string table is
+        // only pre-reserved to 1024 bytes, and long mangled names (Odin's
+        // runtime has hundreds) overflowed it, silently corrupting the
+        // object file (heap-buffer-overflow, nondeterministic traps and
+        // "invalid r_symbolnum=0" linker errors). tb_outs reserves first.
+        tb_outs(strtbl, strlen(name) + 1, name);
     } else {
         tb_out1b(strtbl, 0);
     }

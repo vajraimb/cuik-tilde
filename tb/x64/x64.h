@@ -136,7 +136,12 @@ static bool is_value_match(const Val* a, const Val* b) {
     if (a->type != b->type) return false;
 
     if (a->type == VAL_MEM) {
-        return a->reg == b->reg && a->index == b->index && a->scale == b->scale && a->index == b->index;
+        // PATCH(odin-tilde): upstream forgot the displacement — any two
+        // RSP-relative slots "matched", so stack-to-stack mach copies
+        // between DIFFERENT spill slots were silently dropped as no-ops,
+        // leaving the destination slot unwritten (read-back garbage under
+        // high spill pressure; hung thread.join, broke bit_set locals).
+        return a->reg == b->reg && a->index == b->index && a->scale == b->scale && a->imm == b->imm;
     }
 
     return (a->type == VAL_GPR || a->type == VAL_XMM) ? a->reg == b->reg : false;

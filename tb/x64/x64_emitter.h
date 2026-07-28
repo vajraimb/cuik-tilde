@@ -136,7 +136,9 @@ static void inst2(TB_CGEmitter* restrict e, InstType type, const Val* a, const V
         // Opcode
         if (inst->cat == INST_BINOP_EXT || inst->cat == INST_BINOP_EXT2) {
             // DEF instructions can only be 32bit and 64bit... maybe?
-            if (type != XADD) sz = 0;
+            // PATCH(odin-tilde): CMPXCHG (like XADD) has a byte form at
+            // opcode-1, so let the sz bit select 0xB0/0xB1.
+            if (type != XADD && type != CMPXCHG) sz = 0;
             EMIT1(e, 0x0F);
         }
 

@@ -331,12 +331,18 @@ static TB_Node* isel_multi_way_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
     double density = range_fits ? ((double)br->succ_count) / ((double) (max - min)) : 0.0;
 build_linear_table:
     if (density > 0.25f) {
+        // PATCH(odin-tilde): the frontend stores case keys sign-extended
+        // to 64 bits, so when any key lives in the negative region (high
+        // 32 bits set) the runtime key must be sign-extended as well;
+        // zero-extension would make every negative key miss the range
+        // check and fall into the default case.
+        bool signed_keys = (max >> 32) != 0;
         if (src->dt.type == TB_TAG_I32) {
-            src = unary_reg(f, TB_x86_mov, TB_TYPE_I64, src);
+            src = unary_reg(f, signed_keys ? TB_x86_movsx32 : TB_x86_mov, TB_TYPE_I64, src);
         } else if (src->dt.type == TB_TAG_I16) {
-            src = unary_reg(f, TB_x86_movzx16, TB_TYPE_I64, src);
+            src = unary_reg(f, signed_keys ? TB_x86_movsx16 : TB_x86_movzx16, TB_TYPE_I64, src);
         } else if (src->dt.type == TB_TAG_I8) {
-            src = unary_reg(f, TB_x86_movzx8, TB_TYPE_I64, src);
+            src = unary_reg(f, signed_keys ? TB_x86_movsx8 : TB_x86_movzx8, TB_TYPE_I64, src);
         }
 
         // normalize range, x' = x - range_start
@@ -466,9 +472,14 @@ build_linear_table:
                 // k = rol(k, 15) * 0x1b873593
                 // h = rol(h ^ k, 13) * 5
                 // h = (h + 0xe6546b64) >> (32 - shift)
-                if (src->dt.type < TB_TAG_I32) {
-                    // zero extend
-                    src = unary_reg(f, src->dt.type == TB_TAG_I16 ? TB_x86_movzx16 : TB_x86_movzx8, TB_TYPE_I32, src);
+                // PATCH(odin-tilde): negative (sign-extended) keys need
+                // sign extension here too — both the 32-bit hash input and
+                // the 64-bit key check below must match the stored keys.
+                bool signed_keys = (max >> 32) != 0;
+                if (src->dt.type == TB_TAG_I16) {
+                    src = unary_reg(f, signed_keys ? TB_x86_movsx16 : TB_x86_movzx16, TB_TYPE_I32, src);
+                } else if (src->dt.type == TB_TAG_I8) {
+                    src = unary_reg(f, signed_keys ? TB_x86_movsx8 : TB_x86_movzx8, TB_TYPE_I32, src);
                 }
 
                 TB_Node* k = src;
@@ -500,10 +511,19 @@ build_linear_table:
             TB_Node* prev_ctrl = n->inputs[0];
             size_t key_offset = cap * sizeof(uint64_t);
             if (1) {
+                // PATCH(odin-tilde): the stored keys are 64 bits wide, so a
+                // 32-bit runtime key must be widened before the compare —
+                // with sign extension when the case keys are negative
+                // (they are stored sign-extended by the frontend).
+                TB_Node* key64 = src;
+                if (key64->dt.type == TB_TAG_I32) {
+                    key64 = unary_reg(f, ((max >> 32) != 0) ? TB_x86_movsx32 : TB_x86_mov, TB_TYPE_I64, key64);
+                }
+
                 TB_Node* cmp = tb_alloc_node(f, TB_x86_cmp, TB_TYPE_I64, 5, sizeof(X86MemOp));
-                set_input(f, cmp, lea, 2);
-                set_input(f, cmp, h,   3);
-                set_input(f, cmp, src, 4);
+                set_input(f, cmp, lea,   2);
+                set_input(f, cmp, h,     3);
+                set_input(f, cmp, key64, 4);
                 TB_NODE_SET_EXTRA(cmp, X86MemOp, .disp = key_offset, .scale = SCALE_X8, .flags = OP_INDEXED, .mode = MODE_LD, .extra_dt = TB_TYPE_I64);
 
                 prev_ctrl = insert_range_check(ctx, f, n, cmp, E);
@@ -1123,6 +1143,15 @@ static void init_ctx(Ctx* restrict ctx, TB_ABI abi) {
 
     // walk the entry to find any parameter stack slots
     FOR_N(i, 0, ctx->f->param_count) {
+        // PATCH(odin-tilde): this home-slot aliasing is only valid on Win64,
+        // where every parameter has a reserved shadow-space slot at
+        // caller_rsp + 8 + i*8. On SysV, register params have no stack home
+        // and stack-passed params are compacted into slots 1..k, so aliasing
+        // register-param locals to -(8 + i*8) makes them collide with (and
+        // clobber) the incoming stack arguments of any function that has
+        // both register and stack parameters.
+        if (ctx->calling_conv != &CC_WIN64) { break; }
+
         TB_Node* proj = params[3 + i];
         if (proj->user_count != 1 || USERI(proj->users) == 0) { continue; }
         TB_Node* store_op = USERN(proj->users);
@@ -1133,7 +1162,7 @@ static void init_ctx(Ctx* restrict ctx, TB_ABI abi) {
         TB_NodeLocal* local = TB_NODE_GET_EXTRA(addr);
         local->stack_pos = -(8 + i*8);
 
-        if (i >= 4 && ctx->calling_conv == &CC_WIN64) {
+        if (i >= 4) {
             // get rid of the store since it's already at that location
             TB_Node* prev = store_op->inputs[1];
             set_input(ctx->f, store_op, NULL, 1);
@@ -1319,6 +1348,31 @@ static int node_constraint_kill(Ctx* restrict ctx, TB_Node* n, RegMask** kills) 
             kills[kill_count++] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
         }
         return kill_count;
+    } else if (n->type == TB_ATOMIC_AND || n->type == TB_ATOMIC_XOR || n->type == TB_ATOMIC_OR) {
+        // PATCH(odin-tilde): the fetch forms lower to a CAS retry loop that
+        // clobbers RCX (scratch register) and FLAGS (cmpxchg + the bitop).
+        TB_Node* dproj = USERN(proj_with_index(n, 1));
+        if (dproj && dproj->users) {
+            kills[kill_count++] = intern_regmask(ctx, REG_CLASS_GPR, false, (1u << RAX) | (1u << RCX));
+            kills[kill_count++] = ctx->normie_mask[REG_CLASS_FLAGS];
+        }
+        return kill_count;
+    } else if (n->type == TB_ATOMIC_CAS) {
+        // PATCH(odin-tilde): lock cmpxchg clobbers RAX (old value) and FLAGS.
+        kills[kill_count++] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
+        kills[kill_count++] = ctx->normie_mask[REG_CLASS_FLAGS];
+        return kill_count;
+    } else if (n->type == TB_ATOMIC_XCHG || n->type == TB_ATOMIC_ADD || n->type == TB_ATOMIC_PTROFF) {
+        // PATCH(odin-tilde): xadd/lock add clobber FLAGS (xchg does not,
+        // but the extra kill is harmless and keeps this simple). The fetch
+        // forms additionally clobber RAX (the proj register is written
+        // before the RMW reads the address).
+        TB_Node* dproj = USERN(proj_with_index(n, 1));
+        if (dproj && dproj->users) {
+            kills[kill_count++] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
+        }
+        kills[kill_count++] = ctx->normie_mask[REG_CLASS_FLAGS];
+        return kill_count;
     } else {
         return 0;
     }
@@ -1435,6 +1489,60 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
         }
         return &TB_REG_EMPTY;
 
+        // PATCH(odin-tilde): atomic node constraints (upstream never filled
+        // these in for x64). The tuple itself produces no value; the data
+        // proj's mask is handled in the TB_PROJ case.
+        case TB_ATOMIC_LOAD:
+        if (ins) {
+            ins[1] = &TB_REG_EMPTY;
+            ins[2] = ctx->normie_mask[REG_CLASS_GPR];
+        }
+        return &TB_REG_EMPTY;
+
+        case TB_ATOMIC_XCHG:
+        case TB_ATOMIC_ADD:
+        case TB_ATOMIC_AND:
+        case TB_ATOMIC_XOR:
+        case TB_ATOMIC_OR:
+        case TB_ATOMIC_PTROFF:
+        if (ins) {
+            ins[1] = &TB_REG_EMPTY;
+            ins[2] = ctx->normie_mask[REG_CLASS_GPR];
+            ins[3] = ctx->normie_mask[REG_CLASS_GPR];
+
+            TB_Node* dproj = USERN(proj_with_index(n, 1));
+            if (dproj && dproj->users) {
+                // PATCH(odin-tilde): every fetch form pins its old-value
+                // proj to RAX (see TB_PROJ) because the emitter writes the
+                // source into the proj register before the RMW instruction
+                // reads the address — so the address and source must stay
+                // out of RAX. fetch-AND/XOR/OR additionally lower to a CAS
+                // retry loop that uses RCX as scratch.
+                uint64_t excl = ~(1ull << RAX);
+                if (n->type == TB_ATOMIC_AND || n->type == TB_ATOMIC_XOR || n->type == TB_ATOMIC_OR) {
+                    excl &= ~(1ull << RCX);
+                }
+                uint64_t mask = ctx->normie_mask[REG_CLASS_GPR]->mask[0] & excl;
+                ins[2] = intern_regmask(ctx, REG_CLASS_GPR, false, mask);
+                ins[3] = ins[2];
+            }
+        }
+        return &TB_REG_EMPTY;
+
+        case TB_ATOMIC_CAS:
+        if (ins) {
+            // PATCH(odin-tilde): cmpxchg's implicit operand is RAX, so the
+            // address and the new value must be kept out of it; the
+            // expected value is pinned to RAX and the old value lands in
+            // RAX as well (see TB_PROJ case).
+            uint64_t no_rax = ctx->normie_mask[REG_CLASS_GPR]->mask[0] & ~(1ull << RAX);
+            ins[1] = &TB_REG_EMPTY;
+            ins[2] = intern_regmask(ctx, REG_CLASS_GPR, false, no_rax);
+            ins[3] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
+            ins[4] = intern_regmask(ctx, REG_CLASS_GPR, false, no_rax);
+        }
+        return &TB_REG_EMPTY;
+
         case TB_VSHUFFLE:
         case TB_VBROADCAST:
         case TB_FLOAT_EXT:
@@ -1462,6 +1570,16 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
                 return intern_regmask(ctx, reg_class, false, 1u << cc->rets[reg_class][i - 2]);
             } else if (n->inputs[0]->type == TB_UMULPAIR || n->inputs[0]->type == TB_SMULPAIR || n->inputs[0]->type == TB_x86_idiv || n->inputs[0]->type == TB_x86_div) {
                 return intern_regmask(ctx, REG_CLASS_GPR, false, 1u << (i ? RDX : RAX));
+            } else if (n->inputs[0]->type == TB_ATOMIC_CAS) {
+                // PATCH(odin-tilde): cmpxchg leaves the old value in RAX
+                return intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
+            } else if (n->inputs[0]->type >= TB_ATOMIC_XCHG && n->inputs[0]->type <= TB_ATOMIC_PTROFF) {
+                // PATCH(odin-tilde): all fetch-form RMW projs live in RAX
+                // (see the constraint above for why inputs exclude RAX)
+                return intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
+            } else if (n->inputs[0]->type == TB_ATOMIC_LOAD) {
+                // PATCH(odin-tilde): atomic load data proj, any GPR
+                return ctx->normie_mask[REG_CLASS_GPR];
             }
 
             tb_todo();
@@ -2100,7 +2218,23 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                     COMMENT("reload");
                 }
 
-                if (dst.type == VAL_GPR && src.type == VAL_XMM) {
+                if (dst.type == VAL_MEM && src.type == VAL_MEM) {
+                    // PATCH(odin-tilde): x86 has no mem->mem MOV. Slot-to-slot
+                    // spill copies appear under high RA pressure (split
+                    // chains); bounce through RAX preserved with push/pop
+                    // (the RA reserves no scratch GPR). RSP-relative
+                    // displacements shift by 8 while RAX is on the stack.
+                    TB_X86_DataType idt = dt;
+                    if (idt >= TB_X86_F32x1) {
+                        idt = (idt == TB_X86_F32x1) ? TB_X86_DWORD : TB_X86_QWORD;
+                    }
+                    Val src2 = src; src2.imm += 8;
+                    Val dst2 = dst; dst2.imm += 8;
+                    EMIT1(e, 0x50); // PUSH RAX
+                    __(MOV, idt, Vgpr(RAX), &src2);
+                    __(MOV, idt, &dst2, Vgpr(RAX));
+                    EMIT1(e, 0x58); // POP RAX
+                } else if (dst.type == VAL_GPR && src.type == VAL_XMM) {
                     __(MOV_F2I, dt, &dst, &src);
                 } else if (dst.type == VAL_XMM && src.type == VAL_GPR) {
                     TB_X86_DataType src_dt = legalize(n->inputs[1]->dt);
@@ -2720,7 +2854,40 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             break;
         }
 
-        case TB_ATOMIC_LOAD:
+        // PATCH(odin-tilde): atomic load is just a MOV on x64 (TSO); the
+        // upstream table indexed [type - TB_ATOMIC_XCHG] which is -1 for
+        // TB_ATOMIC_LOAD and read inputs[3] which does not exist.
+        case TB_ATOMIC_LOAD: {
+            TB_Node* dproj = USERN(proj_with_index(n, 1));
+            TB_X86_DataType dt = legalize_int(dproj->dt);
+
+            Val addr = op_at(ctx, n->inputs[2]);
+            assert(addr.type == VAL_GPR);
+            addr.type = VAL_MEM;
+            addr.index = -1;
+
+            Val dst = op_at(ctx, dproj);
+            __(MOV, dt, &dst, &addr);
+            break;
+        }
+
+        case TB_ATOMIC_CAS: {
+            // PATCH(odin-tilde): lock cmpxchg. The expected value is pinned
+            // to RAX by the constraint; the old value lands in RAX.
+            TB_Node* dproj = USERN(proj_with_index(n, 1));
+            TB_X86_DataType dt = legalize_int(dproj->dt);
+
+            Val addr = op_at(ctx, n->inputs[2]);
+            Val newv = op_at(ctx, n->inputs[4]);
+            assert(addr.type == VAL_GPR);
+            addr.type = VAL_MEM;
+            addr.index = -1;
+
+            EMIT1(e, 0xF0);
+            __(CMPXCHG, dt, &addr, &newv);
+            break;
+        }
+
         case TB_ATOMIC_XCHG:
         case TB_ATOMIC_ADD:
         case TB_ATOMIC_AND:
@@ -2739,14 +2906,37 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
 
             Val addr = op_at(ctx, n->inputs[2]);
             Val src  = op_at(ctx, n->inputs[3]);
-            int op = (dproj->users ? fetch_tbl : tbl)[n->type - TB_ATOMIC_XCHG];
-            assert(op != 0); // unsupported op, we need to emulate it :(
-
             {
                 assert(addr.type == VAL_GPR);
                 addr.type = VAL_MEM;
                 addr.index = -1;
             }
+
+            // PATCH(odin-tilde): fetch-AND/XOR/OR have no single x86 RMW
+            // instruction; emit a CAS retry loop. RAX holds the expected
+            // value and ends up with the old value, RCX is scratch, and the
+            // constraints above keep addr/src out of both.
+            if (dproj->users && (n->type == TB_ATOMIC_AND || n->type == TB_ATOMIC_XOR || n->type == TB_ATOMIC_OR)) {
+                int bitop = tbl[n->type - TB_ATOMIC_XCHG];
+                Val rax = val_gpr(RAX);
+                Val rcx = val_gpr(RCX);
+
+                // rax = *addr (first guess for the expected value)
+                __(MOV, dt, &rax, &addr);
+                size_t loop_start = e->count;
+                __(MOV, dt, &rcx, &rax);          // rcx = old
+                __(bitop, dt, &rcx, &src);        // rcx = old OP src
+                EMIT1(e, 0xF0);                   // lock cmpxchg [addr], rcx
+                __(CMPXCHG, dt, &addr, &rcx);     //   (implicit RAX operand)
+                // jne retry (flags come straight out of the cmpxchg)
+                ptrdiff_t rel = (ptrdiff_t)loop_start - (ptrdiff_t)(e->count + 2);
+                assert(rel >= -128);
+                EMIT1(e, 0x75); EMIT1(e, (int)(rel & 0xFF));
+                break;
+            }
+
+            int op = (dproj->users ? fetch_tbl : tbl)[n->type - TB_ATOMIC_XCHG];
+            assert(op != 0); // unsupported op, we need to emulate it :(
 
             if (dproj->users) {
                 // this form needs to do exchanges
@@ -2756,6 +2946,15 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 }
                 EMIT1(e, 0xF0);
                 __(op, dt, &addr, &dst);
+            } else if (n->type == TB_ATOMIC_XCHG) {
+                // PATCH(odin-tilde): upstream emitted "lock mov" here which
+                // is not a valid instruction. An atomic store is a plain
+                // MOV on x64 (release); SEQ_CST additionally needs a full
+                // fence after the store.
+                __(MOV, dt, &addr, &src);
+                if (a->order == TB_MEM_ORDER_SEQ_CST) {
+                    EMIT1(e, 0x0F); EMIT1(e, 0xAE); EMIT1(e, 0xF0); // mfence
+                }
             } else {
                 // this form can use normal ops with a LOCK
                 EMIT1(e, 0xF0);
