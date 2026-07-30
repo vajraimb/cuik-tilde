@@ -29,6 +29,10 @@ void cuikperf_region_start(const char* fmt, const char* extra);
 void cuikperf_region_start2(const char* fmt, size_t extra_len, const char* extra);
 void cuikperf_region_end(void);
 
+// odin-tilde: sorted per-phase table, registered via atexit when
+// TB_PHASE_TIMING=1; safe to call manually as well.
+void cuikperf_phase_timing_report(void);
+
 // Usage:
 // CUIK_TIMED_BLOCK("Beans %d", 5) {
 //   ...

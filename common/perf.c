@@ -36,6 +36,79 @@ static _Atomic bool profiling;
 static SpallProfile ctx;
 static _Thread_local SpallBuffer muh_buffer;
 
+////////////////////////////////////////////
+// Lightweight phase timing (odin-tilde)
+////////////////////////////////////////////
+// Enabled by TB_PHASE_TIMING=1. Accumulates wall-clock time per
+// CUIK_TIMED_BLOCK label (even when spall profiling is off) and prints
+// a sorted table to stderr at process exit. Nested blocks are counted
+// per-label; the printed "total" only sums depth-0 regions.
+
+#define PHASE_TIMING_MAX_LABELS 128
+#define PHASE_TIMING_MAX_DEPTH  64
+
+static int phase_timing_mode = -1; // -1 = unchecked
+static atomic_flag phase_timing_lock = ATOMIC_FLAG_INIT;
+static const char* phase_labels[PHASE_TIMING_MAX_LABELS];
+static uint64_t phase_totals[PHASE_TIMING_MAX_LABELS];
+static uint64_t phase_counts[PHASE_TIMING_MAX_LABELS];
+static uint64_t phase_toplevel_total;
+static int phase_label_count;
+
+void cuikperf_phase_timing_report(void);
+
+static _Thread_local const char* pt_stack_label[PHASE_TIMING_MAX_DEPTH];
+static _Thread_local uint64_t pt_stack_start[PHASE_TIMING_MAX_DEPTH];
+static _Thread_local int pt_depth;
+
+static bool phase_timing_enabled(void) {
+    if (phase_timing_mode < 0) {
+        const char* env = getenv("TB_PHASE_TIMING");
+        phase_timing_mode = (env && env[0] == '1') ? 1 : 0;
+        if (phase_timing_mode) {
+            atexit(cuikperf_phase_timing_report);
+        }
+    }
+    return phase_timing_mode == 1;
+}
+
+static int phase_label_slot(const char* label) {
+    for (int i = 0; i < phase_label_count; i++) {
+        if (phase_labels[i] == label || strcmp(phase_labels[i], label) == 0) {
+            return i;
+        }
+    }
+    if (phase_label_count >= PHASE_TIMING_MAX_LABELS) return -1;
+    phase_labels[phase_label_count] = label;
+    return phase_label_count++;
+}
+
+void cuikperf_phase_timing_report(void) {
+    if (phase_label_count == 0) return;
+
+    // sort indices by total time, descending
+    int order[PHASE_TIMING_MAX_LABELS];
+    for (int i = 0; i < phase_label_count; i++) order[i] = i;
+    for (int i = 0; i < phase_label_count; i++) {
+        for (int j = i + 1; j < phase_label_count; j++) {
+            if (phase_totals[order[j]] > phase_totals[order[i]]) {
+                int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+            }
+        }
+    }
+
+    fprintf(stderr, "\n== TB phase timing (TB_PHASE_TIMING) ==\n");
+    fprintf(stderr, "%-24s %12s %8s %8s\n", "phase", "total", "share", "count");
+    for (int i = 0; i < phase_label_count; i++) {
+        int s = order[i];
+        double ms = phase_totals[s] / 1e6;
+        double share = phase_toplevel_total ? 100.0 * phase_totals[s] / phase_toplevel_total : 0.0;
+        fprintf(stderr, "%-24s %10.1fms %7.1f%% %8llu\n",
+                phase_labels[s], ms, share, (unsigned long long)phase_counts[s]);
+    }
+    fprintf(stderr, "%-24s %10.1fms\n", "(top-level total)", phase_toplevel_total / 1e6);
+}
+
 #ifdef CUIK__IS_X64
 #ifdef _WIN32
 static uint64_t get_rdtsc_freq(void) {
@@ -197,6 +270,11 @@ void cuikperf_thread_stop(void) {
 }
 
 void cuikperf_region_start(const char* label, const char* extra) {
+    if (phase_timing_enabled() && pt_depth < PHASE_TIMING_MAX_DEPTH) {
+        pt_stack_label[pt_depth] = label;
+        pt_stack_start[pt_depth] = cuik_time_in_nanos();
+        pt_depth++;
+    }
     if (profiling) {
         uint64_t nanos = cuik_time_in_nanos();
 
@@ -229,6 +307,23 @@ void cuikperf_region_start2(const char* label, size_t extra_len, const char* ext
 }
 
 void cuikperf_region_end(void) {
+    if (phase_timing_enabled() && pt_depth > 0) {
+        uint64_t end = cuik_time_in_nanos();
+        pt_depth--;
+        uint64_t delta = end - pt_stack_start[pt_depth];
+        const char* label = pt_stack_label[pt_depth];
+
+        while (atomic_flag_test_and_set(&phase_timing_lock)) {}
+        int slot = phase_label_slot(label);
+        if (slot >= 0) {
+            phase_totals[slot] += delta;
+            phase_counts[slot] += 1;
+        }
+        if (pt_depth == 0) {
+            phase_toplevel_total += delta;
+        }
+        atomic_flag_clear(&phase_timing_lock);
+    }
     if (profiling) {
         uint64_t nanos = cuik_time_in_nanos();
 
