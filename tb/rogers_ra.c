@@ -1437,25 +1437,27 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
             #endif
 
             // reset assignment, but don't try to split them this round
-            if (num_spills > 64) {
+            // PATCH(odin-tilde): upstream throttled split insertion to
+            // 64/round, deferring the rest to later full-recolor rounds;
+            // on huge functions (core:reflect write_type_writer, 1540 BBs)
+            // that forced ~283 rounds. ra_split.c still has a hard 64-per-
+            // call limit (uint64 bitsets indexed by spill slot), so insert
+            // in batches of 64 within the same round instead: same eventual
+            // splits, far fewer recolor rounds. Order by spill cost so the
+            // most expensive conflicts are split first.
+            enum { MAX_SPLITS_PER_CALL = 64 };
+            if (num_spills > MAX_SPLITS_PER_CALL) {
                 compare_split__vregs = ctx->vregs;
                 qsort(ra.splits, num_spills, sizeof(SplitDecision), compare_split);
-
-                for (size_t i = 64; i < num_spills; i++) {
-                    SplitDecision split = ra.splits[i];
-                    VReg* v = &ctx->vregs[split.target];
-                    v->class = 0;
-                    v->assigned = -1;
-                }
-
-                dyn_array_set_length(ra.splits, 64);
-                num_spills = 64;
             }
 
-            /*for (size_t i = 0; i < num_spills; i++) {
-                printf("  V%u\n", ra.splits[i].target);
-            }*/
-            tb__insert_splits(ctx, &ra, ra.splits, num_spills);
+            for (size_t base = 0; base < num_spills; base += MAX_SPLITS_PER_CALL) {
+                size_t batch = num_spills - base;
+                if (batch > MAX_SPLITS_PER_CALL) {
+                    batch = MAX_SPLITS_PER_CALL;
+                }
+                tb__insert_splits(ctx, &ra, ra.splits + base, batch);
+            }
             dyn_array_clear(ra.splits);
         }
 

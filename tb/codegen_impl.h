@@ -964,9 +964,24 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
 
     CUIK_TIMED_BLOCK("regalloc") {
         STATS_ENTER(MACH_RA);
+        // odin-tilde: per-function RA wall time, printed for slow functions
+        // when TB_RA_FUNC_TIMING=<threshold_ms> is set.
+        static int ra_func_timing_threshold = -2;
+        if (ra_func_timing_threshold == -2) {
+            const char* e = getenv("TB_RA_FUNC_TIMING");
+            ra_func_timing_threshold = e ? atoi(e) : -1;
+        }
+        uint64_t ra_t0 = ra_func_timing_threshold >= 0 ? cuik_time_in_nanos() : 0;
         switch (ra) {
             case TB_RA_ROGERS: tb__rogers(&ctx, &f->tmp_arena); break;
             case TB_RA_BRIGGS: tb__briggs(&ctx, &f->tmp_arena); break;
+        }
+        if (ra_func_timing_threshold >= 0) {
+            double ms = (cuik_time_in_nanos() - ra_t0) / 1e6;
+            if (ms >= ra_func_timing_threshold) {
+                fprintf(stderr, "RA-FUNC %8.1fms %s (nodes=%u bbs=%zu)\n",
+                        ms, f->super.name, f->node_count, ctx.bb_count);
+            }
         }
 
         worklist_clear(ws);
