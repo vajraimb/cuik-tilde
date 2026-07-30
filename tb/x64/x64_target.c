@@ -1376,6 +1376,11 @@ static int node_constraint_kill(Ctx* restrict ctx, TB_Node* n, RegMask** kills) 
         if (a->has_fill) {
             kills[kill_count++] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
         }
+        // PATCH(odin-tilde): small constant-size MEMCPY is emitted as
+        // load/store pairs through scratch RAX (see TB_MEMCPY emitter).
+        if (n->type == TB_MEMCPY && a->has_count && a->imm_count > 0 && a->imm_count <= 32) {
+            kills[kill_count++] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RAX);
+        }
         return kill_count;
     } else if (n->type == TB_ATOMIC_AND || n->type == TB_ATOMIC_XOR || n->type == TB_ATOMIC_OR) {
         // PATCH(odin-tilde): the fetch forms lower to a CAS retry loop that
@@ -2863,6 +2868,37 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         }
 
         case TB_MEMCPY: {
+            // PATCH(odin-tilde): small constant-size copies lower to straight-
+            // line load/store pairs through RAX (declared as a kill in the
+            // kills hook) instead of rep movsb, whose startup cost dwarfs the
+            // actual copy for element swaps (e.g. smoothsort's 4-byte cycle).
+            if (n->input_count < 5) {
+                TB_NodeMemAccessImm* a = TB_NODE_GET_EXTRA(n);
+                if (a->has_count && a->imm_count > 0 && a->imm_count <= 32) {
+                    Val dst_base = op_at(ctx, n->inputs[2]); // pinned RDI
+                    Val src_base = op_at(ctx, n->inputs[3]); // pinned RSI
+                    Val rax = { .type = VAL_GPR, .reg = RAX };
+
+                    uint32_t count = (uint32_t) a->imm_count;
+                    int32_t off = 0;
+                    while (count > 0) {
+                        TB_X86_DataType dt;
+                        uint32_t chunk;
+                        if (count >= 8)      { dt = TB_X86_QWORD; chunk = 8; }
+                        else if (count >= 4) { dt = TB_X86_DWORD; chunk = 4; }
+                        else if (count >= 2) { dt = TB_X86_WORD;  chunk = 2; }
+                        else                 { dt = TB_X86_BYTE;  chunk = 1; }
+
+                        Val src = src_base; src.type = VAL_MEM; src.index = -1; src.imm = off;
+                        Val dst = dst_base; dst.type = VAL_MEM; dst.index = -1; dst.imm = off;
+                        __(MOV, dt, &rax, &src);
+                        __(MOV, dt, &dst, &rax);
+                        off += chunk;
+                        count -= chunk;
+                    }
+                    break;
+                }
+            }
             // PATCH(odin-tilde): save/restore RDI/RSI/RCX (see TB_MEMSET)
             EMIT1(e, 0x57); // push rdi
             EMIT1(e, 0x56); // push rsi
