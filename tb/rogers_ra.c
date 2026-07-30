@@ -95,6 +95,12 @@ typedef struct {
     // interference mask
     int mask_cap;
     uint64_t* mask;
+
+    // PATCH(odin-tilde): incremental occupied-bit mirror of active[][],
+    // so allocate_reg can OR whole words instead of scanning num_regs
+    // entries (the STK class scan was quadratic in the spill count).
+    uint64_t* active_mask[MAX_REG_CLASSES];
+    int active_mask_words;
 } Rogers;
 
 static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* splits, size_t num_spills);
@@ -1604,6 +1610,16 @@ static void put_to_sleep_vreg(Ctx* restrict ctx, Rogers* restrict ra, int class,
 // way we only query for assignments which we haven't yet forbidden (either
 // due to the active set or the reg mask).
 
+static void active_mask_set(Rogers* ra, int class, int reg, int width) {
+    // replicate the exact single-word semantics of the original scan
+    uint64_t allot = UINT64_MAX >> (64ull - width);
+    ra->active_mask[class][reg / 64ull] |= allot << (reg % 64ull);
+}
+static void active_mask_clear(Rogers* ra, int class, int reg, int width) {
+    uint64_t allot = UINT64_MAX >> (64ull - width);
+    ra->active_mask[class][reg / 64ull] &= ~(allot << (reg % 64ull));
+}
+
 static void mark_active(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
     VReg* vreg = &ctx->vregs[ctx->vreg_map[gvn]];
     if (vreg->class == REG_CLASS_STK) {
@@ -1623,6 +1639,7 @@ static void mark_active(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
     }
 
     ra->active[vreg->class][vreg->assigned] = gvn;
+    active_mask_set(ra, vreg->class, vreg->assigned, vreg->reg_width);
 }
 
 static void wake_up_node(Ctx* restrict ctx, Rogers* restrict ra, int class, int gvn) {
@@ -1637,6 +1654,7 @@ static void unmark_active(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
     TB_ASSERT(other->assigned >= 0);
     TB_ASSERT(ra->active[other->class][other->assigned] == gvn);
     ra->active[other->class][other->assigned] = 0;
+    active_mask_clear(ra, other->class, other->assigned, other->reg_width);
 }
 
 static void unmark_active2(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
@@ -1645,6 +1663,7 @@ static void unmark_active2(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
     TB_ASSERT(other->assigned >= 0);
     if (ra->active[other->class][other->assigned] == gvn) {
         ra->active[other->class][other->assigned] = 0;
+        active_mask_clear(ra, other->class, other->assigned, other->reg_width);
     }
 }
 
@@ -1991,15 +2010,12 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
 
     // interfere live things
     dyn_array_clear(ra->potential_spills);
-    FOR_N(i, 0, num_regs) {
-        uint32_t gvn = ra->active[def_class][i];
-        if (gvn > 0) {
-            VReg* vreg = &ctx->vregs[ctx->vreg_map[gvn]];
-            uint64_t allot_mask = UINT64_MAX >> (64ull - vreg->reg_width);
-            ra_mask[i / 64ull] |= allot_mask << (i % 64ull);
-
-            // TB_OPTDEBUG(REGALLOC5)(printf("%%%u -- ", ra->active[def_class][i]), print_reg_name(def_class, i), printf("; "));
-        }
+    // PATCH(odin-tilde): OR the incrementally maintained occupied-bit
+    // mirror instead of scanning all num_regs active slots (the STK
+    // class scan was quadratic in the spill count on big functions).
+    {
+        uint64_t* am = ra->active_mask[def_class];
+        FOR_N(j, 0, mask_word_count) { ra_mask[j] |= am[j]; }
     }
     int inactive_cnt = 0;
 
@@ -2023,6 +2039,15 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
 
             int other_assigned  = other_vreg->assigned;
             uint64_t allot_mask = (UINT64_MAX >> (64ull - other_vreg->reg_width));
+            uint64_t need_bits  = allot_mask << (other_assigned % 64ull);
+
+            // PATCH(odin-tilde): if this sleeper's register is already
+            // blocked, the interference query cannot change ra_mask, and
+            // as an eviction candidate it is useless (evicting it alone
+            // cannot free the register). Skip the expensive range checks.
+            if ((ra_mask[other_assigned / 64ull] & need_bits) == need_bits) {
+                continue;
+            }
 
             // Inlined form of the "interfere()" function because speed reasons
             TB_BasicBlock* other_block = scheduled[other_gvn];
@@ -2083,6 +2108,17 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
                     ra->active[0][i] = 0;
                 }
                 ra->stack_reg_count = new_size;
+
+                // PATCH(odin-tilde): grow the occupied-bit mirror alongside
+                size_t new_words = (new_size + 63) / 64;
+                if (new_words > (size_t)ra->active_mask_words) {
+                    ra->active_mask[0] = tb_arena_realloc(ra->arena, ra->active_mask[0],
+                        ra->active_mask_words * sizeof(uint64_t), new_words * sizeof(uint64_t));
+                    FOR_N(i, ra->active_mask_words, new_words) {
+                        ra->active_mask[0][i] = 0;
+                    }
+                    ra->active_mask_words = new_words;
+                }
             }
 
             vreg->class = REG_CLASS_STK;
@@ -2348,6 +2384,14 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
 
     ra->active[0] = tb_arena_alloc(arena, ra->stack_reg_count * sizeof(int));
     memset(ra->active[0], 0, ra->stack_reg_count * sizeof(int));
+
+    // PATCH(odin-tilde): occupied-bit mirrors of active[][] (one per class,
+    // sized to mask_cap words; STK's grows with stack_reg_count).
+    ra->active_mask_words = (ra->mask_cap + 63) / 64;
+    FOR_N(i, 0, ctx->num_classes) {
+        ra->active_mask[i] = tb_arena_alloc(arena, ra->active_mask_words * sizeof(uint64_t));
+        memset(ra->active_mask[i], 0, ra->active_mask_words * sizeof(uint64_t));
+    }
 
     // Compute areas (probably slow...)
     compute_areas(ctx, ra, arena);
