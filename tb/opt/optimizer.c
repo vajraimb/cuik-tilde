@@ -1404,6 +1404,151 @@ int tb_opt_peeps(TB_Function* f) {
     return changes;
 }
 
+// PATCH(odin-tilde): helpers for tb_opt_peeps_only — see through odin's
+// defined-shift guard: select(cmp_ult(cnt, bits), shift(x, cnt), 0).
+// Returns the underlying TB_SHL/TB_SHR node and stores the count in *cnt_out.
+static TB_Node* odin_unguard_shift(TB_Node* n, int bits, TB_Node** cnt_out) {
+    if (n->type == TB_SHL || n->type == TB_SHR) {
+        *cnt_out = n->inputs[2];
+        return n;
+    }
+    if (n->type == TB_SELECT) {
+        uint64_t z, b;
+        TB_Node* cond = n->inputs[1];
+        TB_Node* tv   = n->inputs[2];
+        if (cond->type == TB_CMP_ULT &&
+            (tv->type == TB_SHL || tv->type == TB_SHR) &&
+            get_int_const(n->inputs[3], &z) && z == 0 &&
+            get_int_const(cond->inputs[2], &b) && b == (uint64_t) bits &&
+            cond->inputs[1] == tv->inputs[2]) {
+            *cnt_out = tv->inputs[2];
+            return tv;
+        }
+    }
+    return NULL;
+}
+
+static TB_Node* odin_strip_truncate(TB_Node* n) {
+    while (n->type == TB_TRUNCATE) {
+        n = n->inputs[1];
+    }
+    return n;
+}
+
+// PATCH(odin-tilde): rotate-idiom pass — recognizes
+// (or (shl x k) (shr x bits-k)) and the mirrored ROR form, including odin's
+// select-guarded variable-count shape from core:math/bits rotate_left*/right*
+// (which odin-tilde does not inline) — and rewrites them to TB_ROL/TB_ROR,
+// which dominates scalar SHA-2 and similar bit-mixing code.
+static int odin_rotate_idiom_pass(TB_Function* f, TB_Worklist* ws) {
+    // collect all reachable nodes
+    TB_ASSERT(worklist_count(ws) == 0);
+    worklist_push(ws, f->root_node);
+    for (size_t i = 0; i < dyn_array_length(ws->items); i++) {
+        TB_Node* n = ws->items[i];
+        FOR_USERS(u, n) { worklist_push(ws, USERN(u)); }
+    }
+
+    int changes = 0;
+    FOR_N(i, 0, dyn_array_length(ws->items)) {
+        TB_Node* n = ws->items[i];
+        if (n->type != TB_OR || !TB_IS_INTEGER_TYPE(n->dt)) {
+            continue;
+        }
+        int bits = tb_data_type_bit_size(NULL, n->dt.type);
+
+        // try both operand orders; ROL is (shl | shr), ROR is (shr | shl)
+        FOR_N(swap, 0, 2) {
+            TB_Node* ca = NULL;
+            TB_Node* cb = NULL;
+            TB_Node* sa = odin_unguard_shift(n->inputs[1 + swap], bits, &ca);
+            TB_Node* sb = odin_unguard_shift(n->inputs[2 - swap], bits, &cb);
+            if (sa == NULL || sb == NULL || sa->inputs[1] != sb->inputs[1]) {
+                continue;
+            }
+
+            bool rol;
+            TB_Node* cnt_s;     // shift carrying the rotate amount s
+            TB_Node* other_cnt; // shift carrying bits - s
+            if (sa->type == TB_SHL && sb->type == TB_SHR) {
+                rol = true;  cnt_s = ca; other_cnt = cb;
+            } else if (sa->type == TB_SHR && sb->type == TB_SHL) {
+                rol = false; cnt_s = ca; other_cnt = cb;
+            } else {
+                continue;
+            }
+
+            uint64_t ka, kb;
+            if (get_int_const(cnt_s, &ka) && get_int_const(other_cnt, &kb) &&
+                ka + kb == (uint64_t) bits) {
+                // constant rotate: the guards are statically satisfied and
+                // (rol x 0) == x covers the k == 0 corner
+                TB_Node* r = tb_alloc_node(f, rol ? TB_ROL : TB_ROR, n->dt, 3, sizeof(TB_NodeBinopInt));
+                set_input(f, r, sa->inputs[1], 1);
+                set_input(f, r, cnt_s,         2);
+                subsume_node(f, n, r);
+                changes++;
+                break;
+            }
+
+            // variable rotate: other count is truncate*(sub bits, truncate*(s)).
+            // This is exactly the body shape of core:math/bits rotate_*.
+            TB_Node* sub = odin_strip_truncate(other_cnt);
+            if (sub->type != TB_SUB) {
+                continue;
+            }
+            uint64_t c;
+            if (!get_int_const(sub->inputs[1], &c) || c != (uint64_t) bits) {
+                continue;
+            }
+            if (odin_strip_truncate(sub->inputs[2]) != odin_strip_truncate(cnt_s)) {
+                continue;
+            }
+
+            // source semantics yield 0 for s >= bits (the shl-side guard)
+            // while the rotate instruction masks the count, so the guard
+            // must be rebuilt: select(s < bits, rol(x, s), 0)
+            TB_Node* guard_sel = n->inputs[1 + swap];
+            if (guard_sel->type != TB_SELECT) {
+                continue; // unguarded variable shift: cannot prove s < bits
+            }
+            TB_Node* r = tb_alloc_node(f, rol ? TB_ROL : TB_ROR, n->dt, 3, sizeof(TB_NodeBinopInt));
+            set_input(f, r, sa->inputs[1], 1);
+            set_input(f, r, cnt_s,         2);
+            TB_Node* sel = tb_alloc_node(f, TB_SELECT, n->dt, 4, 0);
+            set_input(f, sel, guard_sel->inputs[1], 1); // cmp_ult(s, bits)
+            set_input(f, sel, r,                    2);
+            set_input(f, sel, guard_sel->inputs[3], 3); // iconst 0
+            subsume_node(f, n, sel);
+            changes++;
+            break;
+        }
+    }
+
+    worklist_clear(ws);
+    return changes;
+}
+
+// PATCH(odin-tilde): reduced optimization pipeline. The odin-tilde backend
+// does not run the full tb_opt pipeline (locals-to-SSA, loop opts, SLP, cprop
+// rounds): the peephole solver's lattice machinery asserts on IR shapes
+// upstream never produces, and tb_opt_locals promotion drives the Rogers RA
+// into a split loop (rounds < 2048 assert). This runs just the rotate-idiom
+// pass above — safe, local rewrites with a solid SHA-2 payoff.
+TB_API bool tb_opt_peeps_only(TB_Function* f, TB_Worklist* ws) {
+    if (f->super.tag != TB_SYMBOL_FUNCTION) {
+        return false;
+    }
+
+    TB_ASSERT_MSG(f->root_node, "missing root node");
+    f->worklist = ws;
+
+    int changes = odin_rotate_idiom_pass(f, ws);
+
+    f->worklist = NULL;
+    return changes > 0;
+}
+
 static void* zalloc(size_t s) {
     void* ptr = cuik_malloc(s);
     memset(ptr, 0, s);

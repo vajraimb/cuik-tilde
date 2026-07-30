@@ -605,8 +605,10 @@ static TB_Node* ideal_bits(TB_Function* f, TB_Node* n) {
         return n;
     }
 
-    if (type == TB_OR) {
-        TB_ASSERT(TB_IS_INTEGER_TYPE(n->dt));
+    // PATCH(odin-tilde): odin's cg may emit OR on float-typed bit containers
+    // (float select lowering); upstream frontends never produce non-integer
+    // bitwise ops, so the assert fired. Guard instead of asserting.
+    if (type == TB_OR && TB_IS_INTEGER_TYPE(n->dt)) {
         int bits = tb_data_type_bit_size(NULL, n->dt.type);
 
         // (or (shl a 24) (shr a 40)) => (rol a 24)
