@@ -122,7 +122,15 @@ static TB_DataType reg_class_to_tb(TB_ABI abi, RegClass rg, TB_DebugType* type) 
             switch (debug_type_size(abi, type)) {
                 case 1:  return TB_TYPE_I8;
                 case 2:  return TB_TYPE_I16;
+                // PATCH(odin-tilde): sub-4/8-byte aggregates (e.g. Odin's
+                // [3]u8 RGB_Pixel) ride in a single GPR as an integer blob;
+                // round up to the transport width, upper bits are undefined
+                // per SysV and ignored by both sides.
+                case 3:  return TB_TYPE_I32;
                 case 4:  return TB_TYPE_I32;
+                case 5:
+                case 6:
+                case 7:
                 case 8:  return TB_TYPE_I64;
                 default: {
                     fprintf(stderr, "[tb] reg_class_to_tb: RG_INTEGER with bad size %d (type tag %d)\n", debug_type_size(abi, type), type->tag);

@@ -206,10 +206,19 @@ static TB_Node* isel_if_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
 
 enum { PHASH_DEFAULT = 0xcc9e2d51 };
 static uint32_t phash_fn(uint32_t h, uint32_t k, uint32_t mod) {
-    k = ((k << 15) | (k >> 17))*0x1b873593;
-    h = (((h^k) << 13) | ((h^k) >> 19))*5 + 0xe6546b64;
+    // PATCH(odin-tilde): murmur3 fmix32 finalizer. The old rol/mul chain
+    // produced SEED-INDEPENDENT collisions (keys 16 apart always landed in
+    // the same bucket — e.g. ASCII 'b'/'r', 'f'/'v'), so every switch with
+    // such a pair exhausted all 32 seeds and fell back to a linear table.
+    // Must match the runtime node chain in isel_multi_way_branch exactly.
+    uint32_t x = k ^ h;
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
     // grab the top bits
-    return h >> (32 - mod);
+    return x >> (32 - mod);
 }
 
 // PATCH(odin-tilde): 64-bit variant used when the switch key type is wider
@@ -469,9 +478,11 @@ build_linear_table:
                 x = binop_reg(f, TB_x86_xor,  x, t);
                 h = binop_imm(f, TB_x86_shr,  x, 64 - shift);
             } else {
-                // k = rol(k, 15) * 0x1b873593
-                // h = rol(h ^ k, 13) * 5
-                // h = (h + 0xe6546b64) >> (32 - shift)
+                // murmur3 fmix32 of (key ^ seed); must match phash_fn
+                // exactly:
+                //   x = k ^ h; x ^= x>>16; x *= 0x85ebca6b;
+                //   x ^= x>>13; x *= 0xc2b2ae35; x ^= x>>16;
+                //   h = x >> (32 - shift)
                 // PATCH(odin-tilde): negative (sign-extended) keys need
                 // sign extension here too — both the 32-bit hash input and
                 // the 64-bit key check below must match the stored keys.
@@ -482,16 +493,18 @@ build_linear_table:
                     src = unary_reg(f, signed_keys ? TB_x86_movsx8 : TB_x86_movzx8, TB_TYPE_I32, src);
                 }
 
-                TB_Node* k = src;
-                k = binop_imm(f, TB_x86_rol,  k, 15);
-                k = binop_imm(f, TB_x86_imul, k, 0x1b873593);
-
-                h = make_int_node(f, TB_TYPE_I32, hash);
-                h = binop_reg(f, TB_x86_xor,  k, h);
-                h = binop_imm(f, TB_x86_rol,  h, 13);
-                h = binop_imm(f, TB_x86_imul, h, 5);
-                h = binop_imm(f, TB_x86_add,  h, 0xe6546b64);
-                h = binop_imm(f, TB_x86_shr,  h, 32 - shift);
+                TB_Node* x = src;
+                x = binop_reg(f, TB_x86_xor, x, make_int_node(f, TB_TYPE_I32, hash));
+                TB_Node* t;
+                t = binop_imm(f, TB_x86_shr,  x, 16);
+                x = binop_reg(f, TB_x86_xor,  x, t);
+                x = binop_imm(f, TB_x86_imul, x, 0x85ebca6b);
+                t = binop_imm(f, TB_x86_shr,  x, 13);
+                x = binop_reg(f, TB_x86_xor,  x, t);
+                x = binop_imm(f, TB_x86_imul, x, 0xc2b2ae35);
+                t = binop_imm(f, TB_x86_shr,  x, 16);
+                x = binop_reg(f, TB_x86_xor,  x, t);
+                h = binop_imm(f, TB_x86_shr,  x, 32 - shift);
             }
 
             TB_Global* table = tb_global_create(f->super.module, 0, NULL, NULL, TB_LINKAGE_PRIVATE);
@@ -550,6 +563,10 @@ build_linear_table:
     // e.g. typeids), the 64-bit hash above must keep retrying instead —
     // with full-width keys distinct seeds resolve collisions in practice.
     tb_arena_restore(&f->tmp_arena, sp);
+    if (getenv("TB_PHASH_DEBUG")) { // DEBUG(odin-tilde)
+        fprintf(stderr, "PHASH-FALLBACK: %s succ=%d min=%"PRIu64" max=%"PRIu64" shift=%"PRIu64" wide=%d range_fits=%d\n",
+            f->super.name, br->succ_count, min, max, shift, wide_keys, range_fits);
+    }
     TB_ASSERT(range_fits && "perfect hash failed and key range cannot fit a linear jump table");
     density = 1.0;
     goto build_linear_table;
@@ -992,6 +1009,12 @@ static TB_X86_DataType legalize_int(TB_DataType dt) {
         case TB_TAG_I32:  return TB_X86_DWORD;
         case TB_TAG_I64:  return TB_X86_QWORD;
         case TB_TAG_PTR:  return TB_X86_QWORD;
+        // PATCH(odin-tilde): the isel routes float SELECTs to GPR cmovcc
+        // (x64.machine has no dt guard), which treats the float as a bit
+        // container in a general-purpose register. Map to the bit-equivalent
+        // integer width; only bit-moving ops may legally see these.
+        case TB_TAG_F32:  return TB_X86_DWORD;
+        case TB_TAG_F64:  return TB_X86_QWORD;
         default: tb_todo();
     }
 }
@@ -1331,6 +1354,12 @@ static int node_constraint_kill(Ctx* restrict ctx, TB_Node* n, RegMask** kills) 
         // Clobber FLAGS
         kills[kill_count++] = ctx->normie_mask[REG_CLASS_FLAGS];
         return kill_count;
+    } else if (n->type == TB_CYCLE_COUNTER) {
+        // PATCH(odin-tilde): the emitter clobbers RDX (rdtsc high half) and
+        // FLAGS (shl + or when recombining into RAX).
+        kills[kill_count++] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << RDX);
+        kills[kill_count++] = ctx->normie_mask[REG_CLASS_FLAGS];
+        return kill_count;
     } else if (n->type == TB_ICONST) {
         // TILDE: iconst 0 is emitted as "mov reg, 0" (see the emitter below) which
         // does NOT clobber FLAGS. Declaring a FLAGS kill here (for xor) caused an
@@ -1403,6 +1432,16 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
             }
             return ctx->normie_mask[REG_CLASS_GPR];
         }
+
+        case TB_CYCLE_COUNTER:
+        // PATCH(odin-tilde): rdtsc leaves the result in RAX:RDX and the
+        // emitter recombines it into RAX (see the emitter), so pin the def
+        // to RAX; RDX and FLAGS are declared as kills in
+        // node_constraint_kill.
+        if (ins) {
+            ins[0] = &TB_REG_EMPTY; // control input
+        }
+        return intern_regmask2(ctx, REG_CLASS_GPR, false, RAX);
 
         case TB_LOCAL:
         case TB_BRANCH_PROJ:

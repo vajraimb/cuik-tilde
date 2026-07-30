@@ -334,7 +334,14 @@ static void asm_inst1(TB_CGEmitter* e, int type, TB_X86_DataType dt, const Val* 
 
         EMIT1(e, mod_rx_rm(mod, rx, needs_index ? RSP : base));
         if (needs_index) {
-            EMIT1(e, mod_rx_rm(scale, (base & 7) == RSP ? RSP : index, base));
+            // PATCH(odin-tilde): keep the real index register even when the
+            // base itself forced a SIB (base == RSP/R12). The old expression
+            // wrote "no index" (RSP in the index slot) whenever base&7==RSP,
+            // silently dropping the index from e.g. jmp [r12 + rax*8] in
+            // multi-way branch tables — switches then always took
+            // targets[0] (the default arm) whenever RA assigned the table
+            // base to RSP/R12 (fmt any-switch infinite recursion).
+            EMIT1(e, mod_rx_rm(scale, index != GPR_NONE ? index : RSP, base));
         }
 
         if (mod == MOD_INDIRECT_DISP8) EMIT1(e, (int8_t)disp);

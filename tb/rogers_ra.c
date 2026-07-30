@@ -101,6 +101,7 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 static void insert_op_at_end(Ctx* ctx, Rogers* ra, TB_BasicBlock* bb, TB_Node* n);
 
 static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* arena);
+static int rogers_debug_round; // DEBUG(odin-tilde)
 static void compute_ordinals(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* arena);
 static bool interfere(Ctx* restrict ctx, Rogers* restrict ra, TB_Node* lhs, TB_Node* rhs);
 
@@ -164,12 +165,16 @@ static double rogers_get_spill_cost(Ctx* restrict ctx, Rogers* restrict ra, VReg
 
     // printf("spill_cost(%zu) = %f\n", vreg - ctx->vregs, vreg->spill_cost / vreg->area);
     double score = vreg->spill_cost - vreg->area*0.2;
-    // PATCH(odin-tilde): penalize repeatedly-split vregs so choose_best_spill
-    // stops evicting the same pinned reload/copy lineage forever (evicting it
-    // just recreates it on the same conflict point) and picks a vreg whose
-    // split actually makes progress instead.
-    if (vreg->was_spilled >= 2) {
-        score += 1e6;
+    // PATCH(odin-tilde): penalize repeatedly-split vregs PROPORTIONALLY so
+    // choose_best_spill rotates victims instead of sacrificing the same
+    // vreg every round (a flat penalty ties once every candidate has been
+    // split twice — observed: ~10 x86_cmp/x86_test vregs all at 1e6 trading
+    // the identical eviction forever on FLAGS, a single-register class).
+    // The least-split candidate is always preferred, so a victim whose
+    // split makes no progress (e.g. a test whose only use is the adjacent
+    // jcc — remat lands on the same point) is never chosen twice in a row.
+    if (vreg->was_spilled > 0) {
+        score += (double)vreg->was_spilled * 1e6;
     }
     return score;
 }
@@ -928,6 +933,7 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
         // reflect@write_type_writer needs 283). Keep the assert as an
         // infinite-loop guard but with ample headroom.
         TB_ASSERT(rounds < 2048);
+        rogers_debug_round = rounds; // DEBUG(odin-tilde)
 
         // PATCH(odin-tilde): global zombie fixed-mask sweep. Splitting can
         // leave a vreg pinned to a single register after the use that
@@ -1162,6 +1168,26 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                                 rogers_get_spill_cost(ctx, &ra, ovr),
                                 set_get(&ra.been_spilled, ov));
                         }
+                    }
+                    printf("\n");
+                }
+                // DEBUG(odin-tilde): dump the GPR active set so we can see
+                // why a non-fixed self-split found no eviction candidate.
+                if (v->mask && fixed_reg_mask(v->mask) < 0 && rounds >= 2040) {
+                    int cls = v->mask->class;
+                    printf("    actives class%d:", cls);
+                    FOR_N(ai, 0, ctx->num_regs[cls]) {
+                        uint32_t ag = ra.active[cls][ai];
+                        if (ag == 0) { continue; }
+                        int av = ctx->vreg_map[ag];
+                        if (av <= 0) { printf(" [%d]=%%%u(no-vreg)", ai, ag); continue; }
+                        VReg* avr = &ctx->vregs[av];
+                        printf(" [%d]=%%%u(V%d %s f=%d ms=%d cost=%.0f bs=%d)", ai, ag, av,
+                            avr->n ? tb_node_get_name(avr->n->type) : "?",
+                            avr->mask ? fixed_reg_mask(avr->mask) : -9,
+                            avr->mask ? avr->mask->may_spill : -1,
+                            rogers_get_spill_cost(ctx, &ra, avr),
+                            set_get(&ra.been_spilled, av));
                     }
                     printf("\n");
                 }
@@ -1631,6 +1657,19 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
     int useful_class = attempted_vreg->mask->class;
     int us = ctx->vreg_map[attempted_n->gvn];
     int fx_attempted = fixed_reg_mask(useful_mask);
+    bool dbg = getenv("TB_RA_SPIN_DEBUG") && rogers_debug_round >= 2040; // DEBUG(odin-tilde)
+    if (dbg) { // DEBUG(odin-tilde)
+        printf("CHOOSE: attempted V%d %%%u(%s) fixed=%d mask=", us, attempted_n->gvn,
+            tb_node_get_name(attempted_n->type), fx_attempted);
+        FOR_N(mi, 0, ctx->num_regs[useful_class]) {
+            if (within_reg_mask(useful_mask, mi)) { printf(" R%zu", mi); }
+        }
+        printf(" free=");
+        FOR_N(mi, 0, ctx->num_regs[useful_class]) {
+            if (!bits64_member(ra->mask, mi)) { printf(" R%zu", mi); }
+        }
+        printf("\n");
+    }
     FOR_N(i, 0, ctx->num_regs[useful_class]) {
         // TODO(NeGate): this is bit math & tests, we can speed this process up
         if (ra->active[useful_class][i] > 0 && bits64_member(ra->mask, i)) {
@@ -1676,13 +1715,33 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
         // range-pinned occupant is the only way to free its register, since
         // the occupant's tail can bridge out — see the occ_pinned_same
         // logic below.)
+        // EXCEPTION: pinned PROJECTIONS (parameter/call-result projs). Their
+        // pin is exercised once at their def (entry or a call), not at the
+        // conflict point, so evicting them genuinely frees the register
+        // here: the split keeps the def pinned and bridges the tail out.
+        // In the Odin calling convention arguments arrive in callee-saved
+        // registers too, so ALL of R3/R5/R12-R15 can be held by live
+        // pinned parameter projections — skipping them leaves zero
+        // candidates and the self-split remats a stack reload at the same
+        // point every round (image@alpha_drop_if_present spun forever).
         if (fx_attempted < 0 &&
             vreg->mask != NULL && vreg->mask != &TB_REG_EMPTY &&
-            fixed_reg_mask(vreg->mask) >= 0) {
+            fixed_reg_mask(vreg->mask) >= 0 &&
+            (vreg->n == NULL || vreg->n->type != TB_MACH_PROJ)) {
+            if (dbg) { // DEBUG(odin-tilde)
+                printf("CHOOSE:   skip %%%u V%d(%s) reg%d pinned\n", gvn, ctx->vreg_map[gvn],
+                    tb_node_get_name(vreg->n ? vreg->n->type : 0), vreg->assigned);
+            }
             continue;
         }
 
         float score = rogers_get_spill_cost(ctx, ra, vreg);
+        if (dbg) { // DEBUG(odin-tilde)
+            printf("CHOOSE:   cand %%%u V%d(%s) reg%d fixed=%d ms=%d score=%.0f\n", gvn, ctx->vreg_map[gvn],
+                tb_node_get_name(vreg->n ? vreg->n->type : 0), vreg->assigned,
+                fixed_reg_mask(vreg->mask ? vreg->mask : &TB_REG_EMPTY),
+                vreg->mask ? vreg->mask->may_spill : -1, score);
+        }
         if (score <= best_score) {
             if (best_spill >= 0) {
                 TB_OPTDEBUG(REGALLOC)(printf("#     %%%u is a better spill! V%d (%f is better than %f)\n", gvn, ctx->vreg_map[gvn], score, best_score));
@@ -1702,6 +1761,13 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
     }
 
     float us_score = rogers_get_spill_cost(ctx, ra, &ctx->vregs[us]);
+    int fx_us = fixed_reg_mask(ctx->vregs[us].mask);
+    bool occ_pinned_same = false;
+    if (fx_us >= 0 && best_spill > 0) {
+        RegMask* occ_mask = ctx->vregs[best_spill].mask;
+        occ_pinned_same = occ_mask != NULL && occ_mask != &TB_REG_EMPTY &&
+                          fixed_reg_mask(occ_mask) == fx_us;
+    }
     // PATCH(odin-tilde): self-splitting a fixed-mask vreg usually cannot
     // resolve its allocation failure — the split def inherits the same
     // single-register mask and fails identically next round (infinite
@@ -1716,16 +1782,20 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
     // the register through spill copies. A pinned attempted COPY is the
     // mirror case — its range is a single point so self-splitting is
     // futile, and evicting the range-pinned occupant is the only option.
-    int fx_us = fixed_reg_mask(ctx->vregs[us].mask);
-    bool occ_pinned_same = false;
-    if (fx_us >= 0 && best_spill > 0) {
-        RegMask* occ_mask = ctx->vregs[best_spill].mask;
-        occ_pinned_same = occ_mask != NULL && occ_mask != &TB_REG_EMPTY &&
-                          fixed_reg_mask(occ_mask) == fx_us;
-    }
+    //
+    // Single-register classes with no spill path (e.g. FLAGS) force
+    // eviction too — but only while the victim is FRESH (was_spilled < 2).
+    // Evicting an already-split FLAGS vreg is futile when its range is
+    // minimal (test adjacent to its jcc: the remat lands on the same
+    // point), and once every candidate is stale the musical-chairs loop
+    // never ends (image@alpha_drop_if_present: a cmp live across two
+    // flags-clobbering shrs must self-split — its remat clones land next
+    // to the cmovs, AFTER the clobbers, which is the one split that
+    // actually shrinks the conflict).
+    bool victim_is_fresh = best_spill > 0 && ctx->vregs[best_spill].was_spilled < 2;
     if (best_spill > 0 && best_score != INFINITY && fx_us >= 0 &&
         (!occ_pinned_same || attempted_n->type == TB_MACH_COPY ||
-         ctx->mayspill_mask[useful_class] == NULL)) {
+         (ctx->mayspill_mask[useful_class] == NULL && victim_is_fresh))) {
         // Evict the occupant. The mayspill_mask == NULL case (e.g. FLAGS,
         // a single-register class): self-splitting can never resolve the
         // conflict — the tail cannot bridge out of the register (no spill
@@ -1736,6 +1806,18 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
     } else if (occ_pinned_same && us_score != INFINITY) {
         // force the self-split branch below
         best_score = INFINITY;
+    }
+    // PATCH(odin-tilde): if the victim lineage's accumulated avoid mask
+    // plus the register it's being evicted from covers EVERY register in
+    // the class, its split clones would get an empty mask and instantly
+    // re-conflict — force the self-split instead.
+    if (best_spill > 0 && us_score != INFINITY && fx_us >= 0 &&
+        ctx->num_regs[useful_class] < 64) {
+        uint64_t total = (1ull << ctx->num_regs[useful_class]) - 1;
+        uint64_t avoid = ctx->vregs[best_spill].avoid_mask | (1ull << fx_us);
+        if ((avoid & total) == total) {
+            best_score = INFINITY;
+        }
     }
     if (us_score < best_score) {
         // mark the second best as the HRP region to split around it
@@ -1778,7 +1860,11 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
         // the complement mask would be empty, so leave those to the normal
         // split machinery.
         if (fx >= 0 && ctx->num_regs[useful_class] > 1) {
-            s.clobber = intern_regmask(ctx, useful_class, false, 1ull << fx);
+            // PATCH(odin-tilde): seed the split's clobber set with the
+            // victim lineage's accumulated avoid mask so clones dodge every
+            // register they've been bounced out of, not just this round's.
+            s.clobber = intern_regmask(ctx, useful_class, false,
+                ctx->vregs[best_spill].avoid_mask | (1ull << fx));
         }
     }
     cuikperf_region_end();
@@ -1855,7 +1941,8 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
                     // (only meaningful when the class has room to avoid into)
                     SplitDecision s = { .target = vreg_id };
                     if (ctx->num_regs[def_class] > 1) {
-                        s.clobber = intern_regmask(ctx, def_class, false, 1ull << fixed_reg_mask(holder->mask));
+                        s.clobber = intern_regmask(ctx, def_class, false,
+                            ctx->vregs[vreg_id].avoid_mask | (1ull << fixed_reg_mask(holder->mask)));
                     }
                     dyn_array_put(ra->splits, s);
                     return false;
@@ -1866,7 +1953,8 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
                 if (self_pinned && ctx->num_regs[def_class] > 1) {
                     // the holder's split clones must avoid our pinned
                     // register or it retakes it and we evict it forever.
-                    s.clobber = intern_regmask(ctx, def_class, false, 1ull << vreg->assigned);
+                    s.clobber = intern_regmask(ctx, def_class, false,
+                        ctx->vregs[old_vreg].avoid_mask | (1ull << vreg->assigned));
                 }
                 dyn_array_put(ra->splits, s);
             }

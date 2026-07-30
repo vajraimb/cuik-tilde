@@ -234,7 +234,11 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
         ////////////////////////////////
         // case TB_POISON:
         // case TB_INLINE_ASM:
-        // case TB_CYCLE_COUNTER:
+        case TB_CYCLE_COUNTER:
+        if (ins) {
+            ins[0] = &TB_REG_EMPTY; // control input
+        }
+        return ctx->normie_mask[REG_CLASS_GPR];
         // case TB_PREFETCH:
 
         ////////////////////////////////
@@ -668,7 +672,13 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         ////////////////////////////////
         case TB_POISON: break;
         // case TB_INLINE_ASM:
-        // case TB_CYCLE_COUNTER:
+        case TB_CYCLE_COUNTER: {
+            // mrs Xt, cntvct_el0 — matches llvm.readcyclecounter semantics on
+            // arm64 (virtual count register, same as the LLVM backend's asm).
+            int dst = op_reg_at(ctx, n, REG_CLASS_GPR);
+            EMIT4(e, 0xD53BE040u | (uint32_t)dst);
+            break;
+        }
         // case TB_PREFETCH:
         case TB_SYMBOL_TABLE: break;
 

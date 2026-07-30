@@ -178,8 +178,11 @@
     CMP_OP(CMP_EQ,  E)
     CMP_OP(CMP_NE,  NE)
 
-    pat (CMP_FLT cmp_dt=$dt ___ $lhs $rhs) => (x86_COND dt=TB_TYPE_I8 (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=B)
-    pat (CMP_FLE cmp_dt=$dt ___ $lhs $rhs) => (x86_COND dt=TB_TYPE_I8 (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=BE)
+    // PATCH(odin-tilde): FLT/FLE carry the same float guard as EQ/NE so the
+    // DSL generator packs all four float compares into one rule group; else
+    // FLT/FLE fall behind the EQ/NE float guard and cond is never set (jO).
+    pat (CMP_FLT cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_COND dt=TB_TYPE_I8 (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=B)
+    pat (CMP_FLE cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_COND dt=TB_TYPE_I8 (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=BE)
     pat (CMP_EQ  cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_COND dt=TB_TYPE_I8 (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=E)
     pat (CMP_NE  cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_COND dt=TB_TYPE_I8 (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=NE)
 
@@ -361,7 +364,7 @@
     // 1/8 -> 32/64
     pat (SIGN_EXT dt=$dt ___ $src)
     where "($dt.type == TB_TAG_I16 || $dt.type == TB_TAG_I32 || $dt.type == TB_TAG_I64) && ($src->dt.type == TB_TAG_I8 || $src->dt.type == TB_TAG_BOOL)"
-    => (x86_movsx8 dt=$dt ___ ___ $src extra_dt="$src->dt")
+    => (x86_movsx8 dt=$dt ___ ___ $src extra_dt="$dt")
 
     // 1/8 -> 16/32/64
     pat (ZERO_EXT dt=$dt ___ $src)
@@ -383,7 +386,7 @@
     => (MACH_COPY dt=$dt ___ $src def="ctx->normie_mask[REG_CLASS_GPR]" use="ctx->normie_mask[REG_CLASS_GPR]")
 
     // 16 -> 32
-    pat (SIGN_EXT dt=$dt ___ $src) where "$src->dt.type == TB_TAG_I16" => (x86_movsx16 dt=$dt ___ ___ $src extra_dt="TB_TYPE_I16")
+    pat (SIGN_EXT dt=$dt ___ $src) where "$src->dt.type == TB_TAG_I16" => (x86_movsx16 dt=$dt ___ ___ $src extra_dt="$dt")
     pat (ZERO_EXT dt=$dt ___ $src) where "$src->dt.type == TB_TAG_I16" => (x86_movzx16 dt=$dt ___ ___ $src extra_dt="TB_TYPE_I16")
 )
 

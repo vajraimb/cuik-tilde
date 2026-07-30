@@ -107,6 +107,13 @@ struct VReg {
     // in get_spill_cost could never fire. Widen so repeat-spill detection works.
     int  was_spilled : 4;
     bool was_reload  : 1;
+    // PATCH(odin-tilde): registers this vreg's lineage has been evicted out
+    // of, accumulated across rounds. Split clones avoid all of them, not
+    // just the latest evictor's pin — otherwise two (or more) pinned
+    // occupants ping-pong the clone between their registers forever
+    // (jpeg@load_from_context: entry projections pinned to RBX/RBP kept
+    // evicting the same reload lineage into each other's register).
+    uint64_t avoid_mask;
 };
 
 typedef struct Ctx Ctx;

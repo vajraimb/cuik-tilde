@@ -24,6 +24,7 @@ typedef struct {
 
     int* spill_vreg_id;
     int* was_spilled;
+    uint64_t* avoid_mask; // PATCH(odin-tilde): lineage avoid accumulation
 
     NL_Table spill_map;
     NL_Table uses_spill;
@@ -550,6 +551,7 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
     splitter.spill_vreg_id = tb_arena_alloc(ra->arena, num_spills * sizeof(int));
     splitter.was_spilled   = tb_arena_alloc(ra->arena, num_spills * sizeof(int));
+    splitter.avoid_mask    = tb_arena_alloc(ra->arena, num_spills * sizeof(uint64_t));
 
     uint64_t was_spilled_before = 0;
     uint64_t class2vreg[MAX_REG_CLASSES] = { 0 };
@@ -564,13 +566,22 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         // the splitter cannot operate on stack nodes, they also
         // don't ever need "splitting"
         TB_ASSERT(!reg_mask_is_stack(to_spill->mask));
+        // PATCH(odin-tilde): initialize the lineage avoid set BEFORE the
+        // clobber block below accumulates into it (arena memory is not
+        // zeroed, and a later plain assignment would clobber the update).
+        splitter.avoid_mask[i]    = to_spill->avoid_mask;
         splitter.reload_mask[i] = ctx->normie_mask[class];
         if (splits[i].clobber) {
             RegMask* clobber = splits[i].clobber;
             TB_ASSERT(ctx->num_regs[clobber->class] < 64);
 
             uint64_t total_mask = UINT64_MAX >> (64 - ctx->num_regs[clobber->class]);
-            splitter.spill_mask[i] = intern_regmask(ctx, clobber->class, true, ~clobber->mask[0] & total_mask);
+            // PATCH(odin-tilde): accumulate the avoid set across rounds so
+            // clones don't ping-pong between registers held by different
+            // pinned occupants.
+            splitter.avoid_mask[i] |= clobber->mask[0];
+            uint64_t avoid = splitter.avoid_mask[i] & total_mask;
+            splitter.spill_mask[i] = intern_regmask(ctx, clobber->class, true, ~avoid & total_mask);
             // PATCH(odin-tilde): reloads of a clobber-split must avoid the
             // clobbered registers too. Reloads are placed at block
             // granularity, so a reload can still span the clobbering call;
@@ -1555,6 +1566,7 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             // PATCH(odin-tilde): saturate so the counter never wraps
             int ws = splitter.was_spilled[spill] + 1;
             new_vreg->was_spilled = ws > 3 ? 3 : ws;
+            new_vreg->avoid_mask  = splitter.avoid_mask[spill];
         }
     }
 
