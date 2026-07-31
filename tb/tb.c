@@ -554,6 +554,10 @@ TB_Symbol* tb_symbol_alloc(TB_Module* m, TB_SymbolTag tag, ptrdiff_t len, const 
     s->name_length = len;
     s->name = tb__arena_strdup(m, len, name);
     s->module = m;
+    // NOTE(odin-tilde): the arena does not zero memory, and ordinal lives
+    // inside TB_Symbol (outside the memset below); export layout sorts by
+    // ordinal, so it must start at a deterministic value.
+    s->ordinal = 0;
     if (size > sizeof(TB_Symbol)) {
         memset(&s[1], 0, size - sizeof(TB_Symbol));
     }
@@ -613,6 +617,19 @@ void tb_global_set_storage(TB_Module* m, TB_ModuleSectionHandle section, TB_Glob
     global->objects = TB_ARENA_ARR_ALLOC(get_permanent_arena(m), max_objects, TB_InitObj);
 }
 
+// NOTE(odin-tilde): deterministic names for codegen-created globals (jump
+// tables, builder strings). Function codegen is sequential, so a
+// per-function counter yields names that are stable across runs; the export
+// layout tie-breaks on symbol names, so unique stable names keep builds
+// reproducible.
+char* tb__anon_global_name(TB_Function* f, const char* prefix) {
+    size_t prefix_len = strlen(prefix);
+    size_t cap = prefix_len + f->super.name_length + 24;
+    char* buf = tb_arena_alloc(&f->arena, cap);
+    snprintf(buf, cap, "%s$%.*s$%u", prefix, (int) f->super.name_length, f->super.name, ++f->anon_global_count);
+    return buf;
+}
+
 TB_Global* tb__small_data_intern(TB_Module* m, size_t len, const void* data) {
     assert(len <= 32);
 
@@ -627,7 +644,18 @@ TB_Global* tb__small_data_intern(TB_Module* m, size_t len, const void* data) {
     if (search >= 0) {
         g = m->global_interns[search].v;
     } else {
-        g = tb_global_create(m, 0, NULL, NULL, TB_LINKAGE_PRIVATE);
+        // NOTE(odin-tilde): name by content so the export layout tie-break
+        // stays deterministic even when two constants share their first 8
+        // bytes (the ordinal below only covers those).
+        static const char hex[] = "0123456789abcdef";
+        char sd_name[4 + 2*32];
+        sd_name[0] = '_'; sd_name[1] = '_'; sd_name[2] = '$'; sd_name[3] = 'd';
+        for (size_t i = 0; i < len; i++) {
+            unsigned byte = (unsigned char) c.data[i];
+            sd_name[4 + 2*i + 0] = hex[byte >> 4];
+            sd_name[4 + 2*i + 1] = hex[byte & 0xF];
+        }
+        g = tb_global_create(m, 4 + 2*len, sd_name, NULL, TB_LINKAGE_PRIVATE);
         g->super.ordinal = *((uint64_t*) &c.data);
         tb_global_set_storage(m, tb_module_get_rdata(m), g, len, len, 1);
 

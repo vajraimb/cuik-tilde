@@ -322,7 +322,7 @@ TB_Node* tb_builder_string(TB_GraphBuilder* g, ptrdiff_t len, const char* str) {
     if (len < 0) len = strlen(str) + 1;
 
     TB_Function* f = g->f;
-    TB_Global* dummy = tb_global_create(f->super.module, 0, NULL, NULL, TB_LINKAGE_PRIVATE);
+    TB_Global* dummy = tb_global_create(f->super.module, -1, tb__anon_global_name(f, "bstr"), NULL, TB_LINKAGE_PRIVATE);
     tb_global_set_storage(f->super.module, tb_module_get_rdata(f->super.module), dummy, len, 1, 1);
 
     char* dst = tb_global_add_region(f->super.module, dummy, 0, len);

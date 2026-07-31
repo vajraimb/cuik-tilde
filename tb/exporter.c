@@ -59,16 +59,41 @@ TB_API bool tb_export_buffer_to_file(TB_ExportBuffer buffer, const char* path) {
     return true;
 }
 
+// Deterministic tie-break: symbol names are unique per module (the symbol
+// table interns by name and panics on collision), and insertion order into
+// that table is not deterministic under parallel codegen, so when ordinals
+// compare equal we fall back to the name to keep layout reproducible.
+static int compare_symbol_names(const TB_Symbol* sym_a, const TB_Symbol* sym_b) {
+    size_t len_a = sym_a->name_length;
+    size_t len_b = sym_b->name_length;
+    size_t min_len = len_a < len_b ? len_a : len_b;
+    int c = min_len ? memcmp(sym_a->name, sym_b->name, min_len) : 0;
+    if (c != 0) { return c; }
+    return (len_a > len_b) - (len_a < len_b);
+}
+
 static int compare_symbols(const void* a, const void* b) {
     const TB_Symbol* sym_a = *(const TB_Symbol**) a;
     const TB_Symbol* sym_b = *(const TB_Symbol**) b;
-    return (sym_a->ordinal > sym_b->ordinal) - (sym_a->ordinal < sym_b->ordinal);
+    if (sym_a->ordinal != sym_b->ordinal) {
+        return (sym_a->ordinal > sym_b->ordinal) - (sym_a->ordinal < sym_b->ordinal);
+    }
+    if (sym_a != sym_b) {
+        return compare_symbol_names(sym_a, sym_b);
+    }
+    return 0;
 }
 
 static int compare_functions(const void* a, const void* b) {
     const TB_FunctionOutput* sym_a = *(const TB_FunctionOutput**) a;
     const TB_FunctionOutput* sym_b = *(const TB_FunctionOutput**) b;
-    return (sym_a->ordinal > sym_b->ordinal) - (sym_a->ordinal < sym_b->ordinal);
+    if (sym_a->ordinal != sym_b->ordinal) {
+        return (sym_a->ordinal > sym_b->ordinal) - (sym_a->ordinal < sym_b->ordinal);
+    }
+    if (sym_a != sym_b) {
+        return compare_symbol_names((const TB_Symbol*) sym_a->parent, (const TB_Symbol*) sym_b->parent);
+    }
+    return 0;
 }
 
 static void layout_section(TB_ModuleSection* restrict section) {

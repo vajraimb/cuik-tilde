@@ -459,6 +459,11 @@ struct TB_Function {
     // Bookkeeping in certain interprocedural opts
     int uid;
 
+    // NOTE(odin-tilde): sequential counter for naming codegen-created
+    // globals (jump tables, builder strings). Function codegen runs
+    // sequentially, so names derived from it are stable across runs.
+    uint32_t anon_global_count;
+
     // Optimizer related data
     struct {
         // how we track duplicates for GVN, it's possible to run while building the IR.
@@ -738,6 +743,9 @@ TB_Symbol* tb_symbol_alloc(TB_Module* m, TB_SymbolTag tag, ptrdiff_t len, const 
 
 void tb_emit_symbol_patch(TB_FunctionOutput* func_out, TB_Symbol* target, size_t pos, TB_ObjectRelocType type);
 TB_Global* tb__small_data_intern(TB_Module* m, size_t len, const void* data);
+// NOTE(odin-tilde): deterministic name for codegen-created globals (jump
+// tables, builder strings) — see tb.c.
+char* tb__anon_global_name(TB_Function* f, const char* prefix);
 void tb__lattice_init(TB_Module* m);
 
 // out_bytes needs at least 16 bytes

@@ -395,7 +395,7 @@ build_linear_table:
             }
         }
 
-        TB_Global* table = tb_global_create(f->super.module, 0, NULL, NULL, TB_LINKAGE_PRIVATE);
+        TB_Global* table = tb_global_create(f->super.module, -1, tb__anon_global_name(f, "jt"), NULL, TB_LINKAGE_PRIVATE);
         tb_global_set_storage(f->super.module, data_sec, table, limit * sizeof(uint64_t), sizeof(uint64_t), 1 + limit);
 
         TB_Node* sym = mach_symbol_nowalk(f, &table->super);
@@ -518,7 +518,7 @@ build_linear_table:
                 h = binop_imm(f, TB_x86_shr,  x, 32 - shift);
             }
 
-            TB_Global* table = tb_global_create(f->super.module, 0, NULL, NULL, TB_LINKAGE_PRIVATE);
+            TB_Global* table = tb_global_create(f->super.module, -1, tb__anon_global_name(f, "pht"), NULL, TB_LINKAGE_PRIVATE);
             tb_global_set_storage(f->super.module, data_sec, table, cap * sizeof(uint64_t[2]), sizeof(uint64_t), 2 + cap);
 
             TB_Node* sym = mach_symbol_nowalk(f, &table->super);
