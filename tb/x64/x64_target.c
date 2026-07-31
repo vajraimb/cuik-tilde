@@ -356,7 +356,18 @@ build_linear_table:
 
         // normalize range, x' = x - range_start
         if (min != 0) {
-            src = binop_imm(f, TB_x86_sub, src, min);
+            // PATCH(odin-tilde): binop_imm narrows the immediate to int32
+            // (X86MemOp.imm), silently truncating a 64-bit range start.
+            // Type switches keyed by typeids carry kind/named bits in the
+            // top byte, so their min key never fits imm32 and every case
+            // fell through to default (demo "I'm a monster" regression).
+            // Materialize such constants in a register and subtract reg/reg.
+            if ((uint64_t)(int64_t)(int32_t)min == min) {
+                src = binop_imm(f, TB_x86_sub, src, min);
+            } else {
+                TB_Node* c = make_int_node(f, TB_TYPE_I64, min);
+                src = binop_reg(f, TB_x86_sub, src, c);
+            }
         }
 
         // TODO(NeGate): technically if the default case leads
