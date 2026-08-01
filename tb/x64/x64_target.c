@@ -2248,7 +2248,19 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             }
 
             if (dt == TB_X86_WORD) {
-                EMIT1(e, 0x66);
+                // PATCH(odin-tilde): 16-bit has no BSWAP (66 0F C8 is
+                // architecturally undefined and behaves like a 32-bit
+                // bswap whose low half is zero). Use ROL r16, 8 instead.
+                if (dst.reg >= 8) {
+                    EMIT1(e, 0x66);
+                    EMIT1(e, 0x41);
+                } else {
+                    EMIT1(e, 0x66);
+                }
+                EMIT1(e, 0xC1);
+                EMIT1(e, 0xC0 + (dst.reg & 0x7));
+                EMIT1(e, 8);
+                break;
             }
 
             if (dt == TB_X86_QWORD || dst.reg >= 8) {
