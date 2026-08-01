@@ -120,6 +120,11 @@ static TB_DataType reg_class_to_tb(TB_ABI abi, RegClass rg, TB_DebugType* type) 
         case RG_INTEGER: {
             if (type->tag == TB_DEBUG_TYPE_POINTER) { return TB_TYPE_PTR; }
             switch (debug_type_size(abi, type)) {
+                // PATCH(odin-tilde): zero-sized aggregates (Odin's struct{})
+                // carry no information; ride as a dummy byte, contents are
+                // ignored by both sides (tilde-compiled callers/callees only
+                // ever meet each other across this ABI).
+                case 0:  return TB_TYPE_I8;
                 case 1:  return TB_TYPE_I8;
                 case 2:  return TB_TYPE_I16;
                 // PATCH(odin-tilde): sub-4/8-byte aggregates (e.g. Odin's

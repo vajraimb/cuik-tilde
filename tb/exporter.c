@@ -233,6 +233,11 @@ size_t tb_helper_write_section(TB_Module* m, size_t write_pos, TB_ModuleSection*
         memset(&data[g->pos], 0, g->size);
         FOR_N(k, 0, g->obj_count) {
             if (g->objects[k].type == TB_INIT_OBJ_REGION) {
+                if (!(g->objects[k].offset + g->objects[k].region.size <= g->size)) {
+                    fprintf(stderr, "[cuik] global region overflow: %s offset=%zu region=%zu size=%zu\n",
+                            g->super.name ? g->super.name : "?", (size_t)g->objects[k].offset,
+                            g->objects[k].region.size, (size_t)g->size);
+                }
                 assert(g->objects[k].offset + g->objects[k].region.size <= g->size);
                 memcpy(&data[g->pos + g->objects[k].offset], g->objects[k].region.ptr, g->objects[k].region.size);
             }

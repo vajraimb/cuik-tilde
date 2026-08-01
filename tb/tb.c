@@ -607,6 +607,10 @@ TB_Global* tb_symbol_as_global(TB_Symbol* s) {
 }
 
 void tb_global_set_storage(TB_Module* m, TB_ModuleSectionHandle section, TB_Global* global, size_t size, size_t align, size_t max_objects) {
+    // NOTE(odin-tilde): Odin has zero-sized types (e.g. struct {}); give such
+    // globals a dummy byte of storage instead of asserting — nobody reads it.
+    if (size == 0) size = 1;
+    if (align == 0) align = 1;
     TB_ASSERT(size > 0 && align > 0 && tb_is_power_of_two(align));
     global->parent = section;
     global->pos = 0;
