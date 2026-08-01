@@ -123,7 +123,29 @@ static TB_Node** coalesce_set_array(Ctx* ctx, Rogers* ra, TB_Node** n_ptr, size_
     int leader = uf_find(ra->uf, ra->uf_len, (*n_ptr)->gvn);
     ArenaArray(TB_Node*) set = nl_table_get(&ra->coalesce_set, (void*) (uintptr_t) (leader + 1));
     if (set) {
-        *out_count = aarray_length(set);
+        // PATCH(odin-tilde): coalesce sets retain pointers to nodes that were
+        // later killed — the CISC/phi hard-split deletion paths null the node
+        // and zero its vreg_map without removing it from the set. Consumers
+        // then crash on the stale member (put_to_sleep_vreg assert, NULL
+        // scheduled[] block deref in interference — seen compiling odinfmt,
+        // dead copy %126 in a phi's set). Filter dead members centrally.
+        size_t len = aarray_length(set);
+        bool has_dead = false;
+        FOR_N(i, 0, len) {
+            if (set[i]->type == TB_NULL) { has_dead = true; break; }
+        }
+        if (has_dead) {
+            TB_Node** filtered = tb_arena_alloc(&ctx->f->tmp_arena, len * sizeof(TB_Node*));
+            size_t cnt = 0;
+            FOR_N(i, 0, len) {
+                if (set[i]->type != TB_NULL) {
+                    filtered[cnt++] = set[i];
+                }
+            }
+            *out_count = cnt;
+            return filtered;
+        }
+        *out_count = len;
         return set;
     } else {
         *out_count = 1;
@@ -154,6 +176,8 @@ static double rogers_get_spill_cost(Ctx* restrict ctx, Rogers* restrict ra, VReg
         double c = 0.0;
         if (set) {
             aarray_for(i, set) {
+                // PATCH(odin-tilde): skip killed members (see coalesce_set_array)
+                if (set[i]->type == TB_NULL) { continue; }
                 c += get_node_spill_cost(ctx, set[i]);
             }
         } else {
@@ -203,6 +227,8 @@ static bool rogers_can_coalesce(Ctx* restrict ctx, Rogers* restrict ra, TB_Node*
         return !interfere(ctx, ra, xn, yn);
     } else {
         aarray_for(i, set) {
+            // PATCH(odin-tilde): skip killed members (see coalesce_set_array)
+            if (set[i]->type == TB_NULL) { continue; }
             if (interfere(ctx, ra, set[i], yn)) {
                 return false;
             }
@@ -268,6 +294,13 @@ static void rogers_update_mask(Ctx* restrict ctx, Rogers* restrict ra, TB_Node* 
         aarray_for(i, set) {
             int y = set[i]->gvn;
             TB_Node* yy = ra->gvn2node[y];
+
+            // PATCH(odin-tilde): skip killed set members (see
+            // put_to_sleep_vreg) — remapping or constraining a dead node
+            // would resurrect it into this vreg.
+            if (yy->type == TB_NULL) {
+                continue;
+            }
 
             ctx->vreg_map[y] = vreg_id;
             mask = tb__reg_mask_meet(ctx, mask, ctx->constraint(ctx, yy, NULL));
@@ -1599,6 +1632,14 @@ static void put_to_sleep_vreg(Ctx* restrict ctx, Rogers* restrict ra, int class,
     FOR_N(j, 0, cnt) {
         if (arr[j] != n) {
             TB_ASSERT(arr[j]->gvn < ctx->f->node_count);
+            // PATCH(odin-tilde): coalesce sets retain pointers to nodes that
+            // were later killed — the CISC/phi hard-split paths null the node
+            // and zero its vreg_map without removing it from the set (seen on
+            // odinfmt: a deleted copy node coalesced into a phi's set tripped
+            // the assert below). Dead members need no liveness tracking.
+            if (arr[j]->type == TB_NULL) {
+                continue;
+            }
             TB_ASSERT(ctx->vreg_map[arr[j]->gvn] == vreg_id);
             put_to_sleep(ra, class, arr[j]->gvn);
         }

@@ -47,7 +47,7 @@ if arch_features then
         end
         if feat[2] then
             if feat[2] == "=>" then
-                implies_map:put(feat_name, { unpack(feat, 3) })
+                implies_map:put(feat_name, { table.unpack(feat, 3) })
             else
                 print(inspect(feat))
                 print("wrong syntax for arch_features")
@@ -1073,11 +1073,12 @@ do
 
             for where,list in packs:iter() do
                 local is_subpat = set[list[1]][3]
+                local where_expr = where
                 if is_subpat then
-                    if where == "true" then
-                        where = "depth == 0"
+                    if where_expr == "true" then
+                        where_expr = "depth == 0"
                     else
-                        where = "depth == 0 && "..where
+                        where_expr = "depth == 0 && "..where_expr
                     end
                 end
 
@@ -1092,10 +1093,10 @@ do
                 add_rline(string.format("%s{", indent))
                 find_captures(rule_lines, set[list[1]][1], "n", false, indent.."    ")
 
-                if where == "true" then
+                if where_expr == "true" then
                     add_rline(string.format("%s    return %d;", indent, accept_id))
                 else
-                    add_rline(string.format("%s    if (%s) { return %d; }", indent, where, accept_id))
+                    add_rline(string.format("%s    if (%s) { return %d; }", indent, where_expr, accept_id))
                 end
                 add_rline(string.format("%s}", indent))
 

@@ -352,7 +352,7 @@ TB_Node* tb_builder_cast(TB_GraphBuilder* g, TB_DataType dt, int type, TB_Node* 
 }
 
 TB_Node* tb_builder_binop_int(TB_GraphBuilder* g, int type, TB_Node* a, TB_Node* b, TB_ArithmeticBehavior ab) {
-    TB_ASSERT_MSG(TB_DATA_TYPE_EQUALS(a->dt, b->dt), "datatype mismatch");
+    TB_ASSERT_MSG(TB_DATA_TYPE_EQUALS(a->dt, b->dt), "datatype mismatch: op=%d a=(raw=%d) b=(raw=%d) in %s", type, a->dt.raw, b->dt.raw, g->f->super.name);
     TB_ASSERT_MSG(TB_IS_INTEGER_TYPE(a->dt), "datatype wasn't an integer");
     TB_ASSERT_MSG(type >= TB_AND && type <= TB_SMOD, "'type' wasn't an integer binop type (see TB_NodeTypeEnum)");
 

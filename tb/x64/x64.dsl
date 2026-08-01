@@ -217,7 +217,7 @@
     pat (AND dt=$dt ___ (SHL ___ ($con: ICONST ...) $y) $x) where "as_int32($con) == 1" => (x86_COND dt=TB_TYPE_I8 (x86_bt dt=TB_TYPE_I64 ___ ___ $y $x extra_dt=$dt) cond=B)
 
     (node adc extra=X86MemOp)
-    pat (x86_cmovcc dt=$dt ___ ___ $x (ADD ___ $y ($con: ICONST ...)) $pred) where "as_int32($con) == 1 && TB_NODE_GET_EXTRA_T(n, X86MemOp)->cond == B" => (x86_adc dt=$dt ___ ___ $x $pred flags="OP_IMMEDIATE" imm="0")
+    pat (x86_cmovcc dt=$dt ___ ___ $x (ADD ___ $y ($con: ICONST ...)) $pred) where "as_int32($con) == 1 && $x == $y && TB_NODE_GET_EXTRA_T(n, X86MemOp)->cond == B" => (x86_adc dt=$dt ___ ___ $x $pred flags="OP_IMMEDIATE" imm="0")
 
     // IARITH X, Y
     // set,s A
