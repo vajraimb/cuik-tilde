@@ -574,10 +574,6 @@ build_linear_table:
     // e.g. typeids), the 64-bit hash above must keep retrying instead —
     // with full-width keys distinct seeds resolve collisions in practice.
     tb_arena_restore(&f->tmp_arena, sp);
-    if (getenv("TB_PHASH_DEBUG")) { // DEBUG(odin-tilde)
-        fprintf(stderr, "PHASH-FALLBACK: %s succ=%d min=%"PRIu64" max=%"PRIu64" shift=%"PRIu64" wide=%d range_fits=%d\n",
-            f->super.name, br->succ_count, min, max, shift, wide_keys, range_fits);
-    }
     TB_ASSERT(range_fits && "perfect hash failed and key range cannot fit a linear jump table");
     density = 1.0;
     goto build_linear_table;

@@ -475,7 +475,25 @@ static uint64_t update_phi_edges(Ctx* ctx, Rogers* ra, RegSplitter* splitter, ui
                     set_input(f, bb_defs[k], pred_def, 1+pred_path);
                 }
             } else if (bb_defs[k] != pred_def) {
-                if ((splitter->remat_all >> k) & 1) {
+                // PATCH(odin-tilde): a remat_all merge may only take the
+                // single reload path when the value genuinely
+                // rematerializes from this def. After several rounds the
+                // "single def" can be a reload/spill-store chain whose
+                // producer is NOT remat-able (e.g. a param projection):
+                // insert_reload then degrades to a slot reload reading the
+                // CURRENT pred's store — a store that does not dominate
+                // this block on the OTHER edges (ols request_initialize
+                // SIGSEGV: BB450 read STACK677 written only in BB418).
+                // Detect the dead end here and build a phi instead.
+                bool can_remat_here = false;
+                if (pred_def != NULL && ((splitter->remat_all >> k) & 1)) {
+                    TB_Node* rsrc = pred_def;
+                    while (rsrc->type == TB_MACH_COPY && rsrc->inputs[1] != NULL) {
+                        rsrc = rsrc->inputs[1];
+                    }
+                    can_remat_here = !is_spill_store(rsrc) && can_remat(ctx, rsrc);
+                }
+                if (can_remat_here) {
                     // this value is single-def, there's no variants of it so no phis
                     size_t pos = 1;
                     bb_defs[k] = insert_reload(ctx, ra, splitter, &ctx->cfg.blocks[bb_id], defs, pred_defs, k, splitter->W_exit[bb_id], &pos);
@@ -525,12 +543,6 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
     // bbb++;
     // tb_opt__REGSPLIT = bbb == 6 || bbb == 7;
-    {   // DEBUG(odin-tilde): env-gated per-function REGSPLIT dump.
-        // TB_REGSPLIT_DEBUG=<substring of mangled name> enables it.
-        const char* rsdbg = getenv("TB_REGSPLIT_DEBUG");
-        tb_opt__REGSPLIT = rsdbg != NULL && f->super.name != NULL &&
-                           strstr(f->super.name, rsdbg) != NULL;
-    }
 
     TB_OPTDEBUG(REGSPLIT)(printf("== INSERT NODES ==\n"));
 
@@ -554,6 +566,9 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
     splitter.avoid_mask    = tb_arena_alloc(ra->arena, num_spills * sizeof(uint64_t));
 
     uint64_t was_spilled_before = 0;
+    // PATCH(odin-tilde): spill ids whose spill space is pinned to a pure
+    // stack slot (non-clobber splits); see the recompute loop below.
+    uint64_t stk_only = 0;
     uint64_t class2vreg[MAX_REG_CLASSES] = { 0 };
     FOR_N(i, 0, num_spills) {
         uint32_t vreg_id = splits[i].target;
@@ -566,19 +581,18 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         // the splitter cannot operate on stack nodes, they also
         // don't ever need "splitting"
         TB_ASSERT(!reg_mask_is_stack(to_spill->mask));
-        // PATCH(odin-tilde): initialize the lineage avoid set BEFORE the
-        // clobber block below accumulates into it (arena memory is not
-        // zeroed, and a later plain assignment would clobber the update).
-        splitter.avoid_mask[i]    = to_spill->avoid_mask;
+        // PATCH(odin-tilde): do NOT inherit the lineage avoid set: each
+        // split only avoids the registers of its OWN clobber. Accumulating
+        // the avoid set across split generations shrinks the usable mask
+        // every round until the split loop cannot converge.
+        splitter.avoid_mask[i]    = 0;
         splitter.reload_mask[i] = ctx->normie_mask[class];
         if (splits[i].clobber) {
             RegMask* clobber = splits[i].clobber;
             TB_ASSERT(ctx->num_regs[clobber->class] < 64);
 
             uint64_t total_mask = UINT64_MAX >> (64 - ctx->num_regs[clobber->class]);
-            // PATCH(odin-tilde): accumulate the avoid set across rounds so
-            // clones don't ping-pong between registers held by different
-            // pinned occupants.
+            // avoid only THIS split's clobber registers (see above).
             splitter.avoid_mask[i] |= clobber->mask[0];
             uint64_t avoid = splitter.avoid_mask[i] & total_mask;
             splitter.spill_mask[i] = intern_regmask(ctx, clobber->class, true, ~avoid & total_mask);
@@ -590,6 +604,15 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             splitter.reload_mask[i] = splitter.spill_mask[i];
         } else {
             splitter.spill_mask[i] = ctx->mayspill_mask[class];
+        }
+        // PATCH(odin-tilde): pin every spill space with a usable spill
+        // mask to a pure stack slot (clobber splits included — their
+        // spill-stores were observed being colored into registers, which
+        // breaks the splitter's slot-residency assumption exactly like
+        // the non-clobber case). The reload mask keeps the clobber-avoid
+        // semantics, only the store side is stack-pinned.
+        if (splitter.spill_mask[i] != NULL) {
+            stk_only |= 1ull << i;
         }
         splitter.spill_vreg_id[i] = 0;
         splitter.was_spilled[i]   = to_spill->was_spilled;
@@ -753,7 +776,9 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             printf(" ");
             FOR_N(class, 1, ctx->num_classes) {
                 HRPRegion* hrp = &ra->hrp[i];
-                if (hrp->start[class] >= 0) {
+                if (hrp->start[class] >= 0 &&
+                    hrp->start[class] < (int) aarray_length(bb->items) &&
+                    hrp->end[class] < (int) aarray_length(bb->items)) {
                     printf("[%s, %d (%%%u), %d (%%%u)] ", reg_class_name(class), hrp->start[class], bb->items[hrp->start[class]]->gvn, hrp->end[class], bb->items[hrp->end[class]]->gvn);
                 }
             }
@@ -1600,6 +1625,40 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             }
         }
 
+        // PATCH(odin-tilde): spill-stores of a split must stay
+        // slot-resident. The splitter's W-tracking treats "not
+        // register-resident" as "in the stack slot", but the spill copies'
+        // may_spill GPR masks still let the RA color the shared spill vreg
+        // into a register; the slot is then never written on paths that
+        // skip the store and later reloads read garbage (ols resolve_poly
+        // SIGSEGV: a context-param spill-store became "mov r9 -> r13"
+        // while the merge-block reload read the never-written slot). Pin
+        // the vreg to the pure-stack spill mask so stores always write the
+        // slot and reloads always read it. Reload copies are excluded via
+        // !is_reload: for clobber splits their def mask is the (may_spill)
+        // avoid mask, so is_spill_store alone would misclassify them and
+        // pin the register the reload is supposed to land in. Spill phis
+        // coalesce with their input stores, so stack-resident (W=0) phis
+        // inherit the pin through the shared vreg, while register-resident
+        // (W=1) phis — whose inputs are reloads, never spill-stores — are
+        // untouched.
+        {
+            int spill_i = spill_map_get2(&splitter.spill_map, n);
+            if (spill_i >= 0 && ((stk_only >> spill_i) & 1) &&
+                is_spill_store(n) && !is_reload(n)) {
+                int stk_vreg_id = ctx->vreg_map[leader];
+                if (stk_vreg_id != 0) {
+                    VReg* stk_vreg = &ctx->vregs[stk_vreg_id];
+                    stk_vreg->mask = intern_regmask(ctx, REG_CLASS_STK, true, 0);
+                    stk_vreg->reg_width = tb__reg_width_from_dt(REG_CLASS_STK, n->dt);
+                    stk_vreg->spill_bias = -100.0f;
+                    stk_vreg->spill_cost = INFINITY;
+                    ctx->vreg_map[n->gvn] = stk_vreg_id;
+                    continue;
+                }
+            }
+        }
+
         RegMask* mask = ctx->constraint(ctx, n, NULL);
 
         int vreg_id = ctx->vreg_map[leader];
@@ -1608,32 +1667,57 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             vreg->reg_width  = tb__reg_width_from_dt(mask->class, n->dt);
             vreg->spill_bias = mask->may_spill ? -100.0f : 0.0f;
         }
-        mask = tb__reg_mask_meet(ctx, mask, ctx->vregs[vreg_id].mask);
-        if (getenv("TB_RA_SPIN_DEBUG") && (n->gvn == 51 || n->gvn == 55)) { // DEBUG(odin-tilde)
-            printf("RECOMPUTE-SEE: %%%u(%s) V%d old_fixed=%d met_fixed=%d\n",
-                n->gvn, tb_node_get_name(n->type), vreg_id,
-                ctx->vregs[vreg_id].mask ? fixed_reg_mask(ctx->vregs[vreg_id].mask) : -9,
-                mask ? fixed_reg_mask(mask) : -9);
+        // PATCH(odin-tilde): do NOT meet in the old vreg mask when it is
+        // stack-ish (STK class or any may_spill mask) or already empty.
+        // The old mask records the PREVIOUS segment's fate — a "proper
+        // spill" STK pin or a mayspill narrowing — and meeting it into the
+        // new segment either crosses classes (GPR def-constraint meet STK
+        // pin => TB_REG_EMPTY) or intersects disjoint mayspill bit sets
+        // (=> interned empty mayspill mask). Both poison the new vreg into
+        // an uncolorable empty mask, the split loop re-creates the same
+        // poison every generation, and the store chain grows one link per
+        // round until the round assert (server@index_file). Legitimate
+        // constraints flow forward through the def constraint above and
+        // the live use masks below; this split's own clobber narrowing is
+        // re-applied by the reload-narrowing block further down.
+        RegMask* old_vm = ctx->vregs[vreg_id].mask;
+        // PATCH(odin-tilde): preserve the stk_only spill pin. The pin is
+        // applied to spill-store vregs earlier in THIS pass; overwriting
+        // it with a recomputed GPR mask lets the store color into a
+        // register, the slot is never written, and reloads read garbage
+        // (ols request_initialize SIGSEGV: allocator/context fields came
+        // back as path-string bytes "/Users/vajra/Claw/Tildebackend").
+        // Only preserve for PURE spill spaces (no real-op defs): a vreg
+        // shared with a real op cannot be stack-resident (the op cannot
+        // write a slot) — keeping the pin there re-poisons the split
+        // loop (server@index_file).
+        if (old_vm != NULL && reg_mask_is_spill(old_vm)) {
+            bool pure = true;
+            size_t pcnt;
+            TB_Node** parr = coalesce_set_array(ctx, ra, &n, &pcnt);
+            FOR_N(pi, 0, pcnt) {
+                int pt = parr[pi]->type;
+                if (pt != TB_MACH_COPY && pt != TB_PHI &&
+                    pt != TB_MACH_PROJ && pt != TB_MACH_TEMP) { pure = false; break; }
+            }
+            if (pure) {
+                ctx->vregs[vreg_id].mask = old_vm;
+                ctx->vreg_map[n->gvn] = vreg_id;
+                continue;
+            }
         }
-        if (getenv("TB_RA_SPIN_DEBUG") && mask != NULL && fixed_reg_mask(mask) >= 0 &&
-            fixed_reg_mask(ctx->constraint(ctx, n, NULL)) < 0) { // DEBUG(odin-tilde)
-            printf("FIXED-OLD: %%%u(%s) vreg V%d old-mask-fixed\n",
-                n->gvn, tb_node_get_name(n->type), vreg_id);
+        if (old_vm != NULL && old_vm != &TB_REG_EMPTY &&
+            !reg_mask_is_stack(old_vm) && reg_mask_is_not_empty(old_vm)) {
+            mask = tb__reg_mask_meet(ctx, mask, old_vm);
         }
 
         FOR_USERS(u, n) {
             if (USERI(u) > 0 && USERI(u) < USERN(u)->input_count) {
                 RegMask* in_mask = constraint_in(ctx, USERN(u), USERI(u));
-                if (getenv("TB_RA_SPIN_DEBUG") && fixed_reg_mask(in_mask) >= 0) { // DEBUG(odin-tilde)
-                    printf("FIXED-MEET: %%%u(%s) pinned by %%%u(%s):%d mask=%p\n",
-                        n->gvn, tb_node_get_name(n->type), USERN(u)->gvn,
-                        tb_node_get_name(USERN(u)->type), USERI(u), (void*)in_mask);
-                }
                 mask = tb__reg_mask_meet(ctx, mask, in_mask);
             }
         }
 
-        // TB_ASSERT(mask != &TB_REG_EMPTY);
         // PATCH(odin-tilde): relax zombie fixed masks. Meets are monotone,
         // so once a vreg's mask was pinned by a use that has since been
         // rewired away, it stays pinned forever even though no remaining
@@ -1679,10 +1763,6 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                 }
             }
             if (!intrinsic && !needed) {
-                if (getenv("TB_RA_SPIN_DEBUG")) { // DEBUG(odin-tilde)
-                    printf("ZOMBIE-RELAX: %%%u(%s) vreg V%d fixed=%d -> normie\n",
-                        n->gvn, tb_node_get_name(n->type), vreg_id, fx);
-                }
                 mask = ctx->normie_mask[mask->class];
             }
         }
@@ -1701,17 +1781,6 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                     mask = narrowed;
                 }
             }
-        }
-        if (getenv("TB_RA_SPIN_DEBUG") && (n->gvn == 51 || n->gvn == 55)) { // DEBUG(odin-tilde)
-            printf("RECOMPUTE-FINAL: %%%u(%s) V%d final_fixed=%d\n",
-                n->gvn, tb_node_get_name(n->type), vreg_id,
-                mask ? fixed_reg_mask(mask) : -9);
-        }
-        if (vreg_id == 0) { // DEBUG(odin-tilde)
-            printf("RECOMPUTE-V0: n=%%%u(%s) leader=%%%u\n",
-                n->gvn, tb_node_get_name(n->type), leader);
-            fflush(stdout);
-            abort();
         }
         ctx->vregs[vreg_id].mask = mask;
         ctx->vreg_map[n->gvn] = vreg_id;
@@ -1794,5 +1863,115 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
     TB_OPTDEBUG(SERVER)(dbg_submit_event_sched(&ctx->cfg, f, "Post-split"));
     TB_OPTDEBUG(REGSPLIT)(rogers_dump_sched(ctx, old_node_count));
+}
+
+// PATCH(odin-tilde): materialize uses of stack-resident vregs.
+// Several nets (the stk_only spill-space pin, the "proper spill" drop,
+// clobber-split reload masks) can leave a vreg with a STK-class mask.
+// Only mach_copy consumers tolerate that (MOV folds a memory source);
+// every other unfused emitter path hardcodes register operands —
+// op_gpr_at address bases (runtime@print_type: mov loading through a
+// pinned store) and inst2 secondaries (server@collect_value_decl: an
+// x86_sub reading a stack-pinned vreg) both asserted. Every store of a
+// spill space writes the SAME slot, so the slot is path-insensitively
+// current at any dominated use: insert an explicit reload copy before
+// such uses and rewire them to it. Uses whose own constraint expects a
+// stack slot (um->class == STK, e.g. call argument slots) are left
+// alone — the slot IS their required location. Called once per RA round
+// after the split phase (also covers rounds whose only stack-pinnings
+// came from the no-split "proper spill" net).
+static void materialize_stk_uses(Ctx* ctx, Rogers* ra) {
+    TB_Function* f = ctx->f;
+
+    // Collapse reload->spill-store pairs: R is a register-class mach_copy
+    // reading a stack slot, whose sole user S is a spill-store writing
+    // another slot. Rewire S to read R's source slot directly and kill R.
+    // Splitting such a pair only re-creates it one slot deeper (the reload
+    // can never need a register — its only consumer is a store), growing
+    // an alternating store/reload chain by two links EVERY round until the
+    // round assert fires (server@index_file reached thousands of links).
+    // Same-block requirement: the def-use edge guarantees the source slot
+    // is still current at S (no intervening store of the source space can
+    // exist between a splitter-placed reload and its use). Pinned copies
+    // (fixed def masks, e.g. call-argument copies) are never collapsed —
+    // killing them would drop the pinned register write.
+    FOR_N(bb_id, 0, ctx->bb_count) {
+        TB_BasicBlock* bb = &ctx->cfg.blocks[bb_id];
+        for (size_t ni = 0; ni < aarray_length(bb->items); ni++) {
+            TB_Node* r = bb->items[ni];
+            if (r->type != TB_MACH_COPY || r->user_count != 1) { continue; }
+            int rv = (r->gvn < aarray_length(ctx->vreg_map)) ? ctx->vreg_map[r->gvn] : 0;
+            if (rv <= 0) { continue; }
+            VReg* rvv = &ctx->vregs[rv];
+            if (rvv->mask == NULL || rvv->mask->class == REG_CLASS_STK ||
+                fixed_reg_mask(rvv->mask) >= 0) { continue; }
+            TB_Node* rsrc = r->inputs[1];
+            if (rsrc == NULL) { continue; }
+            int rsv = (rsrc->gvn < aarray_length(ctx->vreg_map)) ? ctx->vreg_map[rsrc->gvn] : 0;
+            if (rsv <= 0) { continue; }
+            VReg* rsrcv = &ctx->vregs[rsv];
+            if (rsrcv->mask == NULL || rsrcv->mask->class != REG_CLASS_STK) { continue; }
+            TB_Node* s = USERN(&r->users[0]);
+            if (s->type != TB_MACH_COPY || USERI(&r->users[0]) != 1) { continue; }
+            if (f->scheduled[s->gvn] != bb) { continue; }
+            int sv = (s->gvn < aarray_length(ctx->vreg_map)) ? ctx->vreg_map[s->gvn] : 0;
+            if (sv <= 0) { continue; }
+            VReg* svv = &ctx->vregs[sv];
+            if (svv->mask == NULL || svv->mask->class != REG_CLASS_STK) { continue; }
+
+            set_input(f, s, rsrc, 1);
+            ctx->vreg_map[r->gvn] = 0;
+            tb__remove_node(ctx, f, r);
+            tb_kill_node(f, r);
+            ni--; // re-examine the slot the removed copy occupied
+        }
+    }
+
+    FOR_N(bb_id, 0, ctx->bb_count) {
+        TB_BasicBlock* bb = &ctx->cfg.blocks[bb_id];
+        for (size_t ni = 0; ni < aarray_length(bb->items); ni++) {
+            TB_Node* n = bb->items[ni];
+            if (n->type == TB_PHI || n->type == TB_MACH_PROJ ||
+                n->type == TB_MACH_COPY) { continue; }
+
+            size_t ins_pos = ni;
+            int inserted = 0;
+            FOR_N(k, 1, n->input_count) {
+                TB_Node* in = n->inputs[k];
+                if (in == NULL) { continue; }
+                int sv = (in->gvn < aarray_length(ctx->vreg_map)) ? ctx->vreg_map[in->gvn] : 0;
+                if (sv <= 0) { continue; }
+                VReg* svr = &ctx->vregs[sv];
+                if (svr->mask == NULL || svr->mask->class != REG_CLASS_STK) { continue; }
+                RegMask* um = constraint_in(ctx, n, k);
+                if (um != NULL && um->class == REG_CLASS_STK) { continue; }
+                int vclass = um != NULL ? um->class :
+                    (in->dt.type == TB_TAG_F32 || in->dt.type == TB_TAG_F64 ||
+                     in->dt.type == TB_TAG_V128 ? 2 : 1);
+                RegMask* rmask = ctx->normie_mask[vclass];
+                RegMask* smask = ctx->mayspill_mask[vclass];
+                if (rmask == NULL || smask == NULL) { continue; }
+
+                TB_Node* cpy = tb_alloc_node(f, TB_MACH_COPY, in->dt, 2, sizeof(TB_NodeMachCopy));
+                set_input(f, cpy, in, 1);
+                TB_NODE_SET_EXTRA(cpy, TB_NodeMachCopy, .def = rmask, .use = smask);
+                VReg* rv = tb__set_node_vreg(ctx, cpy);
+                rv->mask = rmask;
+                rv->reg_width = tb__reg_width_from_dt(rmask->class, cpy->dt);
+
+                rogers_insert_op(ctx, bb_id, cpy, ins_pos);
+                FOR_N(class, 1, ctx->num_classes) {
+                    ra->hrp[bb_id].start[class] += ins_pos <= ra->hrp[bb_id].start[class];
+                    ra->hrp[bb_id].end[class]   += ins_pos <= ra->hrp[bb_id].end[class];
+                }
+                ins_pos++;
+                inserted++;
+                set_input(f, n, cpy, k);
+                TB_OPTDEBUG(REGSPLIT)(printf("  BB%zu: stk-use reload %%%u (of %%%u) for %%%u:%zu\n",
+                    bb_id, cpy->gvn, in->gvn, n->gvn, k));
+            }
+            ni += inserted;
+        }
+    }
 }
 
