@@ -302,9 +302,9 @@
     (node idiv extra=X86MemOp)
 
     pat (UDIV dt=$dt ___ $lhs $rhs) => (PROJ dt=$dt (x86_div dt=TB_TYPE_TUPLE ___ ___ $rhs $lhs extra_dt=$dt) index=0)
-    pat (SDIV dt=$dt ___ $lhs $rhs) => (PROJ dt=$dt (x86_div dt=TB_TYPE_TUPLE ___ ___ $rhs $lhs extra_dt=$dt) index=0)
+    pat (SDIV dt=$dt ___ $lhs $rhs) => (PROJ dt=$dt (x86_idiv dt=TB_TYPE_TUPLE ___ ___ $rhs $lhs extra_dt=$dt) index=0)
     pat (UMOD dt=$dt ___ $lhs $rhs) => (PROJ dt=$dt (x86_div dt=TB_TYPE_TUPLE ___ ___ $rhs $lhs extra_dt=$dt) index=1)
-    pat (SMOD dt=$dt ___ $lhs $rhs) => (PROJ dt=$dt (x86_div dt=TB_TYPE_TUPLE ___ ___ $rhs $lhs extra_dt=$dt) index=1)
+    pat (SMOD dt=$dt ___ $lhs $rhs) => (PROJ dt=$dt (x86_idiv dt=TB_TYPE_TUPLE ___ ___ $rhs $lhs extra_dt=$dt) index=1)
 
     // *******************************
     // float ops

@@ -192,7 +192,16 @@ static void inst2sse(TB_CGEmitter* restrict e, InstType type, const Val* a, cons
     bool packed    = (dt == TB_X86_F32x4 || dt == TB_X86_F64x2);
     bool is_double = (dt == TB_X86_F64x2 || dt == TB_X86_F64x1);
 
-    if (type == MOV_I2F || type == MOV_F2I || (supports_mem_dst && dir)) {
+    // PATCH(odin-tilde): do NOT swap for MOV_I2F. movd 0x6E encodes the
+    // destination XMM in the reg field and the GPR/mem source in rm, so
+    // (a=dst, b=src) is already the correct operand order; swapping made
+    // rx the GPR source and rm the XMM destination — an inverted modrm
+    // that reads as "movd <other xmm>, <other gpr>" whenever the source
+    // and destination register numbers differ (ols fuzzy_match score:
+    // movd %eax,%xmm1 came out as movd %ecx,%xmm0 and multiplied the
+    // score_scale by pointer bits). MOV_F2I (0x7E) genuinely needs the
+    // swap because its reg field names the XMM source.
+    if (type == MOV_F2I || (supports_mem_dst && dir)) {
         SWAP(const Val*, a, b);
     }
 
@@ -305,6 +314,18 @@ static void asm_inst1(TB_CGEmitter* e, int type, TB_X86_DataType dt, const Val* 
     bool is_rexw = dt == TB_X86_QWORD;
 
     uint8_t op = inst->op_i, rx = inst->rx_i;
+    // PATCH(odin-tilde): idiv (F7 /7) needs width-correct encodings — the
+    // 66h operand-size prefix for 16-bit operands and the F6 opcode
+    // variant for 8-bit operands. Without this an idiv with dt=WORD/BYTE
+    // silently encoded as a 32-bit idivl and divided EDX:EAX garbage
+    // (SIGFPE / wrong results for i8/i16 signed division). DIV (F7 /6) is
+    // deliberately NOT flipped: the zero-extension convention makes the
+    // 32-bit divl correct for u8/u16, and it keeps the remainder in EDX
+    // where the register model expects it.
+    if (inst->cat == INST_UNARY && op == 0xF7 && rx == 0x07) {
+        if (dt == TB_X86_WORD) EMIT1(e, 0x66);
+        else if (dt == TB_X86_BYTE) op = 0xF6;
+    }
     if (r->type == VAL_GPR) {
         if (is_rex || r->reg >= 8) {
             EMIT1(e, rex(is_rexw, 0x00, r->reg, 0x00));

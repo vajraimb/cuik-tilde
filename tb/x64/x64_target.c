@@ -2310,8 +2310,24 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                     TB_X86_DataType src_dt = legalize(n->inputs[1]->dt);
                     __(FP_MOV, src_dt, &dst, &src);
                 } else {
-                    int op = dt < TB_X86_F32x1 ? MOV : FP_MOV;
-                    __(op, dt, &dst, &src);
+                    // PATCH(odin-tilde): when BOTH endpoints live in the
+                    // integer domain (GPR or stack slot) the copy moves raw
+                    // bits, so the float encoding must not be selected.
+                    // legalize() maps F32/F64 to the XMM-class F32x1/F64x1,
+                    // and FP_MOV then encodes movss/movsd with the GPR number
+                    // crammed into the XMM reg field — f32 min() died of this:
+                    // the reload before cmovcc came out as "movss slot->xmm2"
+                    // (never writing the GPR dst) and the result store as
+                    // "movss xmm2->slot", so the cmov's GPR def was dead and
+                    // downstream users read the un-selected value. Demote to
+                    // the bit-equivalent integer width (same treatment the
+                    // mem->mem case above already has).
+                    TB_X86_DataType idt = dt;
+                    if (idt >= TB_X86_F32x1 && dst.type != VAL_XMM && src.type != VAL_XMM) {
+                        idt = (idt == TB_X86_F32x1) ? TB_X86_DWORD : TB_X86_QWORD;
+                    }
+                    int op = idt < TB_X86_F32x1 ? MOV : FP_MOV;
+                    __(op, idt, &dst, &src);
                 }
             } else {
                 TB_OPTDEBUG(REGALLOC2)(EMIT1(e, 0x90));
@@ -2433,13 +2449,35 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
 
         case TB_x86_idiv: {
             X86MemOp* op = TB_NODE_GET_EXTRA(n);
-            // cqo/cdq (sign extend RAX into RDX)
-            if (n->dt.type == TB_TAG_I64) { EMIT1(e, 0x48); }
-            EMIT1(e, 0x99);
+            // PATCH(odin-tilde): sign-extend the dividend for the ACTUAL
+            // operand width. n->dt is TB_TYPE_TUPLE here (see the dsl
+            // pattern) so the old n->dt.type check never fired; and a bare
+            // CDQ is wrong for 8/16-bit operands whose values are held
+            // zero-extended in 32-bit registers (i8 -100 came out as
+            // +156/2=78). CBW/CWD/CDQ/CQO per width.
+            TB_X86_DataType dt = legalize_int(op->extra_dt);
+            switch (dt) {
+            case TB_X86_BYTE:  EMIT1(e, 0x66); EMIT1(e, 0x98); break; // CBW: AL -> AX
+            case TB_X86_WORD:  EMIT1(e, 0x66); EMIT1(e, 0x99); break; // CWD: AX -> DX:AX
+            case TB_X86_QWORD: EMIT1(e, 0x48); EMIT1(e, 0x99); break; // CQO: RAX -> RDX:RAX
+            default:           EMIT1(e, 0x99); break;                 // CDQ: EAX -> EDX:EAX
+            }
             // idiv
             Val rhs = parse_cisc_operand(ctx, n, NULL, TB_NODE_GET_EXTRA(n));
-            TB_X86_DataType dt = legalize_int(op->extra_dt);
             __(IDIV, dt, &rhs);
+            // PATCH(odin-tilde): an 8-bit idiv leaves the remainder in AH,
+            // but the register model expects it in DL (RDX proj). Shuffle
+            // it over when the remainder projection is actually used.
+            if (dt == TB_X86_BYTE) {
+                bool rem_used = false;
+                FOR_USERS(u, n) {
+                    if (IS_PROJ(USERN(u)) && TB_NODE_GET_EXTRA_T(USERN(u), TB_NodeProj)->index == 1) {
+                        rem_used = true;
+                        break;
+                    }
+                }
+                if (rem_used) { EMIT1(e, 0x88); EMIT1(e, 0xE2); } // mov %ah, %dl
+            }
             break;
         }
 
