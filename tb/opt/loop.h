@@ -7,6 +7,9 @@ typedef struct {
     TB_Node** ctrl;
 
     NL_Table loop_map;
+
+    // PATCH(odin-tilde): pure-analysis loop finding (see LoopSCC.analyze_only)
+    bool analyze_only;
 } LoopOpt;
 
 ////////////////////////////////
@@ -27,6 +30,16 @@ typedef struct {
 
     LoopSCCNode* nodes;
     int index;
+
+    // PATCH(odin-tilde): when set, loop_find runs in pure-analysis mode
+    // (used by tb_compute_synthetic_loop_freq during codegen) and must NOT
+    // mutate the graph — the NEVER_BRANCH insertion rewires control edges
+    // and appends a root exit AFTER the codegen CFG (blocks, node_to_block,
+    // dominators) was already computed, so the scheduler/emitter later see
+    // nodes and edges the CFG maps don't know about (x64 emitter asserted
+    // "map entry not found" on the loop-latch jump of an exitless loop,
+    // e.g. testing@stop_test_callback).
+    bool analyze_only;
 
     int stk_cnt;
     int* stk;
@@ -199,7 +212,7 @@ static void loop_scc_walk(LoopSCC* restrict scc, TB_CFG* restrict cfg, TB_BasicB
                 }
             }
 
-            if (exits == 0) {
+            if (exits == 0 && !scc->analyze_only) {
                 TB_Function* f = scc->f;
                 mark_node_n_users(f, bb->start);
 
@@ -254,6 +267,7 @@ static void loop_find(TB_Function* f, TB_CFG* restrict cfg, LoopOpt* restrict ct
         scc.f        = f;
         scc.arena    = &f->tmp_arena;
         scc.loop_map = &ctx->loop_map;
+        scc.analyze_only = ctx->analyze_only;
         scc.nodes    = tb_arena_alloc(&f->tmp_arena, block_count * sizeof(LoopSCCNode));
         scc.stk      = tb_arena_alloc(&f->tmp_arena, block_count * sizeof(int));
 
@@ -1168,6 +1182,10 @@ void tb_compute_synthetic_loop_freq(TB_Function* f, TB_CFG* cfg) {
     LoopOpt ctx = { 0 };
     ctx.f      = f;
     ctx.cfg    = *cfg;
+    // PATCH(odin-tilde): this runs during codegen, after the CFG maps were
+    // already built — loop finding here must be pure analysis and never
+    // insert TB_NEVER_BRANCH into exitless loops (see LoopSCC.analyze_only).
+    ctx.analyze_only = true;
     ctx.loop_map = nl_table_alloc((f->node_count / 16) + 4);
 
     TB_ArenaSavepoint sp = tb_arena_save(&f->tmp_arena);
