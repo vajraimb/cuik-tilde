@@ -181,10 +181,20 @@
     // PATCH(odin-tilde): FLT/FLE carry the same float guard as EQ/NE so the
     // DSL generator packs all four float compares into one rule group; else
     // FLT/FLE fall behind the EQ/NE float guard and cond is never set (jO).
-    pat (CMP_FLT cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_COND dt=TB_TYPE_I8 (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=B)
-    pat (CMP_FLE cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_COND dt=TB_TYPE_I8 (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=BE)
-    pat (CMP_EQ  cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_COND dt=TB_TYPE_I8 (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=E)
-    pat (CMP_NE  cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_COND dt=TB_TYPE_I8 (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=NE)
+    // PATCH(odin-tilde): IEEE-ordered float compares must mask the parity
+    // flag - ucomisd sets ZF=PF=CF=1 when unordered (NaN), so plain
+    // sete/setne/setb/setbe misreport NaN (NaN==0 evaluated true, breaking
+    // math.classify and every `x != x` is-nan idiom). TB constant folder
+    // (peep_cmp.h) already folds with ordered C semantics; match it here.
+    // Each setcc owns its ucomi (isel never dedups mach nodes), so float
+    // cmps lower to ucomi+setcc pairs instead of fused jcc/cmovcc - the
+    // generic test-based IF/SELECT patterns still apply downstream, and
+    // removing x86_COND here also keeps the cond==B cmov->adc idiom from
+    // misfiring on float flags.
+    pat (CMP_FLT cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_and dt=TB_TYPE_I8 ___ ___ (x86_setcc dt=TB_TYPE_I8 ___ ___ (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=B) (x86_setcc dt=TB_TYPE_I8 ___ ___ (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=NP))
+    pat (CMP_FLE cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_and dt=TB_TYPE_I8 ___ ___ (x86_setcc dt=TB_TYPE_I8 ___ ___ (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=BE) (x86_setcc dt=TB_TYPE_I8 ___ ___ (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=NP))
+    pat (CMP_EQ  cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_and dt=TB_TYPE_I8 ___ ___ (x86_setcc dt=TB_TYPE_I8 ___ ___ (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=E) (x86_setcc dt=TB_TYPE_I8 ___ ___ (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=NP))
+    pat (CMP_NE  cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (x86_or dt=TB_TYPE_I8 ___ ___ (x86_setcc dt=TB_TYPE_I8 ___ ___ (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=NE) (x86_setcc dt=TB_TYPE_I8 ___ ___ (x86_ucomi dt=TB_TYPE_I64 ___ ___ $rhs $lhs extra_dt=$dt) cond=P))
 
     pat (CMP_EQ cmp_dt=$dt ___ $lhs ($rhs: ICONST ...)) where "TB_IS_INT_OR_PTR($dt) && TB_NODE_GET_EXTRA_T($rhs, TB_NodeInt)->value == 0" => (x86_COND dt=TB_TYPE_I8 (x86_test dt=TB_TYPE_I64 ___ ___ $lhs $lhs extra_dt=$dt) cond=E)
     pat (CMP_NE cmp_dt=$dt ___ $lhs ($rhs: ICONST ...)) where "TB_IS_INT_OR_PTR($dt) && TB_NODE_GET_EXTRA_T($rhs, TB_NodeInt)->value == 0" => (x86_COND dt=TB_TYPE_I8 (x86_test dt=TB_TYPE_I64 ___ ___ $lhs $lhs extra_dt=$dt) cond=NE)
