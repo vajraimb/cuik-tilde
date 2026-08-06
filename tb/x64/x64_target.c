@@ -2326,8 +2326,25 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                     if (idt >= TB_X86_F32x1 && dst.type != VAL_XMM && src.type != VAL_XMM) {
                         idt = (idt == TB_X86_F32x1) ? TB_X86_DWORD : TB_X86_QWORD;
                     }
+                    // PATCH(odin-tilde): a sub-dword MOV into a register
+                    // leaves the upper bits holding garbage, but TB's
+                    // register model treats the whole register as the value
+                    // (64-bit LEAs in slice indexing, divl dividends, call
+                    // arguments). A spilled u8 index reloaded with movb came
+                    // back as table+0x26910000. Zero-extend BYTE/WORD into
+                    // the full register; narrow stores to memory stay MOV.
+                    if (dst.type == VAL_GPR && (src.type == VAL_GPR || src.type == VAL_MEM)) {
+                        if (idt == TB_X86_BYTE) {
+                            __(MOVZXB, TB_X86_DWORD, &dst, &src);
+                            goto mach_copy_done;
+                        } else if (idt == TB_X86_WORD) {
+                            __(MOVZXW, TB_X86_DWORD, &dst, &src);
+                            goto mach_copy_done;
+                        }
+                    }
                     int op = idt < TB_X86_F32x1 ? MOV : FP_MOV;
                     __(op, idt, &dst, &src);
+                mach_copy_done:;
                 }
             } else {
                 TB_OPTDEBUG(REGALLOC2)(EMIT1(e, 0x90));
@@ -2483,9 +2500,19 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
 
         case TB_x86_div: {
             X86MemOp* op = TB_NODE_GET_EXTRA(n);
+            TB_X86_DataType dt = legalize_int(op->extra_dt);
+            // PATCH(odin-tilde): DIV has no 8/16-bit encoding (op_i = 0xF7),
+            // so BYTE/WORD operands divide EDX:EAX via divl. The dividend
+            // may hold garbage above its real width (a byte spill reload
+            // only writes AL): zero-extend EAX first, then clear EDX.
+            // (u8 9/10 was observed as 777/10 = 77.)
+            if (dt == TB_X86_BYTE) {
+                EMIT1(e, 0x0F); EMIT1(e, 0xB6); EMIT1(e, 0xC0); // movzbl %al, %eax
+            } else if (dt == TB_X86_WORD) {
+                EMIT1(e, 0x0F); EMIT1(e, 0xB7); EMIT1(e, 0xC0); // movzwl %ax, %eax
+            }
             __(XOR, TB_X86_DWORD, Vgpr(RDX), Vgpr(RDX));
             Val rhs = parse_cisc_operand(ctx, n, NULL, TB_NODE_GET_EXTRA(n));
-            TB_X86_DataType dt = legalize_int(op->extra_dt);
             __(DIV, dt, &rhs);
             break;
         }
@@ -2674,7 +2701,21 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                     }
                 }
 
-                __(MOV, dt, &dst, &rm);
+                // PATCH(odin-tilde): an 8/16-bit MOV load leaves garbage
+                // in the upper bits of the destination register, but TB's
+                // register model treats the whole register as the value
+                // (64-bit LEA index arithmetic, call arguments, divl
+                // dividends). A packed-struct u8 field used as a slice
+                // index read back as table+0x26910000. Zero-extend loads
+                // into the full register (same invariant as the MACH_COPY
+                // reload path).
+                if (dst.type == VAL_GPR && dt == TB_X86_BYTE) {
+                    __(MOVZXB, TB_X86_DWORD, &dst, &rm);
+                } else if (dst.type == VAL_GPR && dt == TB_X86_WORD) {
+                    __(MOVZXW, TB_X86_DWORD, &dst, &rm);
+                } else {
+                    __(MOV, dt, &dst, &rm);
+                }
 
                 if (has_lvb) {
                     Stub_LVB* stub = add_code_stub(ctx, 0, sizeof(Stub_LVB));
