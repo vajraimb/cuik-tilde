@@ -31,7 +31,10 @@ static int debug_type_size(TB_ABI abi, TB_DebugType* t) {
         case TB_DEBUG_TYPE_INT:  return (t->int_bits + 7) / 8;
 
         case TB_DEBUG_TYPE_FUNCTION: return 8;
-        case TB_DEBUG_TYPE_ARRAY:    return 8;
+        // NOTE(odin-tilde): arrays-as-values (Odin) need their true
+        // aggregate size for ABI classification; C array parameters
+        // decay to pointers before reaching this point.
+        case TB_DEBUG_TYPE_ARRAY:    return t->array.base ? debug_type_size(abi, t->array.base) * (int)t->array.count : 8;
         case TB_DEBUG_TYPE_POINTER:  return 8;
 
         case TB_DEBUG_TYPE_FLOAT32:  return 4;

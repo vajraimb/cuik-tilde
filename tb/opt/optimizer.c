@@ -824,7 +824,14 @@ void set_input(TB_Function* f, TB_Node* n, TB_Node* in, int slot) {
 void add_user(TB_Function* f, TB_Node* n, TB_Node* in, int slot) {
     if (in->user_count >= in->user_cap) {
         size_t new_cap = ((size_t) in->user_cap) * 2;
-        if (new_cap >= UINT16_MAX) {
+        // NOTE(odin-tilde): clamp to the uint16_t cap instead of panicking
+        // at the doubling boundary — the spill-heavy memory model pushes
+        // MACH_FRAME_PTR past 32k users on very large functions
+        // (core:encoding/xml's generated entity switch).
+        if (new_cap > UINT16_MAX) {
+            new_cap = UINT16_MAX;
+        }
+        if (in->user_count >= new_cap) {
             tb_panic("Too many users to one node");
         }
 
