@@ -2457,7 +2457,12 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             // F2 REX.W 0F 2C /r      CVTTSD2SI xmm1, r/m64
             Val dst = op_at(ctx, n);
             Val lhs = op_at(ctx, n->inputs[1]);
-            __(FP_CVTT, dt, &dst, &lhs);
+            // PATCH(odin-tilde): FP_CVTT never sets REX.W, so a 64-bit
+            // destination was silently emitted as the 32-bit conversion —
+            // out-of-range values collapsed to the 0x80000000 sentinel
+            // (f64 1.23e10 -> u64 came out as 2147483648). Pick the 64-bit
+            // encoding from the destination width.
+            __(n->dt.type == TB_TAG_I64 ? FP_CVTT64 : FP_CVTT, dt, &dst, &lhs);
 
             // TODO(NeGate): that conversion into a 64bit unsigned number requires fixups we
             // don't do quite yet, go fiddle with godbolt later.

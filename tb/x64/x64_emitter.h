@@ -220,7 +220,7 @@ static void inst2sse(TB_CGEmitter* restrict e, InstType type, const Val* a, cons
         tb_todo();
     }
 
-    bool r = (type == FP_CVT64);
+    bool r = (type == FP_CVT64 || type == FP_CVTT64);
     if (type == MOV_I2F || type == MOV_F2I) {
         EMIT1(e, 0x66);
         r = dt == TB_X86_F64x1;
