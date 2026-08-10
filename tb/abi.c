@@ -226,6 +226,20 @@ TB_API TB_FunctionPrototype* tb_prototype_from_dbg(TB_Module* m, TB_DebugType* d
         }
 
         p->params[p->param_count] = ret;
+    } else if (p->return_count > 1) {
+        // PATCH(odin-tilde): multi-value returns — SysV <=16-byte composites
+        // split into per-eightbyte register chunks (e.g. complex128 returns
+        // in xmm0:xmm1) arrive here as individually classified returns.
+        FOR_N(i, 0, p->return_count) {
+            TB_DebugType* rtype = dbg->func.returns[i];
+            RegClass rg = classify_reg(abi, rtype);
+            TB_PrototypeParam r = {
+                .name = "$ret",
+                .debug_type = rtype,
+                .dt = reg_class_to_tb(abi, rg, rtype),
+            };
+            p->params[p->param_count + i] = r;
+        }
     }
 
     return p;
