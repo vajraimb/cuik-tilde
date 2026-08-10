@@ -1,3 +1,8 @@
+> **This is a fork of [RealNeGate/Cuik](https://github.com/RealNeGate/Cuik)** (MIT
+> license, © Yasser Arguelles Snape) — the TB-library companion of
+> [odin-tilde](https://github.com/vajraimb/odin-tilde), containing the fixes the
+> Odin tilde backend depends on. Check out tag `v0.1.0-beta` for the matched pair.
+
 <img src="logo/cuik.svg" width="256px"/>
 
 **warning: unfinished and buggy...**
