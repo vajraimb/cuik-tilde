@@ -24,8 +24,12 @@
 #define CONCAT(x, y) CONCAT_(x, y)
 #endif
 
+// NOTE(odin-tilde): always keep these as real extern globals, even under
+// NDEBUG — the Odin tilde backend flips tb_opt__REGALLOC/REGSPLIT at runtime
+// for its TILDE_RA_DEBUG diagnostics, so the symbols must exist in release
+// archives too. The cost is one load per TB_OPTLOG/IF_OPT check.
 #ifdef NDEBUG
-#  define ON_DBG(name, def) static const bool tb_opt__ ## name = def;
+#  define ON_DBG(name, def) extern bool tb_opt__ ## name;
 #else
 #  define ON_DBG(name, def) extern bool tb_opt__ ## name;
 #endif

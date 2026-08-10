@@ -3,8 +3,10 @@
 #include "host.h"
 #include <hashes.h>
 
+// NOTE(odin-tilde): always define the globals (see tb_internal.h note) —
+// the Odin tilde backend links against them even in release builds.
 #ifdef NDEBUG
-#define ON_DBG(name, def)
+#define ON_DBG(name, def) bool tb_opt__ ## name = def;
 #else
 #define ON_DBG(name, def) bool tb_opt__ ## name = def;
 #endif
