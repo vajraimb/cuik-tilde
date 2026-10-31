@@ -2692,7 +2692,38 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
 
             if (op->mode == MODE_ST) {
                 Val rx, rm = parse_cisc_operand(ctx, n, &rx, op);
-                __(MOV, dt, &rm, &rx);
+                if (rx.type == VAL_XMM && dt < TB_X86_F32x1) {
+                    // PATCH(odin-tilde): SLP-vectorized stores can leave a lane
+                    // value resident in an XMM (store.i8 of truncate(sign_ext(
+                    // cmp_eq.i8)) where the compare was widened into SIMD). An
+                    // integer MOV cannot name an XMM source: dword/qword keep
+                    // the raw bits via movss/movsd (same treatment as the
+                    // MACH_COPY spill patch below), byte/word extract the low
+                    // bits to a scratch GPR first — an FP mov would clobber
+                    // the neighboring bytes the store must not touch.
+                    if (dt == TB_X86_DWORD || dt == TB_X86_QWORD) {
+                        TB_X86_DataType fdt = (dt == TB_X86_DWORD) ? TB_X86_F32x1 : TB_X86_F64x1;
+                        __(FP_MOV, fdt, &rm, &rx);
+                    } else {
+                        GPR scratch = GPR_NONE;
+                        const GPR candidates[] = { RAX, RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
+                        FOR_N(i, 0, COUNTOF(candidates)) {
+                            if (candidates[i] != rm.reg && candidates[i] != rm.index) { scratch = candidates[i]; break; }
+                        }
+                        TB_ASSERT(scratch != GPR_NONE);
+
+                        Val rm2 = rm;
+                        if (rm2.reg == RSP) { rm2.imm += 8; } // the push below shifts RSP-relative slots
+                        if (scratch >= 8) { EMIT1(e, 0x41); }
+                        EMIT1(e, 0x50 + (scratch & 7)); // PUSH scratch
+                        __(MOV_F2I, TB_X86_DWORD, Vgpr(scratch), &rx);
+                        __(MOV, dt, &rm2, Vgpr(scratch));
+                        if (scratch >= 8) { EMIT1(e, 0x41); }
+                        EMIT1(e, 0x58 + (scratch & 7)); // POP scratch
+                    }
+                } else {
+                    __(MOV, dt, &rm, &rx);
+                }
             } else {
                 Val dst = op_at(ctx, n);
                 Val rm  = parse_cisc_operand(ctx, n, NULL, op);
@@ -2718,6 +2749,45 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                     __(MOVZXB, TB_X86_DWORD, &dst, &rm);
                 } else if (dst.type == VAL_GPR && dt == TB_X86_WORD) {
                     __(MOVZXW, TB_X86_DWORD, &dst, &rm);
+                } else if ((dst.type == VAL_XMM || rm.type == VAL_XMM) && dt < TB_X86_F32x1) {
+                    // PATCH(odin-tilde): mirror of the MODE_ST case above —
+                    // an integer-narrow mov whose endpoint is an XMM (lane
+                    // values kept in vector registers after SLP). Integer
+                    // MOVs cannot name XMM endpoints; move the raw bits via
+                    // the FP encodings for dword/qword, and for byte/word
+                    // bounce through a scratch GPR (zero-extended, same
+                    // upper-bits invariant as above).
+                    TB_X86_DataType fdt = (dt == TB_X86_QWORD) ? TB_X86_F64x1 : TB_X86_F32x1;
+                    if (dst.type == VAL_XMM && rm.type == VAL_XMM) {
+                        __(FP_MOV, fdt, &dst, &rm);
+                    } else if (dst.type == VAL_XMM) {
+                        if (dt == TB_X86_DWORD || dt == TB_X86_QWORD) {
+                            __(MOV_I2F, fdt, &dst, &rm);
+                        } else {
+                            GPR scratch = GPR_NONE;
+                            const GPR candidates[] = { RAX, RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
+                            FOR_N(i, 0, COUNTOF(candidates)) {
+                                if (rm.type != VAL_MEM || (candidates[i] != rm.reg && candidates[i] != rm.index)) { scratch = candidates[i]; break; }
+                            }
+                            TB_ASSERT(scratch != GPR_NONE);
+
+                            Val rm2 = rm;
+                            if (rm.type == VAL_MEM && rm2.reg == RSP) { rm2.imm += 8; } // the push below shifts RSP-relative slots
+                            if (scratch >= 8) { EMIT1(e, 0x41); }
+                            EMIT1(e, 0x50 + (scratch & 7)); // PUSH scratch
+                            if (dt == TB_X86_BYTE) {
+                                __(MOVZXB, TB_X86_DWORD, Vgpr(scratch), &rm2);
+                            } else {
+                                __(MOVZXW, TB_X86_DWORD, Vgpr(scratch), &rm2);
+                            }
+                            __(MOV_I2F, TB_X86_F32x1, &dst, Vgpr(scratch));
+                            if (scratch >= 8) { EMIT1(e, 0x41); }
+                            EMIT1(e, 0x58 + (scratch & 7)); // POP scratch
+                        }
+                    } else {
+                        // dst is GPR, source is XMM
+                        __(MOV_F2I, fdt, &dst, &rm);
+                    }
                 } else {
                     __(MOV, dt, &dst, &rm);
                 }

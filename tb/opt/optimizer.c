@@ -1542,7 +1542,25 @@ static int odin_rotate_idiom_pass(TB_Function* f, TB_Worklist* ws) {
 // upstream never produces, and tb_opt_locals promotion drives the Rogers RA
 // into a split loop (rounds < 2048 assert). This runs just the rotate-idiom
 // pass above — safe, local rewrites with a solid SHA-2 payoff.
+//
+// PATCH(odin-tilde, 2026-10-31, stage-1 vectorization experiment): env-gated
+// escape hatch TB_OPT_STAGE to re-test the full pipeline and reproduce the
+// two documented blockers on minimal cases:
+//   unset / "0" — peeps only (original behavior)
+//   "2"         — full tb_opt minus SLP (safe pipeline)
+//   "1"         — full tb_opt incl. SLP (reproduces the XMM lane-emitter
+//                 blocker on bytes.index_byte: SLP lane values reach scalar
+//                 integer movs/binops with BYTE/WORD dts)
 TB_API bool tb_opt_peeps_only(TB_Function* f, TB_Worklist* ws) {
+    static int stage = -1;
+    if (stage < 0) {
+        const char* s = getenv("TB_OPT_STAGE");
+        stage = s ? atoi(s) : 0;
+    }
+    if (stage >= 1) {
+        return tb_opt(f, ws, /*preserve_types:*/ true);
+    }
+
     if (f->super.tag != TB_SYMBOL_FUNCTION) {
         return false;
     }
@@ -1719,6 +1737,14 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             // 4. SLP vectorizer
             ////////////////////////////////
             // Run SLP on each loop (+ the main body)
+            // PATCH(odin-tilde): SLP is gated behind TB_OPT_STAGE=1 only —
+            // its lane values stay XMM-resident and reach scalar integer ops
+            // (x86_mov/binop with BYTE/WORD dts), which the x64 emitter
+            // cannot encode. Stage 2 = full pipeline minus SLP.
+            static int tb_opt_stage = -1;
+            if (tb_opt_stage < 0) { const char* s = getenv("TB_OPT_STAGE"); tb_opt_stage = s ? atoi(s) : 0; }
+            if (tb_opt_stage < 2)
+            {
             TB_OPTDEBUG(PASSES)(printf("    * Vectorize\n"));
             CUIK_TIMED_BLOCK("SLP") {
                 STATS_ENTER(SUPERWORD);
@@ -1741,6 +1767,7 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
                 STATS_EXIT(SUPERWORD);
             }
             TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "SLP"));
+            } // TB_OPT_STAGE < 2 (SLP gate)
             ////////////////////////////////
             // 5. Peepholes
             ////////////////////////////////
