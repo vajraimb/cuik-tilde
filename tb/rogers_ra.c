@@ -1496,6 +1496,31 @@ static void active_mask_clear(Rogers* ra, int class, int reg, int width) {
     ra->active_mask[class][reg / 64ull] &= ~(allot << (reg % 64ull));
 }
 
+// PATCH(odin-tilde): the incrementally maintained active_mask mirror can go
+// stale when a split pass kills a node that is currently active — the corpse
+// cleanup in choose_best_spill frees the active[] slot but used to leave the
+// mirror bit set. A stale bit blocks its register in every later ra_mask with
+// NO eviction candidate ever offered for it (the active[] slot is empty), so
+// once enough bits rot the class fails every allocation at the same program
+// point and the split loop spins forever (fmt@fmt_arg: all 16 GPR bits
+// blocked, only 7 real occupants, identical self-split every round).
+static void sweep_dead_actives(Ctx* restrict ctx, Rogers* restrict ra, int class) {
+    int num_regs = ctx->num_regs[class];
+    FOR_N(i, 0, num_regs) {
+        int g = ra->active[class][i];
+        if (g <= 0) { continue; }
+        if (g >= ra->order_cap || ra->gvn2node[g] == NULL) {
+            ra->active[class][i] = 0;
+            int pv = g < aarray_length(ctx->vreg_map) ? ctx->vreg_map[g] : 0;
+            int width = 1;
+            if (pv > 0 && ctx->vregs[pv].assigned >= 0) {
+                width = ctx->vregs[pv].reg_width;
+            }
+            active_mask_clear(ra, class, i, width);
+        }
+    }
+}
+
 static void mark_active(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
     VReg* vreg = &ctx->vregs[ctx->vreg_map[gvn]];
     if (vreg->class == REG_CLASS_STK) {
@@ -1551,6 +1576,9 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
     int useful_class = attempted_vreg->mask->class;
     int us = ctx->vreg_map[attempted_n->gvn];
     int fx_attempted = fixed_reg_mask(useful_mask);
+    // PATCH(odin-tilde): drop stale active slots up front so the scan below
+    // and the ra_mask mirror agree (see sweep_dead_actives).
+    sweep_dead_actives(ctx, ra, useful_class);
     FOR_N(i, 0, ctx->num_regs[useful_class]) {
         // TODO(NeGate): this is bit math & tests, we can speed this process up
         if (ra->active[useful_class][i] > 0 && bits64_member(ra->mask, i)) {
@@ -1563,6 +1591,9 @@ static SplitDecision choose_best_spill(Ctx* restrict ctx, Rogers* restrict ra, T
             // (crashed in gvn2node[best_gvn] compiling odinfmt/fmt).
             int active_gvn = ra->active[useful_class][i];
             if (ra->gvn2node[active_gvn] == NULL) {
+                int pv = active_gvn < aarray_length(ctx->vreg_map) ? ctx->vreg_map[active_gvn] : 0;
+                int width = (pv > 0) ? ctx->vregs[pv].reg_width : 1;
+                active_mask_clear(ra, useful_class, i, width);
                 ra->active[useful_class][i] = 0;
                 continue;
             }
@@ -1822,8 +1853,14 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
             int old = ra->active[vreg->class][vreg->assigned];
             // PATCH(odin-tilde): a stale occupant (killed by a later split
             // pass) proves nothing about the register — free the slot (see
-            // the matching guard in choose_best_spill).
+            // the matching guard in choose_best_spill). Also clear the
+            // active_mask mirror bit: leaving it set blocks the register
+            // for the rest of the round with no eviction candidate, which
+            // deadlocks the split loop (fmt@fmt_arg).
             if (old != 0 && ra->gvn2node[old] == NULL) {
+                int ov = old < aarray_length(ctx->vreg_map) ? ctx->vreg_map[old] : 0;
+                int width = (ov > 0) ? ctx->vregs[ov].reg_width : 1;
+                active_mask_clear(ra, vreg->class, vreg->assigned, width);
                 ra->active[vreg->class][vreg->assigned] = 0;
                 old = 0;
             }
@@ -1892,9 +1929,9 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
 
     // interfere live things
     dyn_array_clear(ra->potential_spills);
-    // PATCH(odin-tilde): OR the incrementally maintained occupied-bit
-    // mirror instead of scanning all num_regs active slots (the STK
-    // class scan was quadratic in the spill count on big functions).
+    // PATCH(odin-tilde): free stale active slots (and their mirror bits)
+    // before OR-ing the occupied-bit mirror into ra_mask.
+    sweep_dead_actives(ctx, ra, def_class);
     {
         uint64_t* am = ra->active_mask[def_class];
         FOR_N(j, 0, mask_word_count) { ra_mask[j] |= am[j]; }
