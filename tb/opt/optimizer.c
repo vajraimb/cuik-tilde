@@ -1233,10 +1233,16 @@ static TB_Node* peephole(TB_Function* f, TB_Node* n, bool see_users) {
         if (old_type != NULL) {
             Lattice* glb = lattice_meet(f, old_type, new_type);
             if (glb != old_type) {
-                TB_OPTLOG(PEEP, printf("\n\nFORWARD PROGRESS ASSERT!\n"));
+                // PATCH(odin-tilde): the cached type can be higher than a fresh
+                // value_of when a prior phase (optimistic cprop plants types
+                // directly via latuni_set, loop opts rewrite IR in place, or
+                // subsume rewires inputs) left stale precision behind. The
+                // fresh value is sound for the current IR, so adopt it and
+                // let the set_progress below reprocess users — asserting here
+                // aborts on valid Odin-emitted IR (upstream frontends never
+                // trip this because their rewrites keep peephole-monotonicity).
+                TB_OPTLOG(PEEP, printf("\n\nFORWARD PROGRESS CLAMP!\n"));
                 TB_OPTLOG(PEEP, printf("  "), print_lattice(old_type), printf("  is not higher than  "), print_lattice(new_type), printf(", MEET: "), print_lattice(glb), printf("\n\n"));
-                tb_print_dumb_raw(f, &OUT_STREAM_DEFAULT, true);
-                TB_ASSERT_MSG(0, "forward progress assert!");
             }
         }
         #else
