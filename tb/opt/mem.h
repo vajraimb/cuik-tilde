@@ -838,12 +838,16 @@ int tb_opt_locals(TB_Function* f) {
 
     bool needs_to_rewrite = false;
     CUIK_TIMED_BLOCK("sroa") {
-        // i think the SROA'd pieces can't themselves split more? that
-        // should something we check
+        // PATCH(odin-tilde): index-based iteration — tb_opt_sroa can split a
+        // local, appending fresh TB_LOCALs (new root users) and realloc'ing
+        // the users array, which leaves FOR_USERS' cached pointer iterator
+        // dangling (__udivmodti4's 128-bit temporaries at stage>=1).
         size_t snapshot = f->node_count;
-        FOR_USERS(u, f->root_node) {
-            if (USERN(u)->type == TB_LOCAL && USERN(u)->gvn < snapshot) {
-                if (tb_opt_sroa(f, USERN(u)) > 1) {
+        size_t root_users = f->root_node->user_count;
+        for (size_t ui = 0; ui < root_users && ui < f->root_node->user_count; ui++) {
+            TB_Node* un = USERN(&f->root_node->users[ui]);
+            if (un->type == TB_LOCAL && un->gvn < snapshot) {
+                if (tb_opt_sroa(f, un) > 1) {
                     needs_to_rewrite = true;
                 }
             }

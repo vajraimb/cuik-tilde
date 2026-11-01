@@ -482,7 +482,17 @@ static ArenaArray(TB_Node*) loop_clone_ztc(LoopOpt* ctx, TB_Worklist* ws, size_t
                 TB_Node* un = USERN(&old_phi->users[j]);
                 int ui = USERI(&old_phi->users[j]);
 
-                if (cloned[un->gvn] && un != old_phi) { // (un->inputs[ui]->type != TB_PHI || un->inputs[ui]->inputs[0] != header)) {
+                // PATCH(odin-tilde): the guard used to be `cloned[un->gvn]`
+                // ("un HAS a clone") but the intent is "un IS a ZTC clone".
+                // For single-block loops the backedge value (e.g. the
+                // induction ADD) lives in the header block, is therefore
+                // cloned, and passes the old guard — the rewire then pointed
+                // it at itself (phi's backedge input) or at the wrong value,
+                // creating a self-loop ADD that spun ideal_arith's
+                // reassociation forever (runtime@print_i64 at stage>=1).
+                // Real ZTC clones have gvn >= cloned_n (allocated during
+                // cloning, line "size_t cloned_n = f->node_count" above).
+                if (un->gvn >= cloned_n && un != old_phi) { // (un->inputs[ui]->type != TB_PHI || un->inputs[ui]->inputs[0] != header)) {
                     // &&  != old_phi) {
                     #if TB_OPTDEBUG_LOOP
                     printf("   USER(");

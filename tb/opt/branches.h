@@ -670,6 +670,19 @@ static TB_Node* ideal_if(TB_Function* f, TB_Node* n) {
                 }
 
                 if (match) {
+                    // PATCH(odin-tilde): the merge below kills pred_branch
+                    // assuming PROJ-only users. Odin's builder path can leave
+                    // a stale TB_SYMBOL_TABLE attached to the branch (its
+                    // region got subsumed into the IF upstream), and killing
+                    // that here trips the IS_PROJ assert (fmt@search_nul_
+                    // termination-0 at stage>=1). The fold is a pure
+                    // optimization — skip it when the assumption doesn't hold.
+                    bool only_projs = true;
+                    FOR_USERS(u, pred_branch) {
+                        if (!IS_PROJ(USERN(u))) { only_projs = false; break; }
+                    }
+                    if (!only_projs) { return NULL; }
+
                     // remove pred from shared edge
                     remove_input(f, shared_edge, shared_i);
                     FOR_USERS(u, shared_edge) {
@@ -685,7 +698,7 @@ static TB_Node* ideal_if(TB_Function* f, TB_Node* n) {
                     // remove first branch
                     while (pred_branch->user_count > 0) {
                         TB_Node* un = USERN(&pred_branch->users[pred_branch->user_count - 1]);
-                        assert(IS_PROJ(un));
+                        TB_ASSERT_MSG(IS_PROJ(un), "ideal_if: non-proj user of pred_branch in %s: un type=%d gvn=%u, pred_branch type=%d gvn=%u", f->super.name, un->type, un->gvn, pred_branch->type, pred_branch->gvn);
 
                         tb_kill_node(f, un);
                     }

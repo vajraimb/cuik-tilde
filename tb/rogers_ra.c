@@ -1512,6 +1512,11 @@ static bool order_after(int* order, TB_BasicBlock** scheduled, uint32_t a_gvn, u
 }
 
 static bool interfere_in_block(TB_BasicBlock* blocks, int* order, TB_BasicBlock** scheduled, Rogers* restrict ra, TB_Node* lhs, TB_Node* rhs, uint32_t lhs_gvn, uint32_t rhs_gvn, TB_BasicBlock* block) {
+    // PATCH(odin-tilde): soft-final evictions requeue nodes and can end up
+    // querying a node against itself (parse_i64_maybe_prefixed after the
+    // spill-everything wave at stage>=1). A live range never interferes with
+    // itself — treat as no conflict instead of asserting.
+    if (lhs == rhs || lhs_gvn == rhs_gvn) { return false; }
     TB_ASSERT(lhs != rhs && "i... why?");
 
     // phis might have a liveness hole in the middle

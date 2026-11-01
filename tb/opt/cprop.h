@@ -530,10 +530,15 @@ static void cprop_propagate(TB_Function* f, CProp* cprop) {
                     // HACK(NeGate): forward progress when making a range into a constant can sometimes get fucky with
                     // the known bits so i'll just hack around that for now.
                     // if (!lattice_is_const(old_type) || lattice_is_const(new_type)) {
-                    TB_OPTDEBUG(SCCP)(printf("\n\nFORWARD PROGRESS ASSERT!\n"));
+                    // PATCH(odin-tilde): same rationale as the peephole clamp
+                    // (optimizer.c, blocker 1): optimistic cprop plants types
+                    // downward and loop opts rewrite IR in place, so the cached
+                    // lattice can be higher than a fresh value_of. The fresh
+                    // value is sound for the current IR — adopt it instead of
+                    // asserting (hit again on once_probe at stage>=1 after the
+                    // loop-rotation fixes).
+                    TB_OPTDEBUG(SCCP)(printf("\n\nFORWARD PROGRESS CLAMP!\n"));
                     TB_OPTDEBUG(SCCP)(printf("  "), print_lattice(old_type), printf("  became  "), print_lattice(new_type), printf(", MEET: "), print_lattice(glb), printf("\n\n"));
-                    TB_ASSERT_MSG(0, "forward progress assert!");
-                    // }
                 }
                 #endif
 

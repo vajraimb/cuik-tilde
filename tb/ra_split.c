@@ -497,7 +497,14 @@ static uint64_t update_phi_edges(Ctx* ctx, Rogers* ra, RegSplitter* splitter, ui
                     // this value is single-def, there's no variants of it so no phis
                     size_t pos = 1;
                     bb_defs[k] = insert_reload(ctx, ra, splitter, &ctx->cfg.blocks[bb_id], defs, pred_defs, k, splitter->W_exit[bb_id], &pos);
-                } else {
+                } else if (pred_def != NULL) {
+                    // PATCH(odin-tilde): pred_def can be NULL here even though
+                    // the slot is live_out of the pred (defs[] has no entry
+                    // for it — same gap as the backedge/phi-edge cases
+                    // patched above, reached with rotated-loop CFGs at
+                    // stage>=1: __truncsfhf2). Converting a NULL def into a
+                    // phi edge would write NULL inputs and crash codegen;
+                    // keep the def gathered from the other preds instead.
                     // convert from single value to PHI
                     TB_Node* phi = phis[bb_id*num_spills + k];
                     if (phi == NULL) {
@@ -670,11 +677,21 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         TB_Node** arr = coalesce_set_array(ctx, ra, &splitter.leaders[spill_i], &cnt);
         FOR_N(j, 0, cnt) {
             TB_Node* n = arr[j];
+            // PATCH(odin-tilde): same unscheduled-fresh-node guard as the
+            // user scan below — f->scheduled is only valid below scheduled_n.
+            if (n->gvn >= f->scheduled_n || f->scheduled[n->gvn] == NULL) { continue; }
             int bb_id = f->scheduled[n->gvn] - ctx->cfg.blocks;
 
             def_map[bb_id] |= 1ull << spill_i;
             FOR_USERS(u, n) {
-                TB_BasicBlock* use_bb = f->scheduled[USERN(u)->gvn];
+                // PATCH(odin-tilde): batched insert_splits (64/round) can
+                // leave reload/spill users from an earlier batch that were
+                // never scheduled — their scheduled[] slot is out of bounds
+                // (strconv@format_digits at stage>=1). They carry no BB info
+                // yet; the split traversal below wires them up directly.
+                uint32_t ug = USERN(u)->gvn;
+                if (ug >= f->scheduled_n || f->scheduled[ug] == NULL) { continue; }
+                TB_BasicBlock* use_bb = f->scheduled[ug];
                 use_map[use_bb - ctx->cfg.blocks] |= 1ull << spill_i;
             }
         }
