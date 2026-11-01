@@ -1706,7 +1706,20 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                 continue;
             }
         }
-        if (old_vm != NULL && old_vm != &TB_REG_EMPTY &&
+        // PATCH(odin-tilde): for a proper-spill (immediate-store) def
+        // segment, skip the old-mask meet. The segment ends at the spill
+        // store inserted right after the def — no clobber can cross it —
+        // so the def may live in ANY register, including caller-saved
+        // ones. The old mask records the pre-split vreg's monotone
+        // clobber narrowing (e.g. live-across-call shrunk to the 6
+        // callee-saved regs, all of which can be permanently occupied by
+        // pinned argument values); meeting it in poisons every new def
+        // generation into an uncolorable mask and the split loop spins
+        // forever (fmt@fmt_arg: gvn 141 x86_mov, rounds to 8192+).
+        int spill_i0 = spill_map_get2(&splitter.spill_map, n);
+        bool immediate_store = spill_i0 >= 0 && ((was_spilled_before >> spill_i0) & 1);
+        if (!immediate_store &&
+            old_vm != NULL && old_vm != &TB_REG_EMPTY &&
             !reg_mask_is_stack(old_vm) && reg_mask_is_not_empty(old_vm)) {
             mask = tb__reg_mask_meet(ctx, mask, old_vm);
         }

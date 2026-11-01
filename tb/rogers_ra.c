@@ -101,6 +101,14 @@ typedef struct {
     // entries (the STK class scan was quadratic in the spill count).
     uint64_t* active_mask[MAX_REG_CLASSES];
     int active_mask_words;
+
+    // PATCH(odin-tilde): set while the post-wave final_check pass runs. The
+    // spill-everything wave can leave active[] entries whose nodes were
+    // re-split onto different vregs, so the strict handoff invariants in
+    // mark_active/unmark_active may transiently break; in this mode we evict
+    // instead of asserting (the pass either converges or reports !done and
+    // the driver's bail handler degrades the function to peeps-only).
+    bool soft_final;
 } Rogers;
 
 static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* splits, size_t num_spills);
@@ -955,6 +963,9 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
 
     int rounds = 0;
     size_t last_spills = 0;
+    // PATCH(odin-tilde): set by the final pessimistic spill wave; the next
+    // iteration re-runs the coloring pass and MUST accept its verdict.
+    bool final_check = false;
     cuikperf_region_start("main loop", NULL);
     for (;;) {
         TB_ArenaSavepoint sp = tb_arena_save(arena);
@@ -964,9 +975,13 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
         // PATCH(odin-tilde): the pinned-wrapper IR this port generates can
         // legitimately need a few hundred rounds on large functions (the
         // loop resolves about one conflict wave per round; e.g. Odin's
-        // reflect@write_type_writer needs 283). Keep the assert as an
-        // infinite-loop guard but with ample headroom.
-        TB_ASSERT(rounds < 2048);
+        // reflect@write_type_writer needs 283). Round 150 is the
+        // pessimistic-bail ceiling: the wave at exactly 512 spills
+        // everything spillable, iteration 513 re-colors and must either
+        // succeed or bail/ICE loudly below (never spin forever). 512 is
+        // ~1.8x the highest observed converging round count (283), so
+        // legitimately large functions still converge normally.
+        TB_ASSERT(rounds <= 513);
 
         // PATCH(odin-tilde): global zombie fixed-mask sweep. Splitting can
         // leave a vreg pinned to a single register after the use that
@@ -1082,7 +1097,47 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
         }
 
         cuikperf_region_start("round", NULL);
-        bool done = allocate_loop(ctx, &ra, arena);
+        bool done;
+        if (final_check) {
+            // PATCH(odin-tilde): last-chance coloring after the
+            // spill-everything wave. If even this pass reports conflicts
+            // the function is uncolorable for rogers (e.g. a coalesce web
+            // spanning a call while every callee-saved register is pinned
+            // by ABI argument values — fmt@fmt_arg). With a bail handler
+            // installed (the Odin driver) we longjmp out so the driver
+            // can re-emit the function with the peeps-only pipeline;
+            // otherwise ICE loudly with the residual decisions.
+            ra.soft_final = true;
+            done = allocate_loop(ctx, &ra, arena);
+            ra.soft_final = false;
+            if (!done && tb__ra_bail_active()) {
+                cuik_free(ra.uf);
+                cuik_free(ra.uf_size);
+                nl_table_free(ra.coalesce_set);
+                tb__ra_bail();
+            }
+            if (!done) {
+                fflush(stdout); // flush the final-pass trace before the ICE
+                FOR_N(i, 0, dyn_array_length(ra.splits)) {
+                    VReg* v = &ctx->vregs[ra.splits[i].target];
+                    TB_Node* n = v->n;
+                    fprintf(stderr, "[ra] residual conflict V%u", ra.splits[i].target);
+                    if (n) { fprintf(stderr, " gvn=%u %s", n->gvn, tb_node_get_name(n->type)); }
+                    if (v->mask == NULL) { fprintf(stderr, " mask=NULL"); }
+                    else if (v->mask == &TB_REG_EMPTY) { fprintf(stderr, " mask=EMPTY"); }
+                    else { fprintf(stderr, " cls=%d fixed=%d bits=%016llx", v->mask->class, fixed_reg_mask(v->mask), (unsigned long long)v->mask->mask[0]); }
+                    fprintf(stderr, " assigned=%d was_spilled=%d", v->assigned, v->was_spilled);
+                    if (ra.splits[i].clobber) { fprintf(stderr, " clobber"); }
+                    if (n && f->scheduled[n->gvn]) {
+                        fprintf(stderr, " bb=%td", f->scheduled[n->gvn] - ctx->cfg.blocks);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+            TB_ASSERT_MSG(done, "rogers: spill-everything wave still has conflicts (uncolorable def point in %s)", f->super.name);
+        } else {
+            done = allocate_loop(ctx, &ra, arena);
+        }
         // rogers_dump_sched(ctx, f->node_count);
         cuikperf_region_end();
 
@@ -1220,6 +1275,50 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
 
             printf("AAA %-3d %zu (\x1b[%dm%+d\x1b[0m), %u\n", rounds, num_spills, dt < 0 ? 32 : 31, dt, aarray_length(ctx->vregs));
             last_spills = num_spills;
+        }
+
+        // PATCH(odin-tilde): pessimistic convergence bail. Some optimized
+        // functions hit a family of split-loop deadlocks (pinned argument
+        // registers vs clobber-narrowed defs, pinned phis vs pinned
+        // sleepers, ...) where conflict waves are re-created as fast as
+        // they're resolved and the round count climbs forever (verified:
+        // repeating this wave every 128 rounds past 8064 never converges).
+        // At the ceiling, discard this round's decisions and split EVERY
+        // non-pinned register vreg in one wave, with was_spilled pre-set
+        // so the splitter takes the immediate-store proper-spill path
+        // everywhere. Register pressure then collapses to pinned values
+        // plus single-point defs; the next round re-colors once and must
+        // succeed (see final_check above).
+        if (rounds == 512) {
+            dyn_array_clear(ra.splits);
+            size_t n_picked = 0;
+            FOR_N(i, 1, aarray_length(ctx->vregs)) {
+                VReg* v = &ctx->vregs[i];
+                if (v->mask == NULL) { continue; }
+                if (v->mask == &TB_REG_EMPTY) {
+                    // "must spill" signal: must go THROUGH the splitter
+                    // (see the filter loop below), so queue it even though
+                    // it has no usable mask.
+                    dyn_array_put(ra.splits, ((SplitDecision){ .target = (uint32_t)i }));
+                    n_picked++;
+                    continue;
+                }
+                if (reg_mask_is_stack(v->mask)) { continue; }
+                if (ctx->mayspill_mask[v->mask->class] == NULL) { continue; }
+                if (fixed_reg_mask(v->mask) >= 0) { continue; }
+                TB_Node* vn = v->n;
+                if (vn == NULL || vn->type == TB_NULL) { continue; }
+                if ((size_t)vn->gvn >= aarray_length(ctx->vreg_map)) { continue; }
+                if ((size_t)vn->gvn >= ra.uf_len) { continue; }
+                if (uf_find(ra.uf, ra.uf_len, vn->gvn) != vn->gvn) { continue; }
+                if (f->scheduled[vn->gvn] == NULL) { continue; }
+                if (v->was_spilled < 1) { v->was_spilled = 1; }
+                dyn_array_put(ra.splits, ((SplitDecision){ .target = (uint32_t)i }));
+                n_picked++;
+            }
+            fprintf(stderr, "[ra] rogers: %s hit round ceiling, spill-everything wave picked %zu vregs\n",
+                f->super.name, n_picked);
+            final_check = true;
         }
 
         // alloc failures on may_spill vregs will just drop to stack
@@ -1534,7 +1633,15 @@ static void mark_active(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
     // we need to move that node to future active
     int old = ra->active[vreg->class][vreg->assigned];
     if (old != 0 && old != gvn) {
-        TB_ASSERT(ctx->vreg_map[old] == ctx->vreg_map[gvn]);
+        if (ra->soft_final && ctx->vreg_map[old] != ctx->vreg_map[gvn]) {
+            // PATCH(odin-tilde): stale occupant from before the wave (its
+            // node was re-split onto another vreg). Evict it so the final
+            // pass can re-color; stock's put_to_sleep remedy (see below)
+            // is exactly the right tool here.
+            put_to_sleep(ra, vreg->class, old);
+        } else {
+            TB_ASSERT(ctx->vreg_map[old] == ctx->vreg_map[gvn]);
+        }
         // printf("WARNING!!! %%%u %%%u\n", old, gvn);
         // put_to_sleep(ra, vreg->class, old);
     }
@@ -1553,6 +1660,11 @@ static void unmark_active(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
     TB_ASSERT(ctx->vreg_map[gvn]);
     VReg* other = &ctx->vregs[ctx->vreg_map[gvn]];
     TB_ASSERT(other->assigned >= 0);
+    if (ra->soft_final && ra->active[other->class][other->assigned] != gvn) {
+        // PATCH(odin-tilde): slot already evicted/reused during the soft
+        // final pass — nothing to unmark, avoid the stale assert.
+        return;
+    }
     TB_ASSERT(ra->active[other->class][other->assigned] == gvn);
     ra->active[other->class][other->assigned] = 0;
     active_mask_clear(ra, other->class, other->assigned, other->reg_width);

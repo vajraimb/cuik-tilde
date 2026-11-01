@@ -1563,7 +1563,11 @@ TB_API bool tb_opt_peeps_only(TB_Function* f, TB_Worklist* ws) {
         const char* s = getenv("TB_OPT_STAGE");
         stage = s ? atoi(s) : 0;
     }
-    if (stage >= 1) {
+    // PATCH(odin-tilde): per-function override (driver's degraded recompile
+    // after an RA bail); -1 falls back to the env gate.
+    extern __thread int tb__opt_stage_override;
+    int eff_stage = tb__opt_stage_override >= 0 ? tb__opt_stage_override : stage;
+    if (eff_stage >= 1) {
         return tb_opt(f, ws, /*preserve_types:*/ true);
     }
 

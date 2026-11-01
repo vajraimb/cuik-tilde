@@ -2,6 +2,22 @@
 #include "tb_internal.h"
 #include "host.h"
 #include <hashes.h>
+#include <setjmp.h>
+
+// PATCH(odin-tilde): per-thread RA bail channel. The Odin tilde driver
+// installs a jmp_buf around tb_codegen; when the Rogers RA hits its
+// pessimistic-bail ceiling instead of ICE-ing it longjmps back so the
+// driver can re-emit the function with the peeps-only pipeline.
+static __thread jmp_buf* tb__ra_bail_jb;
+void tb__ra_bail_push(void* jb)  { tb__ra_bail_jb = (jmp_buf*) jb; }
+void tb__ra_bail_pop(void)       { tb__ra_bail_jb = NULL; }
+bool tb__ra_bail_active(void)    { return tb__ra_bail_jb != NULL; }
+_Noreturn void tb__ra_bail(void) { longjmp(*tb__ra_bail_jb, 1); }
+
+// PATCH(odin-tilde): per-thread optimization stage override for the
+// driver's per-function degraded recompile (-1 = use TB_OPT_STAGE env).
+static __thread int tb__opt_stage_override = -1;
+void tb__set_opt_stage_override(int stage) { tb__opt_stage_override = stage; }
 
 // NOTE(odin-tilde): always define the globals (see tb_internal.h note) —
 // the Odin tilde backend links against them even in release builds.
@@ -449,8 +465,63 @@ void tb_function_set_attrs(TB_Function* f, TB_FunctionAttribs attrs) {
     f->attrs = attrs;
 }
 
+static void function_init_ir(TB_Function* f, TB_ModuleSectionHandle section, TB_FunctionPrototype* p);
+
 void tb_function_set_prototype(TB_Function* f, TB_ModuleSectionHandle section, TB_FunctionPrototype* p) {
     TB_ASSERT(f->prototype == NULL);
+    function_init_ir(f, section, p);
+}
+
+// PATCH(odin-tilde): reset a function's IR to an empty state so the
+// driver can re-emit the body after a register-allocation bail. The
+// symbol — and with it every external reference (call sites, call
+// patches, module maps) — stays valid; only the IR and per-pass state
+// are discarded. The next tb_builder_enter re-applies the prototype and
+// re-initializes the IR skeleton (tb_function_set_prototype asserts
+// prototype == NULL, so we clear it here).
+void tb_function_reset_ir(TB_Function* f) {
+    TB_ASSERT(f->prototype != NULL);
+
+    nl_hashset_free(f->gvn_nodes);
+    tb_arena_destroy(&f->arena);
+    tb_arena_destroy(&f->tmp_arena);
+
+    // optimizer/codegen pass state (mirrors a fresh TB_Function)
+    f->worklist    = NULL;
+    f->type_cap    = 0;
+    f->types       = NULL;
+    f->gcf_nodes   = NULL;
+    f->scheduled_n = 0;
+    f->scheduled   = NULL;
+    f->latency     = NULL;
+    f->doms_n      = 0;
+    f->doms        = NULL;
+    f->ipsccp_args = NULL;
+    f->ipsccp_ret  = NULL;
+    f->cprop       = NULL;
+    atomic_store(&f->ipsccp_escape, false);
+    atomic_store(&f->ipsccp_status, 0);
+    memset(&f->ipo_lock, 0, sizeof(f->ipo_lock));
+    #if TB_OPTDEBUG_SERVER
+    f->dbg_server_t = 0;
+    #endif
+    #ifndef NDEBUG
+    f->enable_log = false;
+    #endif
+
+    f->prototype   = NULL;
+    f->param_count = 0;
+    f->params      = NULL;
+    f->node_count  = 0;
+    f->root_node   = NULL;
+    f->dead_node_bytes = 0;
+    f->output = NULL;
+    // NOTE: section/features/attrs/dbg_type/anon_global_count are kept;
+    // anon_global_count stays monotonic so anon globals created by the
+    // failed emission keep their unique names.
+}
+
+static void function_init_ir(TB_Function* f, TB_ModuleSectionHandle section, TB_FunctionPrototype* p) {
     size_t param_count = p->param_count;
 
     f->gvn_nodes = nl_hashset_alloc(32);

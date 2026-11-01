@@ -251,6 +251,13 @@ static void known_bits_add(uint64_t a_zeros, uint64_t a_ones, uint64_t b_zeros, 
 }
 
 static Lattice* value_arith_raw(TB_Function* f, TB_NodeTypeEnum type, TB_DataType dt, Lattice* a, Lattice* b, bool congruent, bool at_top) {
+    // PATCH(odin-tilde): the Odin backend feeds pointer values directly into
+    // integer-typed arith (ptr/int punning via transmute), so an operand's
+    // lattice can be ptr-family while the op's dt is an int type. Model any
+    // ptr lattice as the full int range for this op — upstream never emits
+    // this shape (asserts in fmt@fmt_write_array at stage>=1).
+    if (a->tag >= LATTICE_ALLPTR && a->tag <= LATTICE_PTRCON) { a = lattice_from_dt(f, dt); }
+    if (b->tag >= LATTICE_ALLPTR && b->tag <= LATTICE_PTRCON) { b = lattice_from_dt(f, dt); }
     int bits = tb_data_type_bit_size(NULL, dt.type);
     int64_t mask = tb__mask(bits);
     int64_t imin = lattice_int_min(bits);
@@ -258,7 +265,7 @@ static Lattice* value_arith_raw(TB_Function* f, TB_NodeTypeEnum type, TB_DataTyp
     int64_t amin = a->_int.min, amax = a->_int.max;
     int64_t bmin = b->_int.min, bmax = b->_int.max;
 
-    TB_ASSERT(a->tag == LATTICE_INT && b->tag == LATTICE_INT);
+    TB_ASSERT_MSG(a->tag == LATTICE_INT && b->tag == LATTICE_INT, "value_arith on non-int lattice (a=%d b=%d) in %s", a->tag, b->tag, f->super.name);
     bool overflow = false;
     int64_t min, max;
     switch (type) {
