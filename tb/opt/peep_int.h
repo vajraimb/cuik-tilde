@@ -889,6 +889,18 @@ static TB_Node* ideal_int_div(TB_Function* f, TB_Node* n) {
         }
     }
 
+    // PATCH(odin-tilde): the Granlund-Montgomery magic-number reconstruction
+    // below is unreliable in this restoration: signed x/6 compiled to
+    // smulhi(x, 0xAAAAAAAAAAAAAAAB)+sar with a stale `add` flag, and
+    // signed/unsigned narrow-width magics mis-folded through value_trunc
+    // (see the peep_int.h value_trunc span guard) into constant 0 or
+    // garbage — tank@action_move's `int(a)/6` returned 0 for every input,
+    // and tests/float_select_probe/iso shows x/6, x/100, x/1000 wrong for
+    // both signs. Conservatively keep the real DIV node (isel emits an
+    // actual divide). Re-enable only behind a full-range verification
+    // harness (all widths, both signs, every interesting divisor).
+    return NULL;
+
     bool neg = false;
     if (is_signed) {
         if (y >> 63ull) {
@@ -1203,6 +1215,19 @@ static Lattice* value_trunc(TB_Function* f, TB_Node* n) {
     if (TB_IS_INTEGER_TYPE(n->dt)) {
         int bits = tb_data_type_bit_size(NULL, n->dt.type);
         uint64_t mask = tb__mask(bits);
+
+        // PATCH(odin-tilde): the masked-endpoint range is only sound when the
+        // source range spans less than the modulus — otherwise intermediate
+        // values cover every residue and the endpoints can both mask to 0
+        // (e.g. [-2^61, 2^61] & 0xFF = [0,0]) while mid-range values truncate
+        // to nonzero. tank@action_move folded a/6 to constant 0 this way.
+        uint64_t span = (uint64_t)a->_int.max - (uint64_t)a->_int.min;
+        if (span >= mask) {
+            uint64_t zeros = a->_int.known_zeros & mask;
+            uint64_t ones  = a->_int.known_ones  & mask;
+            return lattice_gimme_int2(f, lattice_int_min(bits), lattice_int_max(bits), zeros, ones, bits);
+        }
+
         int64_t  min = tb_sign_ext(NULL, n->dt, a->_int.min & mask);
         int64_t  max = tb_sign_ext(NULL, n->dt, a->_int.max & mask);
         if (min > max) {

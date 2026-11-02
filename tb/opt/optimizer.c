@@ -1695,6 +1695,12 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
     int dirty = ALL_DIRTY;
     do {
         rounds++;
+        // TEMP DIAG: TB_OPT_DUMP_IR0=<substr> dumps the raw IR before any
+        // optimization round (TB_OPT_DUMP_IR's earliest gate runs after peeps).
+        // Also enables f->enable_log so TB_OPTLOG(PEEP) traces this proc.
+        { static const char* tb_dump_ir0 = (const char*)-1;
+          if (tb_dump_ir0 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR0"); tb_dump_ir0 = s; }
+          if (tb_dump_ir0 && f->super.name && strstr(f->super.name, tb_dump_ir0)) { f->enable_log = true; printf("=== INITIAL (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
         TB_OPTDEBUG(PASSES)(printf("  * ROUND %d:\n", rounds));
         TB_OPTDEBUG(PASSES)(printf("    * Minor rewrites\n"));
 
@@ -1711,6 +1717,10 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             }
             STATS_EXIT(PEEPHOLES);
             TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "Peepholes"));
+            // TEMP DIAG: TB_OPT_DUMP_IR1=<substr> dumps after each peeps drain
+            { static const char* tb_dump_ir1 = (const char*)-1;
+              if (tb_dump_ir1 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR1"); tb_dump_ir1 = s; }
+              if (tb_dump_ir1 && f->super.name && strstr(f->super.name, tb_dump_ir1)) { printf("=== AFTER PEEPS (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
 
             #if TB_OPTDEBUG_STATS
             if (f->stats.solver_n > 0) {
