@@ -16,32 +16,6 @@ static void node_add_tmps(Ctx* restrict ctx, TB_Node* n);
 static MatchRule match_rules[];
 static MatchRuleID node_isel_raw(Ctx* ctx, TB_Function* f, Set* shared, TB_Node* n, int depth);
 
-// TEMP DIAG: segfault backtrace during codegen
-#include <signal.h>
-#include <unistd.h>
-static void segv_diag_handler(int sig) {
-    static const char msg[] = "SEGV_DIAG\n";
-    write(2, msg, sizeof(msg) - 1);
-    void* bt[32];
-    int bn = backtrace(bt, 32);
-    backtrace_symbols_fd(bt, bn, 2);
-    _exit(1);
-}
-__attribute__((constructor))
-static void segv_diag_install(void) {
-    // run the handler on an alternate signal stack so it still works when
-    // the fault is a stack overflow (e.g. runaway recursion in a graph walk)
-    static char altstack[256 * 1024];
-    stack_t ss = { .ss_sp = altstack, .ss_size = sizeof(altstack) };
-    sigaltstack(&ss, NULL);
-    struct sigaction sa = {
-        .sa_handler = segv_diag_handler,
-        .sa_flags = SA_ONSTACK,
-    };
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
-}
-
 // Machine-level peepholes happen once we're emitting ops, you can prune or edit the graph while
 // that's going on, if this function returns true we skip the node we're on.
 static bool node_peephole(Ctx* restrict ctx, TB_Node* n, TB_BasicBlock* bb, int i);

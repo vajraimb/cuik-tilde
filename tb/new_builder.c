@@ -1,5 +1,4 @@
 typedef TB_Node* (*PeepFn)(TB_Function* f, TB_Node* n);
-#include <execinfo.h> // TEMP DIAG
 
 struct TB_GraphBuilder {
     TB_Function* f;
@@ -35,24 +34,6 @@ static uint64_t tb_sign_ext(TB_Module* m, TB_DataType dt, uint64_t imm) {
 
 TB_Node* tb_alloc_node_dyn(TB_Function* f, int type, TB_DataType dt, int input_count, int input_cap, size_t extra) {
     assert(input_count < UINT16_MAX && "too many inputs!");
-    // TEMP DIAG
-    if (type == TB_ZERO_EXT) {
-        static int zdiag_done = 0;
-        if (zdiag_done < 3) {
-            zdiag_done++;
-            fprintf(stderr, "[zext-any] f=%s dt=%d gvn=%u\n", f->super.name, dt.type, f->node_count);
-        }
-    }
-    if ((type == TB_ZERO_EXT || type == TB_SIGN_EXT) && dt.type == TB_TAG_BOOL) {
-        static int zdiag_done = 0;
-        if (zdiag_done < 5) {
-            zdiag_done++;
-            fprintf(stderr, "[ext-bool-created] f=%s type=%d gvn=%u nins=%d\n", f->super.name, type, f->node_count, input_count);
-            void* bt[16];
-            int bn = backtrace(bt, 16);
-            backtrace_symbols_fd(bt, bn, 2);
-        }
-    }
     TB_Node* n = tb_arena_alloc(&f->arena, sizeof(TB_Node) + extra);
 
     n->type = type;

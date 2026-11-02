@@ -431,18 +431,6 @@ static void rogers_dump_sched(Ctx* restrict ctx, int old_node_count) {
             printf("  ");
             // tb_print_dumb_node(NULL, bb->items[i]);
             ctx->print_pretty(ctx, bb->items[i]);
-            // TEMP DIAG: print the node's constraint-pinned register
-            { TB_Node* dn = bb->items[i];
-              if (dn->type == TB_PROJ || dn->type == TB_MACH_PROJ) {
-                  RegMask* cm = ctx->constraint(ctx, dn, NULL);
-                  int cfx = cm ? fixed_reg_mask(cm) : -99;
-                  int vid = dn->gvn < aarray_length(ctx->vreg_map) ? ctx->vreg_map[dn->gvn] : 0;
-                  int vmfx = (vid > 0 && (size_t)vid < aarray_length(ctx->vregs) && ctx->vregs[vid].mask)
-                      ? fixed_reg_mask(ctx->vregs[vid].mask) : -99;
-                  printf("  # proj-idx=%d cfix=%d vreg=%d vfix=%d",
-                      TB_NODE_GET_EXTRA_T(dn, TB_NodeProj)->index, cfx, vid, vmfx);
-              }
-            }
             if (bb->items[i]->gvn >= old_node_count) {
                 printf("  #  NEW!!!");
             }
@@ -1165,18 +1153,6 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                     }
                 }
                 if (!needed) {
-                    // TEMP DIAG: TB_OPT_RA_LOGPIN=1 logs fixed-pin relaxations
-                    { static int rl = -1;
-                      if (rl < 0) { const char* s = getenv("TB_OPT_RA_LOGPIN"); rl = s ? atoi(s) : 0; }
-                      if (rl && v->n) {
-                          RegMask* cm = ctx->constraint(ctx, v->n, NULL);
-                          fprintf(stderr, "[ra-relax] %s V%d gvn=%u %s leader_fixed=%d constraint_fixed=%d members=%s\n",
-                              f->super.name ? f->super.name : "?", (int)vi, v->n->gvn,
-                              tb_node_get_name(v->n->type), fx,
-                              cm ? fixed_reg_mask(cm) : -99,
-                              sweep_members[vi] ? "yes" : "NULL");
-                      }
-                    }
                     bool is_copy = v->n->type == TB_MACH_COPY;
                     if (is_copy) {
                         TB_NodeMachCopy* mc = TB_NODE_GET_EXTRA(v->n);
@@ -1236,7 +1212,7 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                     if (n && f->scheduled[n->gvn]) {
                         fprintf(stderr, " bb=%td", f->scheduled[n->gvn] - ctx->cfg.blocks);
                     }
-                    // TEMP DIAG: dump mach_copy endpoints and input chain
+                    // failure-path diagnostic: dump mach_copy endpoints and input chain
                     if (n && n->type == TB_MACH_COPY) {
                         TB_NodeMachCopy* mc = TB_NODE_GET_EXTRA(n);
                         fprintf(stderr, "\n[ra]   copy def: ");
@@ -1491,12 +1467,6 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
             }
             if (v->mask->may_spill) {
                 TB_OPTDEBUG(REGALLOC)(printf("  * V%u is now a proper spill\n", split.target));
-
-                // TEMP DIAG
-                if (getenv("TB_OPT_RA_LOGPIN")) {
-                    fprintf(stderr, "[proper-spill] vreg=%u node gvn=%u type=%d\n",
-                        split.target, v->n->gvn, v->n->type);
-                }
 
                 v->spill_cost = INFINITY;
                 v->mask = intern_regmask(ctx, REG_CLASS_STK, true, 0);
@@ -2410,14 +2380,6 @@ static void compute_ordinals(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* a
         int timeline = 1;
         for (size_t j = 0; j < aarray_length(bb->items); j++) {
             TB_Node* n = bb->items[j];
-
-            // TEMP DIAG
-            if (n->gvn == 223 && n->type == TB_ZERO_EXT && n->dt.type == TB_TAG_BOOL) {
-                fprintf(stderr, "[sched-223] f=%s users=%d in1(type=%d,dt=%d)\n",
-                    ctx->f->super.name, n->user_count,
-                    n->input_count > 1 && n->inputs[1] ? n->inputs[1]->type : -1,
-                    n->input_count > 1 && n->inputs[1] ? n->inputs[1]->dt.type : -1);
-            }
 
             ra->gvn2node[n->gvn] = n;
             ra->order[n->gvn] = timeline++;

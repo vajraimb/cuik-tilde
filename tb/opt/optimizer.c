@@ -605,7 +605,7 @@ static Lattice* value_select(TB_Function* f, TB_Node* n) {
 
 // Returns NULL or a modified node (could be the same node, we can stitch it back into place)
 static TB_Node* idealize(TB_Function* f, TB_Node* n) {
-    // TEMP DIAG: TB_OPT_SKIP_IDEAL="<comma-separated node type numbers>" disables
+    // diagnostic: TB_OPT_SKIP_IDEAL="<comma-separated node type numbers>" disables
     // idealize for those node classes (bitmask over TB_NodeTypeEnum).
     static uint64_t tb_skip_ideal_lo = 0, tb_skip_ideal_hi = 0;
     static int tb_skip_ideal_inited = 0;
@@ -835,18 +835,6 @@ static void remove_user(TB_Function* f, TB_Node* n, int slot) {
 }
 
 void set_input(TB_Function* f, TB_Node* n, TB_Node* in, int slot) {
-    // TEMP DIAG: TB_OPT_LOG_OPT=2 logs IF conditions rewired to constants
-    { static int logi = -1;
-      if (logi < 0) { const char* s = getenv("TB_OPT_LOG_OPT"); logi = s ? atoi(s) : 0; }
-      if (logi >= 2 && n->type == TB_IF && slot == 1 && in && in->type == TB_ICONST &&
-          n->inputs[1] && n->inputs[1]->type != TB_ICONST) {
-          fprintf(stderr, "[if-const] %s: if gvn=%u cond load/gvn=%u -> iconst %llu\n",
-              f->super.name ? f->super.name : "?", n->gvn,
-              n->inputs[1]->gvn,
-              (unsigned long long) TB_NODE_GET_EXTRA_T(in, TB_NodeInt)->value);
-      }
-    }
-
     // try to recycle the user
     TB_ASSERT(slot < n->input_count);
     remove_user(f, n, slot);
@@ -937,21 +925,6 @@ void subsume_node_without_phis(TB_Function* f, TB_Node* n, TB_Node* new_n) {
 }
 
 void subsume_node2(TB_Function* f, TB_Node* n, TB_Node* new_n) {
-    // TEMP DIAG: TB_OPT_LOG_CONST=1 logs LOAD subsumed by a constant (any caller)
-    { static int logc = -1;
-      if (logc < 0) { const char* s = getenv("TB_OPT_LOG_CONST"); logc = s ? atoi(s) : 0; }
-      if (logc && n->type == TB_LOAD && new_n->type == TB_ICONST) {
-          unsigned long long cv = (unsigned long long) TB_NODE_GET_EXTRA_T(new_n, TB_NodeInt)->value;
-          fprintf(stderr, "[subsum] %s: LOAD gvn=%u -> iconst %llu (new_n gvn=%u)\n",
-              f->super.name ? f->super.name : "?", n->gvn, cv, new_n->gvn);
-          if (logc >= 3 && cv != 0 && f->super.name && strstr(f->super.name, getenv("TB_OPT_TRAP_NAME") ? getenv("TB_OPT_TRAP_NAME") : "$")) {
-              fflush(stderr);
-              { void* bt[16]; int bn = backtrace(bt, 16); backtrace_symbols_fd(bt, bn, 2); }
-              abort();
-          }
-      }
-    }
-
     TB_ASSERT(new_n != n);
     node_ensure_users_cap(f, new_n, n->user_count);
 
@@ -1352,29 +1325,6 @@ static TB_Node* peephole(TB_Function* f, TB_Node* n, bool see_users) {
         }
     }
 
-    // TEMP DIAG: TB_OPT_LOG_CONST=2 logs any LOAD whose value_of is a constant int
-    { static int logc = -1;
-      if (logc < 0) { const char* s = getenv("TB_OPT_LOG_CONST"); logc = s ? atoi(s) : 0; }
-      if (logc >= 2 && n->type == TB_LOAD) {
-          Lattice* lt = latuni_get_raw(f, n);
-          if (lt && lt->tag == LATTICE_INT && lt->_int.min == lt->_int.max) {
-              fprintf(stderr, "[load-const] %s: load gvn=%u lattice={%lld}\n",
-                  f->super.name ? f->super.name : "?", n->gvn, (long long) lt->_int.min);
-          }
-      }
-    }
-
-    // TEMP DIAG: TB_OPT_LOG_CONST=1 logs LOAD->constant folds (value_of misreads)
-    { static int logc = -1;
-      if (logc < 0) { logc = getenv("TB_OPT_LOG_CONST") != NULL; }
-      if (logc && n->type == TB_ICONST && old_n_type == TB_LOAD) {
-          Lattice* lt = latuni_get_raw(f, n);
-          fprintf(stderr, "[const-fold] %s: LOAD -> iconst %llu (gvn %u)\n",
-              f->super.name ? f->super.name : "?",
-              (unsigned long long) TB_NODE_GET_EXTRA_T(n, TB_NodeInt)->value, n->gvn);
-          (void) lt;
-      }
-    }
     old_n_type = n->type;
     k = identity(f, n);
     if (n != k) {
@@ -1674,12 +1624,6 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
         tb_arena_create(&f->tmp_arena, "Tmp");
     }
 
-    // TEMP DIAG: TB_OPT_LOG_OPT=1 logs tb_opt entries
-    { static int logo = -1;
-      if (logo < 0) { logo = getenv("TB_OPT_LOG_OPT") != NULL; }
-      if (logo) fprintf(stderr, "[tb_opt] %s preserve=%d had_types=%d\n",
-          f->super.name ? f->super.name : "?", preserve_types ? 1 : 0, f->types != NULL); }
-
     /* if (0 && strcmp(f->super.name, "foo") == 0) {
         f->enable_log = true;
     } */
@@ -1748,13 +1692,6 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
     int k;
     int rounds = 0;
 
-    // TEMP-DIAG(stage2 miscompile bisect): TB_OPT_BISECT=N stops tb_opt
-    // after phase N (1=minor peeps+locals, 2=+compact, 3=+loop rotate,
-    // 4=+loop peeps/strength-reduce, 5=locals skipped, 6=peeps skipped,
-    // unset=full).
-    static int tb_opt_bisect = -2;
-    if (tb_opt_bisect == -2) { const char* s = getenv("TB_OPT_BISECT"); tb_opt_bisect = s ? atoi(s) : -1; }
-
     int dirty = ALL_DIRTY;
     do {
         rounds++;
@@ -1766,14 +1703,9 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
         while (worklist_count(f->worklist) > 0) {
             TB_OPTDEBUG(PASSES)(printf("      * Peeps (%d nodes)\n", worklist_count(f->worklist)));
 
-            // TEMP DIAG: TB_OPT_DUMP_IR=<substr> also dumps at top of each minor round
-            { static const char* tb_dump_ir3 = (const char*)-1;
-              if (tb_dump_ir3 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir3 = s; }
-              if (tb_dump_ir3 && f->super.name && strstr(f->super.name, tb_dump_ir3)) { printf("=== TOP OF ROUND %d ===\n", rounds); tb_print(f); fflush(stdout); } }
-
             // combined pessimistic solver
             STATS_ENTER(PEEPHOLES);
-            if (tb_opt_bisect != 6 && (k = tb_opt_peeps(f), k > 0)) {
+            if ((k = tb_opt_peeps(f), k > 0)) {
                 TB_OPTDEBUG(PASSES)(printf("        * Rewrote %d times\n", k));
                 dirty |= ALL_DIRTY;
             }
@@ -1791,12 +1723,12 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             // work when it returns true.
             TB_OPTDEBUG(PASSES)(printf("      * Locals\n"));
             TB_OPTLOG(PEEP, printf("=== LOCALS ===\n"));
-            // TEMP DIAG: TB_OPT_DUMP_IR also dumps right before locals (after peeps)
+            // diagnostic: TB_OPT_DUMP_IR also dumps right before locals (after peeps)
             { static const char* tb_dump_ir4 = (const char*)-1;
               if (tb_dump_ir4 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir4 = s; }
               if (tb_dump_ir4 && f->super.name && strstr(f->super.name, tb_dump_ir4)) { printf("=== BEFORE LOCALS (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
             STATS_ENTER(MEMORY);
-            if (tb_opt_bisect != 5 && (k = tb_opt_locals(f), k > 0)) {
+            if ((k = tb_opt_locals(f), k > 0)) {
                 TB_OPTDEBUG(PASSES)(printf("        * Folded %d locals into SSA\n", k));
                 dirty |= ALL_DIRTY;
             }
@@ -1804,57 +1736,17 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
 
             TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "Memory"));
 
-            // TEMP DIAG: TB_OPT_DUMP_IR=<substr> also dumps right after locals
+            // diagnostic: TB_OPT_DUMP_IR=<substr> also dumps right after locals
             { static const char* tb_dump_ir2 = (const char*)-1;
               if (tb_dump_ir2 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir2 = s; }
               if (tb_dump_ir2 && f->super.name && strstr(f->super.name, tb_dump_ir2)) { printf("=== AFTER LOCALS (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
-
-            // TEMP DIAG: TB_VERIFY_USERS=1 checks use-list consistency (both directions)
-            { static int tb_verify_users = -1;
-              if (tb_verify_users < 0) { const char* s = getenv("TB_VERIFY_USERS"); tb_verify_users = s ? atoi(s) : 0; }
-              if (tb_verify_users) {
-                  TB_ArenaSavepoint vsp = tb_arena_save(&f->tmp_arena);
-                  TB_Worklist vws = { 0 };
-                  worklist_alloc(&vws, f->node_count);
-                  worklist_push(&vws, f->root_node);
-                  for (size_t i = 0; i < dyn_array_length(vws.items); i++) {
-                      TB_Node* n = vws.items[i];
-                      FOR_USERS(u, n) { worklist_push(&vws, USERN(u)); }
-                  }
-                  int missing = 0, stale = 0;
-                  for (size_t i = 0; i < dyn_array_length(vws.items); i++) {
-                      TB_Node* n = vws.items[i];
-                      // forward: every input must list n as a user
-                      FOR_N(j, 0, n->input_count) if (n->inputs[j]) {
-                          bool found = false;
-                          FOR_USERS(u, n->inputs[j]) {
-                              if (USERN(u) == n && USERI(u) == j) { found = true; break; }
-                          }
-                          if (!found) { printf("[VERIFY] MISSING user entry: %%%u (type %d) input[%zu] -> %%%u\n", n->gvn, n->type, j, n->inputs[j]->gvn); missing++; }
-                      }
-                      // backward: every listed user must actually reference n
-                      FOR_USERS(u, n) {
-                          TB_Node* un = USERN(u); int ui = USERI(u);
-                          if (ui < 0 || (size_t)ui >= un->input_count || un->inputs[ui] != n) { printf("[VERIFY] STALE user entry: %%%u lists %%%u input[%d]\n", n->gvn, un->gvn, ui); stale++; }
-                      }
-                  }
-                  printf("[VERIFY] %s: %zu nodes, %d missing, %d stale\n", f->super.name ? f->super.name : "?", dyn_array_length(vws.items), missing, stale);
-                  worklist_free(&vws);
-                  tb_arena_restore(&f->tmp_arena, vsp);
-                  tb_verify(f, &f->tmp_arena);
-                  printf("[VERIFY] %s: tb_verify passed\n", f->super.name ? f->super.name : "?");
-              } }
-
-            if (tb_opt_bisect == 7) { worklist_clear(ws); break; } // after first peeps+locals round
         }
         cuikperf_region_end();
 
-        // TEMP DIAG: TB_OPT_DUMP_IR=<substr> prints post-minor-opts IR
+        // diagnostic: TB_OPT_DUMP_IR=<substr> prints post-minor-opts IR
         { static const char* tb_dump_ir = (const char*)-1;
           if (tb_dump_ir == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir = s; }
           if (tb_dump_ir && f->super.name && strstr(f->super.name, tb_dump_ir)) { tb_print(f); fflush(stdout); } }
-
-        if (tb_opt_bisect == 1) { break; }
 
         // avoids bloating up my arenas with freed nodes
         float dead_factor = (float)f->dead_node_bytes / (float)tb_arena_current_size(&f->arena);
@@ -1868,7 +1760,6 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             TB_OPTDEBUG(PASSES)(printf("    * Node GC: %.f KiB => %.f KiB\n", old / 1024.0, new / 1024.0));
 
             TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "Compact"));
-            if (tb_opt_bisect == 2) { break; }
         }
 
         if (dirty & LOOP_DIRTY) {
@@ -1901,11 +1792,10 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             progress |= loop_opt_canonicalize(f, &ctx, &tmp_ws);
             STATS_EXIT(LOOP_ROTATE);
             TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "Loop rotation"));
-            // TEMP DIAG: TB_OPT_DUMP_IR=<substr> dumps right after rotate
+            // diagnostic: TB_OPT_DUMP_IR=<substr> dumps right after rotate
             { static const char* tb_dump_ir5 = (const char*)-1;
               if (tb_dump_ir5 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir5 = s; }
               if (tb_dump_ir5 && f->super.name && strstr(f->super.name, tb_dump_ir5)) { printf("=== AFTER ROTATE (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
-            if (tb_opt_bisect == 3 || tb_opt_bisect == 8) { break; }
             ////////////////////////////////
             // 4. SLP vectorizer
             ////////////////////////////////
@@ -1950,7 +1840,6 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             }
             STATS_EXIT(PEEPHOLES);
             TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "Peepholes"));
-            if (tb_opt_bisect == 9) { break; }
             ////////////////////////////////
             // 6. Loop strength reduction
             ////////////////////////////////
@@ -1980,8 +1869,7 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             if (progress) {
                 dirty |= CPROP_DIRTY;
             }
-            if (tb_opt_bisect == 4) { break; }
-            // TEMP DIAG: TB_OPT_DUMP_IR=<substr> dumps after the loop block
+            // diagnostic: TB_OPT_DUMP_IR=<substr> dumps after the loop block
             { static const char* tb_dump_ir4 = (const char*)-1;
               if (tb_dump_ir4 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir4 = s; }
               if (tb_dump_ir4 && f->super.name && strstr(f->super.name, tb_dump_ir4)) { printf("=== AFTER LOOP BLOCK (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
@@ -2021,12 +1909,8 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             #endif
         }
     } while (dirty);
-    // TEMP DIAG: early bisect breaks skip the LOOP block's tmp_arena clear,
-    // so the emptiness assert only holds for full runs.
-    if (tb_opt_bisect == -1) {
-        TB_ASSERT(worklist_count(ws) == 0);
-        TB_ASSERT(tb_arena_is_empty(&f->tmp_arena));
-    }
+    TB_ASSERT(worklist_count(ws) == 0);
+    TB_ASSERT(tb_arena_is_empty(&f->tmp_arena));
     // if we're doing IPO then it's helpful to keep these
     if (!preserve_types) {
         tb_opt_free_types(f);

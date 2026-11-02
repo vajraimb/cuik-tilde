@@ -1651,11 +1651,6 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         TB_Node* n = splitter.all_defs[i];
         int leader = uf_find(ra->uf, ra->uf_len, n->gvn);
 
-        // TEMP DIAG
-        if (getenv("TB_OPT_RA_LOGPIN") && n->gvn == 48) {
-            fprintf(stderr, "[def48] in all_defs: type=%d leader=%u vreg_map[48]=%d vreg_map[leader]=%d\n",
-                n->type, leader, ctx->vreg_map[n->gvn], ctx->vreg_map[leader]);
-        }
         // PATCH(odin-tilde): relax zombie pinned copies. A pinned wrapper
         // copy whose pinned use was rewired away keeps its fixed def mask
         // forever (its own constraint re-pins the vreg every round) and can
@@ -1711,11 +1706,6 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                 int stk_vreg_id = ctx->vreg_map[leader];
                 bool pure = stk_vreg_id != 0 &&
                     spill_pin_is_pure(ctx, ra, &splitter, stk_vreg_id, n);
-                // TEMP DIAG
-                if (getenv("TB_OPT_RA_LOGPIN")) {
-                    fprintf(stderr, "[pin1] store gvn=%u leader=%u vreg=%d pure=%d\n",
-                        n->gvn, leader, stk_vreg_id, (int) pure);
-                }
                 if (pure) {
                     {
                         VReg* stk_vreg = &ctx->vregs[stk_vreg_id];
@@ -1730,11 +1720,6 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             }
         }
 
-        // TEMP DIAG
-        if (n->type == TB_STORE) {
-            fprintf(stderr, "[alldefs-store] gvn=%u leader=%u vreg_map=%d\n",
-                n->gvn, leader, ctx->vreg_map[leader]);
-        }
         RegMask* mask = ctx->constraint(ctx, n, NULL);
 
         int vreg_id = ctx->vreg_map[leader];
@@ -1772,10 +1757,6 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             // spaces — see spill_pin_is_pure.
             bool pure = spill_pin_is_pure(ctx, ra, &splitter, vreg_id, n);
             if (pure) {
-                // TEMP DIAG
-                if (getenv("TB_OPT_RA_LOGPIN") && vreg_id == 121) {
-                    fprintf(stderr, "[pin2-121] RESTORE n_gvn=%u leader=%u vreg=%d\n", n->gvn, leader, vreg_id);
-                }
                 ctx->vregs[vreg_id].mask = old_vm;
                 ctx->vreg_map[n->gvn] = vreg_id;
                 continue;
@@ -1908,15 +1889,6 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                 }
             }
             if (!intrinsic && !needed) {
-                // TEMP DIAG: TB_OPT_RA_LOGPIN=2 logs ra_split relaxations
-                { static int rl2 = -1;
-                  if (rl2 < 0) { const char* s = getenv("TB_OPT_RA_LOGPIN"); rl2 = s ? atoi(s) : 0; }
-                  if (rl2 >= 2) {
-                      fprintf(stderr, "[ra2-relax] %s V%d leader_gvn=%u n_gvn=%u %s fx=%d\n",
-                          ctx->f->super.name ? ctx->f->super.name : "?", vreg_id, leader, n->gvn,
-                          tb_node_get_name(n->type), fx);
-                  }
-                }
                 mask = ctx->normie_mask[mask->class];
             }
         }
@@ -1936,12 +1908,6 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                 }
             }
         }
-        // TEMP DIAG
-        if (getenv("TB_OPT_RA_LOGPIN") && (n->gvn == 48 || vreg_id == 121)) {
-            fprintf(stderr, "[setmap] n_gvn=%u type=%d leader=%u vreg_id=%d mask_class=%d may_spill=%d\n",
-                n->gvn, n->type, leader, vreg_id,
-                mask ? mask->class : -1, mask ? (int) mask->may_spill : -1);
-        }
         // PATCH(odin-tilde): a MACH_COPY's rebuilt mask can meet itself into
         // TB_REG_EMPTY when one endpoint is a non-spillable register mask
         // and the other is a stack mask (reg_mask_meet returns EMPTY for
@@ -1950,7 +1916,7 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         // Without the fallback the vreg is poisoned empty, never colors,
         // and the split loop re-queues it forever (gc_batch_loss ABI fix:
         // io@query 34 vregs, 13 mach_copy mask=EMPTY residuals).
-        if (!getenv("TB_RA_NOEMPTYFB") && mask == &TB_REG_EMPTY && n->type == TB_MACH_COPY) { // TEMP BISECT
+        if (mask == &TB_REG_EMPTY && n->type == TB_MACH_COPY) {
             RegMask* own = ctx->constraint(ctx, n, NULL);
             if (own != NULL && own != &TB_REG_EMPTY) { mask = own; }
         }

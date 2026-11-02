@@ -1,6 +1,5 @@
 #ifdef TB_HAS_X64
 #include "../tb_internal.h"
-#include <execinfo.h> // TEMP DIAG
 
 static_assert(sizeof(float) == sizeof(uint32_t), "Float needs to be a 32-bit float!");
 static_assert(sizeof(double) == sizeof(uint64_t), "Double needs to be a 64-bit float!");
@@ -1948,41 +1947,8 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
         }
 
         default:
-        // TEMP DIAG
-        fprintf(stderr, "[constraint-todo] node type=%d gvn=%u ins=%p dt=%d nins=%d in0=%p in1(type=%d,dt=%d) in2(type=%d,dt=%d) in3(type=%d,dt=%d)\n",
-            n->type, n->gvn, (void*) ins, n->dt.type, n->input_count,
-            n->input_count > 0 ? (void*) n->inputs[0] : NULL,
-            n->input_count > 1 && n->inputs[1] ? n->inputs[1]->type : -1,
-            n->input_count > 1 && n->inputs[1] ? n->inputs[1]->dt.type : -1,
-            n->input_count > 2 && n->inputs[2] ? n->inputs[2]->type : -1,
-            n->input_count > 2 && n->inputs[2] ? n->inputs[2]->dt.type : -1,
-            n->input_count > 3 && n->inputs[3] ? n->inputs[3]->type : -1,
-            n->input_count > 3 && n->inputs[3] ? n->inputs[3]->dt.type : -1);
-        {
-            void* bt[24]; int bn = backtrace(bt, 24); backtrace_symbols_fd(bt, bn, 2);
-            // TEMP DIAG: who still references this node?
-            fprintf(stderr, "[todo-ref] users=%d f=%s node_count=%zu n=%p\n",
-                n->user_count, ctx->f->super.name, ctx->f->node_count, (void*)n);
-            TB_Worklist* rw = ctx->f->worklist;
-            worklist_clear(rw);
-            worklist_push(rw, ctx->f->root_node);
-            Set seen = set_create(1024);
-            for (size_t i = 0; i < worklist_count(rw); i++) {
-                TB_Node* x = rw->items[i];
-                if (x == NULL || set_get(&seen, x->gvn)) continue;
-                set_put(&seen, x->gvn);
-                FOR_N(k, 0, x->input_count) {
-                    TB_Node* in = x->inputs[k];
-                    if (in == NULL) continue;
-                    if (in == n) {
-                        fprintf(stderr, "[todo-ref] referenced by gvn=%u type=%d slot=%d\n", x->gvn, x->type, k);
-                    }
-                    worklist_push(rw, in);
-                }
-            }
-            set_free(&seen);
-        }
-        tb_todo();        return &TB_REG_EMPTY;
+        tb_todo();
+        return &TB_REG_EMPTY;
     }
 }
 
@@ -2330,10 +2296,6 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 }
 
                 if (dst.type == VAL_MEM && src.type == VAL_MEM) {
-                    // TEMP DIAG: TB_COPY_DEBUG prints raw endpoints
-                    { static int tb_copy_debug = -1;
-                      if (tb_copy_debug < 0) { const char* s = getenv("TB_COPY_DEBUG"); tb_copy_debug = s ? atoi(s) : 0; }
-                      if (tb_copy_debug) { COMMENT("RAWCOPY src(reg=%d,imm=%d) dst(reg=%d,imm=%d)", src.reg, src.imm, dst.reg, dst.imm); } }
                     // PATCH(odin-tilde): x86 has no mem->mem MOV. Slot-to-slot
                     // spill copies appear under high RA pressure (split
                     // chains); bounce through RAX preserved with push/pop
@@ -2911,32 +2873,6 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             }
 
             Val rx, rm = parse_cisc_operand(ctx, n, &rx, op);
-            // TEMP DIAG: dump everything about a cmovcc whose dst OR rx landed on the stack
-            if (n->type == TB_x86_cmovcc) {
-                Val dst0 = op_at(ctx, n);
-                if (dst0.type == VAL_MEM || rx.type == VAL_MEM) {
-                    fprintf(stderr, "[cmovcc-diag] n_gvn=%u in_count=%zu op_mode=%d dst_type=%d rx_type=%d\n",
-                        n->gvn, n->input_count, op->mode, dst0.type, rx.type);
-                    int nv = ctx->vreg_map[n->gvn];
-                    fprintf(stderr, "  def vreg=%d mask_class=%d may_spill=%d assigned=%d\n", nv,
-                        nv > 0 && ctx->vregs[nv].mask ? ctx->vregs[nv].mask->class : -1,
-                        nv > 0 && ctx->vregs[nv].mask ? (int) ctx->vregs[nv].mask->may_spill : -1,
-                        nv > 0 ? ctx->vregs[nv].assigned : -1);
-                    FOR_N(ii, 2, n->input_count) {
-                        TB_Node* in = n->inputs[ii];
-                        if (!in) { fprintf(stderr, "  in[%zu]=NULL\n", ii); continue; }
-                        int iv = ctx->vreg_map[in->gvn];
-                        VReg* ivv = iv > 0 ? &ctx->vregs[iv] : NULL;
-                        ctx->constraint(ctx, n, ctx->ins);
-                        RegMask* um = ctx->ins[ii];
-                        fprintf(stderr, "  in[%zu] type=%d gvn=%u vreg=%d class=%d assigned=%d umask_class=%d\n",
-                            ii, in->type, in->gvn, iv,
-                            ivv && ivv->mask ? ivv->mask->class : -1,
-                            ivv ? ivv->assigned : -1,
-                            um ? um->class : -1);
-                    }
-                }
-            }
             if (op->mode == MODE_ST) {
                 __(op_type, dt, &rm, &rx);
             } else if (n->type == TB_x86_cmovcc || (op->flags & OP_IMMEDIATE)) {

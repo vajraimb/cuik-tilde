@@ -1383,8 +1383,6 @@ static bool loop_opt_remove_safepoints(TB_Function* f, LoopOpt* ctx) {
 // canonicalize regions into natural loop headers (or affine loops) and
 // join all backedges into one pred path on the header
 static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp_ws) {
-    // TEMP DIAG: TB_SKIP_CANON=1 returns immediately, isolating loop_opt_begin
-    if (getenv("TB_SKIP_CANON")) { return false; }
     size_t cloned_cap = (f->node_count * 3) / 2;
     TB_Node** cloned  = cuik_malloc(cloned_cap * sizeof(TB_Node*));
     log_debug("allocating clone array %zu (%zu)", cloned_cap, f->node_count);
@@ -1412,12 +1410,8 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
 
         // as part of loop simplification we convert backedges (and entries) into one.
         ptrdiff_t single_backedge = backedges[0];
-        // TEMP DIAG: TB_SKIP_MERGE=1 disables the multi-backedge region split
-        static int tb_skip_merge = -2;
-        if (tb_skip_merge == -2) { const char* s = getenv("TB_SKIP_MERGE"); tb_skip_merge = s ? atoi(s) : 0; }
-        bool do_merge = (dyn_array_length(backedges) > 1 || header->input_count > 2) && !tb_skip_merge;
+        bool do_merge = dyn_array_length(backedges) > 1 || header->input_count > 2;
         if (do_merge) {
-            if (getenv("TB_MERGE_DEBUG")) { fprintf(stderr, "[merge-debug] fn=%s loop_hdr=%%%u backedges=%zu header_ic=%zu\n", f->super.name, header->gvn, dyn_array_length(backedges), header->input_count); }
             // we're splitting regions, usually the peeps would join these together but that doesn't apply
             // to loop regions.
             TB_OPTDEBUG(LOOP)(printf("region split on loop header %%%u\n", header->gvn));
@@ -1552,20 +1546,13 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
                 }
             }
             // if (exit_proj && (!cfg_is_cproj(exit_proj) || exit_proj->inputs[0] != header->inputs[1]->inputs[0] || header->inputs[1]->user_count != 1)) {
-            if (getenv("TB_ROT_DEBUG")) { fprintf(stderr, "[rot-debug] fn=%s loop_hdr=%%%u exit_proj=%%%u exit_block=%%%u ic=%zu extras=%zu ok=%d rot=%d\n", f->super.name, header->gvn, exit_proj?exit_proj->gvn:0, exit_block?exit_block->gvn:0, exit_block?exit_block->input_count:0, dyn_array_length(extra_exit_edges), (int)exit_block_ok, (int)(exit_proj && exit_block_ok && (!cfg_is_cproj(exit_proj) || header->inputs[1]->user_count != 1))); }
-            // TEMP DIAG: TB_ROT_SKIP=<gvn> skips rotation of that loop header;
-            // TB_ROT_SKIP_ALL=1 disables rotation entirely (to separate merge vs rotate).
-            static int tb_rot_skip = -3;
-            static int tb_rot_skip_all = -1;
-            if (tb_rot_skip == -3) { const char* s = getenv("TB_ROT_SKIP"); tb_rot_skip = s ? atoi(s) : -2; }
-            if (tb_rot_skip_all == -1) { const char* s = getenv("TB_ROT_SKIP_ALL"); tb_rot_skip_all = s ? atoi(s) : 0; }
             // PATCH(odin-tilde): skip rotation of freshly-merged multi-backedge loops.
             // After the backedge-merge above, header->inputs[1] is a REGION (the synthetic
             // back_region) rather than a control proj. Stock rotation miscompiles these
             // (seen in tank@backward-2: wrong gradients). Rotation is only an optimization,
             // so leaving them un-rotated preserves correctness.
             bool backedge_is_merged_region = !cfg_is_cproj(header->inputs[1]);
-            if (exit_proj && exit_block_ok && !backedge_is_merged_region && !tb_rot_skip_all && tb_rot_skip != (int)header->gvn && (!cfg_is_cproj(exit_proj) || header->inputs[1]->user_count != 1)) {
+            if (exit_proj && exit_block_ok && !backedge_is_merged_region && (!cfg_is_cproj(exit_proj) || header->inputs[1]->user_count != 1)) {
                 #if 1
                 TB_OPTDEBUG(PASSES)(printf("      * Rotating loop %%%u %p\n", header->gvn, exit_proj));
 
