@@ -134,7 +134,13 @@ static TB_Node* ideal_select(TB_Function* f, TB_Node* n) {
         }
     }
 
-    if (TB_IS_FLOAT_TYPE(n->dt) && src->type == TB_CMP_FLT) {
+    // PATCH(odin-tilde): float select→FMIN/FMAX folding disabled. The x64
+    // lowering of TB_FMIN/TB_FMAX is broken in this restore (emits
+    // `minss dst, dst` / `maxss dst, dst` — second operand dropped — seen
+    // in tank@ray_rect stage2 asm, where max(tb,0)/min(tmax,ta) degenerated
+    // and broke slab tests, raycasts and all game logic downstream).
+    // cmp+select lowers to proven-correct cmov sequences; keep those.
+    if (false && TB_IS_FLOAT_TYPE(n->dt) && src->type == TB_CMP_FLT) {
         TB_Node* a = src->inputs[1];
         TB_Node* b = src->inputs[2];
 
