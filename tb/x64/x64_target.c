@@ -2602,6 +2602,20 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 __(op_type, dt, &rm, &rx);
             } else {
                 Val dst = op_at(ctx, n);
+                // PATCH(odin-tilde): a vmov def can be assigned a GPR when its
+                // only uses treat the float as a bit container (float SELECT
+                // lowers to GPR cmovcc, and rogers_hard_split rematerializes
+                // this const load directly into the cmov operand's vreg).
+                // movss names an XMM register, so the bits never reached the
+                // GPR — tank@apply_action's speed select read a stale pointer
+                // as its -2.0 arm. The value is a pure bit container here;
+                // load it with the width-matched integer MOV (identical bits).
+                if (n->type == TB_x86_vmov && dst.type == VAL_GPR) {
+                    TB_ASSERT(dt == TB_X86_F32x1 || dt == TB_X86_F64x1);
+                    TB_X86_DataType idt = (dt == TB_X86_F64x1) ? TB_X86_QWORD : TB_X86_DWORD;
+                    __(MOV, idt, &dst, &rm);
+                    break;
+                }
                 // PATCH(odin-tilde): SSE FP arith has no memory-destination
                 // encoding, but our restored RA can assign a stack slot to
                 // the def (upstream never does). It used to emit garbage
