@@ -1697,10 +1697,16 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
         rounds++;
         // TEMP DIAG: TB_OPT_DUMP_IR0=<substr> dumps the raw IR before any
         // optimization round (TB_OPT_DUMP_IR's earliest gate runs after peeps).
-        // Also enables f->enable_log so TB_OPTLOG(PEEP) traces this proc.
+        // In debug builds also enables f->enable_log so TB_OPTLOG(PEEP) traces
+        // this proc (the field does not exist under NDEBUG).
         { static const char* tb_dump_ir0 = (const char*)-1;
           if (tb_dump_ir0 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR0"); tb_dump_ir0 = s; }
-          if (tb_dump_ir0 && f->super.name && strstr(f->super.name, tb_dump_ir0)) { f->enable_log = true; printf("=== INITIAL (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
+          if (tb_dump_ir0 && f->super.name && strstr(f->super.name, tb_dump_ir0)) {
+              #ifndef NDEBUG
+              f->enable_log = true;
+              #endif
+              printf("=== INITIAL (round %d) ===\n", rounds); tb_print(f); fflush(stdout);
+          } }
         TB_OPTDEBUG(PASSES)(printf("  * ROUND %d:\n", rounds));
         TB_OPTDEBUG(PASSES)(printf("    * Minor rewrites\n"));
 
