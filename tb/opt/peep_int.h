@@ -979,7 +979,16 @@ static TB_Node* ideal_int_mod(TB_Function* f, TB_Node* n) {
     TB_DataType dt = n->dt;
     TB_Node* x = n->inputs[1];
 
+    // PATCH(odin-tilde): ideal_int_div guards on a constant denominator but
+    // this function did not — TB_NODE_GET_EXTRA_T(..., TB_NodeInt) on a
+    // non-ICONST node is a garbage read, and when that garbage happens to
+    // be a power of two the umod is miscompiled into an AND (fmt's i64
+    // digit loop: `u % b` with runtime b=10 became `u & 7` at stage>=1,
+    // printing 23698 as 27412; TB_OPT_SKIP_IDEAL=80 confirmed).
+    if (n->inputs[2]->type != TB_ICONST) return NULL;
+
     uint64_t y = TB_NODE_GET_EXTRA_T(n->inputs[2], TB_NodeInt)->value;
+    if (y == 0) return NULL; // ffs(0)-1 would shift by UINT64_MAX
     uint64_t log2 = tb_ffs(y) - 1;
     if (!is_signed && y == (UINT64_C(1) << log2)) {
         TB_Node* and_node = tb_alloc_node(f, TB_AND, dt, 3, sizeof(TB_NodeBinopInt));
