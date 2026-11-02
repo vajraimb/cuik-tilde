@@ -2602,6 +2602,23 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 __(op_type, dt, &rm, &rx);
             } else {
                 Val dst = op_at(ctx, n);
+                // PATCH(odin-tilde): SSE FP arith has no memory-destination
+                // encoding, but our restored RA can assign a stack slot to
+                // the def (upstream never does). It used to emit garbage
+                // (`mulsd xmm4, xmm0` — modrm of the stack slot misread as
+                // a register, product discarded; tank@rng_normal returned
+                // sqrt(-2ln u1) without the * cos factor). Compute
+                // destructively in an operand register (consumed anyway)
+                // and store back to the stack slot.
+                if (dst.type == VAL_MEM && n->type != TB_x86_vmov) {
+                    Val* thru = (rx.type == VAL_XMM || rx.type == VAL_GPR) ? &rx
+                              : (rm.type == VAL_XMM || rm.type == VAL_GPR) ? &rm
+                              : NULL;
+                    TB_ASSERT_MSG(thru != NULL, "FP arith def in stack slot with no register operand");
+                    __(op_type, dt, thru, &rm == thru ? &rx : &rm);
+                    __(mov_op, dt, &dst, thru);
+                    break;
+                }
                 if (rx.type != VAL_NONE) {
                     TB_ASSERT(n->type != TB_x86_lea);
                     if (!is_value_match(&dst, &rx)) {
