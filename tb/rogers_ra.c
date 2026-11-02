@@ -431,6 +431,18 @@ static void rogers_dump_sched(Ctx* restrict ctx, int old_node_count) {
             printf("  ");
             // tb_print_dumb_node(NULL, bb->items[i]);
             ctx->print_pretty(ctx, bb->items[i]);
+            // TEMP DIAG: print the node's constraint-pinned register
+            { TB_Node* dn = bb->items[i];
+              if (dn->type == TB_PROJ || dn->type == TB_MACH_PROJ) {
+                  RegMask* cm = ctx->constraint(ctx, dn, NULL);
+                  int cfx = cm ? fixed_reg_mask(cm) : -99;
+                  int vid = dn->gvn < aarray_length(ctx->vreg_map) ? ctx->vreg_map[dn->gvn] : 0;
+                  int vmfx = (vid > 0 && (size_t)vid < aarray_length(ctx->vregs) && ctx->vregs[vid].mask)
+                      ? fixed_reg_mask(ctx->vregs[vid].mask) : -99;
+                  printf("  # proj-idx=%d cfix=%d vreg=%d vfix=%d",
+                      TB_NODE_GET_EXTRA_T(dn, TB_NodeProj)->index, cfx, vid, vmfx);
+              }
+            }
             if (bb->items[i]->gvn >= old_node_count) {
                 printf("  #  NEW!!!");
             }
@@ -887,7 +899,20 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                     TB_Node* move = rogers_hard_split(ctx, &ra, n, in, rm, vreg_id);
                     set_input(f, n, move, k);
 
-                    rm = tb__reg_mask_meet(ctx, rm, ctx->constraint(ctx, move, NULL));
+                    // PATCH(odin-tilde): a cross-class meet can come out empty
+                    // here — the isel routes float SELECTs to GPR cmovcc, so an
+                    // F32 phi's mask can be stack-only while the remat clone of
+                    // an XMM input still constrains to XMM. Keep the previous
+                    // mask (a stack-only phi is always legal); the vreg is on
+                    // potential_spills and the split pass resolves the copy.
+                    // Stock assumed the meet can never be empty.
+                    {
+                        RegMask* cm = ctx->constraint(ctx, move, NULL);
+                        RegMask* nm = tb__reg_mask_meet(ctx, rm, cm);
+                        if (nm != &TB_REG_EMPTY) {
+                            rm = nm;
+                        }
+                    }
                     TB_ASSERT(rm != &TB_REG_EMPTY);
 
                     TB_Node* pred = cfg_get_pred(&ctx->cfg, n->inputs[0], k - 1);
@@ -929,7 +954,61 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                 // remap the vregs
                 int leader = uf_find(ra.uf, ra.uf_len, n->gvn);
                 if (leader != n->gvn) {
-                    ctx->vreg_map[n->gvn] = ctx->vreg_map[leader];
+                    // PATCH(odin-tilde): a register-required def can never
+                    // share a vreg with a stack-pinned class. The stk_only
+                    // spill pin is applied during the split phase, but uf
+                    // merges are rebuilt per round — a real op coalesced
+                    // into the spill class afterwards (vreg_map remap below)
+                    // would land in a slot it cannot write (odin-tank
+                    // runtime@_make_dynamic_array_len_cap: cmovcc def ->
+                    // STACK31, inst2 assert). Keep n on its own vreg; the
+                    // copy edge that triggered the coalesce stays
+                    // materialized. PHIs are exempt — they legitimately
+                    // live in slots (parallel-move emit handles slots).
+                    int leader_vid = ctx->vreg_map[leader];
+                    RegMask* dm = ctx->constraint(ctx, n, NULL);
+                    bool reg_required = dm && dm != &TB_REG_EMPTY &&
+                        dm->class != REG_CLASS_STK && !dm->may_spill &&
+                        n->type != TB_PHI;
+                    bool leader_is_stk = leader_vid > 0 &&
+                        (size_t) leader_vid < aarray_length(ctx->vregs) &&
+                        ctx->vregs[leader_vid].mask &&
+                        ctx->vregs[leader_vid].mask->class == REG_CLASS_STK;
+                    if (reg_required && leader_is_stk) {
+                        int old_vid = ctx->vreg_map[n->gvn];
+                        bool need_new = old_vid == 0 ||
+                            (size_t) old_vid >= aarray_length(ctx->vregs) ||
+                            ctx->vregs[old_vid].mask == NULL ||
+                            ctx->vregs[old_vid].mask->class == REG_CLASS_STK;
+                        if (need_new) {
+                            VReg* nv = tb__set_node_vreg(ctx, n);
+                            nv->mask = dm;
+                            nv->reg_width = tb__reg_width_from_dt(dm->class, n->dt);
+                        }
+                    } else {
+                        ctx->vreg_map[n->gvn] = ctx->vreg_map[leader];
+
+                        // PATCH(odin-tilde): rogers_coalesce merges only the uf
+                        // sets, never the def constraints. A coalesced node with
+                        // an intrinsically fixed def (e.g. umulpair's RDX hi
+                        // projection) thus lands in a vreg whose mask never
+                        // contains the pin; round 1 then "successfully" colors
+                        // the vreg into an arbitrary register and the emitter
+                        // reads the wrong half of the hardware product (div-by-10
+                        // magic wrong, strconv_decimal@assign loops forever).
+                        // Meet the fixed def constraint into the leader vreg.
+                        if (dm && dm != &TB_REG_EMPTY && fixed_reg_mask(dm) >= 0 &&
+                            leader_vid > 0 && (size_t)leader_vid < aarray_length(ctx->vregs)) {
+                            VReg* lv = &ctx->vregs[leader_vid];
+                            if (lv->mask && lv->mask != &TB_REG_EMPTY &&
+                                lv->mask->class == dm->class) {
+                                RegMask* nm = tb__reg_mask_meet(ctx, lv->mask, dm);
+                                if (nm != &TB_REG_EMPTY) {
+                                    lv->mask = nm;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1052,6 +1131,20 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                         }
                     }
                 }
+                // PATCH(odin-tilde): nodes that never appear in any bb's items
+                // still carry their hardware pin — implicit projections of
+                // mach ops (umulpair hi/lo in RDX/RAX, call results, ...) are
+                // materialized by the parent instruction, not scheduled as
+                // standalone items, so the sweep above can't see them and
+                // their pin would be relaxed just because no single use
+                // demands that exact register (the uses take any GPR).
+                // Observed: umulpair hi proj unpinned from RDX, assigned RAX,
+                // div-by-10 magic silently wrong (strconv_decimal@assign
+                // loops forever).
+                if (!intrinsic && v->n != NULL && v->n->type != TB_MACH_COPY &&
+                    fixed_reg_mask(ctx->constraint(ctx, v->n, NULL)) >= 0) {
+                    intrinsic = true;
+                }
                 if (intrinsic) {
                     continue;
                 }
@@ -1072,6 +1165,18 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                     }
                 }
                 if (!needed) {
+                    // TEMP DIAG: TB_OPT_RA_LOGPIN=1 logs fixed-pin relaxations
+                    { static int rl = -1;
+                      if (rl < 0) { const char* s = getenv("TB_OPT_RA_LOGPIN"); rl = s ? atoi(s) : 0; }
+                      if (rl && v->n) {
+                          RegMask* cm = ctx->constraint(ctx, v->n, NULL);
+                          fprintf(stderr, "[ra-relax] %s V%d gvn=%u %s leader_fixed=%d constraint_fixed=%d members=%s\n",
+                              f->super.name ? f->super.name : "?", (int)vi, v->n->gvn,
+                              tb_node_get_name(v->n->type), fx,
+                              cm ? fixed_reg_mask(cm) : -99,
+                              sweep_members[vi] ? "yes" : "NULL");
+                      }
+                    }
                     bool is_copy = v->n->type == TB_MACH_COPY;
                     if (is_copy) {
                         TB_NodeMachCopy* mc = TB_NODE_GET_EXTRA(v->n);
@@ -1110,7 +1215,7 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
             ra.soft_final = true;
             done = allocate_loop(ctx, &ra, arena);
             ra.soft_final = false;
-            if (!done && tb__ra_bail_active()) {
+            if (!done && tb__ra_bail_active() && getenv("TB_RA_NOBAIL") == NULL) {
                 cuik_free(ra.uf);
                 cuik_free(ra.uf_size);
                 nl_table_free(ra.coalesce_set);
@@ -1130,6 +1235,33 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                     if (ra.splits[i].clobber) { fprintf(stderr, " clobber"); }
                     if (n && f->scheduled[n->gvn]) {
                         fprintf(stderr, " bb=%td", f->scheduled[n->gvn] - ctx->cfg.blocks);
+                    }
+                    // TEMP DIAG: dump mach_copy endpoints and input chain
+                    if (n && n->type == TB_MACH_COPY) {
+                        TB_NodeMachCopy* mc = TB_NODE_GET_EXTRA(n);
+                        fprintf(stderr, "\n[ra]   copy def: ");
+                        if (mc->def == NULL) { fprintf(stderr, "NULL"); }
+                        else if (mc->def == &TB_REG_EMPTY) { fprintf(stderr, "EMPTY"); }
+                        else { fprintf(stderr, "cls=%d mayspill=%d fixed=%d bits=%016llx", mc->def->class, mc->def->may_spill, fixed_reg_mask(mc->def), (unsigned long long)mc->def->mask[0]); }
+                        fprintf(stderr, " use: ");
+                        if (mc->use == NULL) { fprintf(stderr, "NULL"); }
+                        else if (mc->use == &TB_REG_EMPTY) { fprintf(stderr, "EMPTY"); }
+                        else { fprintf(stderr, "cls=%d mayspill=%d fixed=%d bits=%016llx", mc->use->class, mc->use->may_spill, fixed_reg_mask(mc->use), (unsigned long long)mc->use->mask[0]); }
+                        fprintf(stderr, " dt=%d", n->dt.type);
+                        TB_Node* src = n->inputs[1];
+                        if (src) {
+                            fprintf(stderr, " src(gvn=%u %s)", src->gvn, tb_node_get_name(src->type));
+                            if (src->type == TB_MACH_COPY) {
+                                TB_NodeMachCopy* sc = TB_NODE_GET_EXTRA(src);
+                                fprintf(stderr, " src.def: ");
+                                if (sc->def == NULL) { fprintf(stderr, "NULL"); }
+                                else if (sc->def == &TB_REG_EMPTY) { fprintf(stderr, "EMPTY"); }
+                                else { fprintf(stderr, "cls=%d fixed=%d bits=%016llx", sc->def->class, fixed_reg_mask(sc->def), (unsigned long long)sc->def->mask[0]); }
+                            }
+                        }
+                        TB_Node* real_def = n;
+                        while (real_def->type == TB_MACH_COPY && real_def->inputs[1]) { real_def = real_def->inputs[1]; }
+                        fprintf(stderr, " root_def(gvn=%u %s)", real_def->gvn, tb_node_get_name(real_def->type));
                     }
                     fprintf(stderr, "\n");
                 }
@@ -1154,6 +1286,14 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
         if (done) {
             // printf("STATS: %d\n", stats_aaa);
             TB_OPTDEBUG(REGALLOC3)(rogers_dump_sched(ctx, f->node_count));
+
+            // TEMP DIAG: TB_OPT_RA_DUMP=<substr> dumps the post-RA schedule
+            { static const char* ra_dump = (const char*)-1;
+              if (ra_dump == (const char*)-1) { const char* s = getenv("TB_OPT_RA_DUMP"); ra_dump = s; }
+              if (ra_dump && f->super.name && strstr(f->super.name, ra_dump)) {
+                  rogers_dump_sched(ctx, f->node_count);
+              }
+            }
 
             tb_arena_restore(arena, sp);
             cuikperf_region_end();
@@ -1351,6 +1491,12 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
             }
             if (v->mask->may_spill) {
                 TB_OPTDEBUG(REGALLOC)(printf("  * V%u is now a proper spill\n", split.target));
+
+                // TEMP DIAG
+                if (getenv("TB_OPT_RA_LOGPIN")) {
+                    fprintf(stderr, "[proper-spill] vreg=%u node gvn=%u type=%d\n",
+                        split.target, v->n->gvn, v->n->type);
+                }
 
                 v->spill_cost = INFINITY;
                 v->mask = intern_regmask(ctx, REG_CLASS_STK, true, 0);
@@ -1638,14 +1784,14 @@ static void mark_active(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
     // we need to move that node to future active
     int old = ra->active[vreg->class][vreg->assigned];
     if (old != 0 && old != gvn) {
-        if (ra->soft_final && ctx->vreg_map[old] != ctx->vreg_map[gvn]) {
+        if (ctx->vreg_map[old] != ctx->vreg_map[gvn]) {
             // PATCH(odin-tilde): stale occupant from before the wave (its
-            // node was re-split onto another vreg). Evict it so the final
-            // pass can re-color; stock's put_to_sleep remedy (see below)
-            // is exactly the right tool here.
+            // node was re-split onto another vreg, see the remap/pin fixes).
+            // Stock asserts here, but with re-split nodes keeping their old
+            // vregs the slot can legitimately hold a different vreg — evict
+            // it so it can be re-colored; stock's own remedy (commented
+            // below) is exactly put_to_sleep.
             put_to_sleep(ra, vreg->class, old);
-        } else {
-            TB_ASSERT(ctx->vreg_map[old] == ctx->vreg_map[gvn]);
         }
         // printf("WARNING!!! %%%u %%%u\n", old, gvn);
         // put_to_sleep(ra, vreg->class, old);
@@ -2020,6 +2166,18 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
         return true;
     }
 
+    if (vreg->assigned >= 0 && vreg->mask != NULL && vreg->mask != &TB_REG_EMPTY &&
+        !within_reg_mask(vreg->mask, vreg->assigned)) {
+        // PATCH(odin-tilde): a stale assignment carried over from an earlier
+        // round (or inherited through coalesce-set surgery) can violate the
+        // vreg's current mask — most dangerously fixed hardware pins like
+        // umulpair's hi projection (RDX): the shortcut below would keep RAX
+        // and the emitter reads the wrong half of the multiply (observed:
+        // div-by-10 magic wrong, strconv_decimal@assign loops forever).
+        // Drop it and let the normal mask-respecting path re-color.
+        vreg->assigned = -1;
+    }
+
     if (vreg->assigned >= 0) {
         TB_OPTDEBUG(REGALLOC)(printf("#   fixed %%%u V%u => ", n->gvn, vreg_id), print_reg_name(vreg->class, vreg->assigned), printf("\n"));
         mark_active(ctx, ra, n->gvn);
@@ -2237,6 +2395,10 @@ static void compute_ordinals(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* a
     size_t new_cap = tb_next_pow2(ctx->f->node_count + 16);
     ra->order = tb_arena_alloc(arena, new_cap * sizeof(int));
     ra->gvn2node = tb_arena_alloc(arena, new_cap * sizeof(TB_Node*));
+    // PATCH(odin-tilde): zero-fill — lookups guard on NULL (e.g. the
+    // ra_split pin-restore scan walks vreg_map entries whose nodes were
+    // never scheduled, and arena garbage read as a node pointer crashes).
+    memset(ra->gvn2node, 0, new_cap * sizeof(TB_Node*));
     ra->order_cap = new_cap;
 
     // just give the root node a fake ordinal
@@ -2248,6 +2410,14 @@ static void compute_ordinals(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* a
         int timeline = 1;
         for (size_t j = 0; j < aarray_length(bb->items); j++) {
             TB_Node* n = bb->items[j];
+
+            // TEMP DIAG
+            if (n->gvn == 223 && n->type == TB_ZERO_EXT && n->dt.type == TB_TAG_BOOL) {
+                fprintf(stderr, "[sched-223] f=%s users=%d in1(type=%d,dt=%d)\n",
+                    ctx->f->super.name, n->user_count,
+                    n->input_count > 1 && n->inputs[1] ? n->inputs[1]->type : -1,
+                    n->input_count > 1 && n->inputs[1] ? n->inputs[1]->dt.type : -1);
+            }
 
             ra->gvn2node[n->gvn] = n;
             ra->order[n->gvn] = timeline++;
@@ -2261,6 +2431,8 @@ static void compute_areas(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     size_t new_cap = tb_next_pow2(node_count + 16);
     ra->order = tb_arena_alloc(arena, new_cap * sizeof(int));
     ra->gvn2node = tb_arena_alloc(arena, new_cap * sizeof(TB_Node*));
+    // PATCH(odin-tilde): zero-fill — same rationale as compute_ordinals.
+    memset(ra->gvn2node, 0, new_cap * sizeof(TB_Node*));
     ra->order_cap = new_cap;
 
     // just give the root node a fake ordinal

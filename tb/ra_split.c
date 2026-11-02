@@ -30,6 +30,41 @@ typedef struct {
     NL_Table uses_spill;
 } RegSplitter;
 
+// PATCH(odin-tilde): a stack pin may only be applied to a vreg whose
+// entire def class is slot-capable (copies/phis/projections/temps). A
+// real op sharing the vreg cannot live in a slot — the op cannot write
+// one and the emitter has no reg-dst lowering for it (odin-tank
+// runtime@_make_dynamic_array_len_cap: a cmovcc def in a spill class
+// pinned to STACK31, inst2 assert). all_defs MUST be scanned: class
+// members are mapped to the class vreg only at the end of this pass, so
+// a vreg_map scan alone misses them (and gvn2node is stale/NULL for
+// split-created nodes).
+static bool spill_pin_is_pure(Ctx* ctx, Rogers* ra, RegSplitter* splitter, int vreg_id, TB_Node* n) {
+    size_t cnt;
+    TB_Node** arr = coalesce_set_array(ctx, ra, &n, &cnt);
+    FOR_N(i, 0, cnt) {
+        int t = arr[i]->type;
+        if (t != TB_MACH_COPY && t != TB_PHI && t != TB_MACH_PROJ && t != TB_MACH_TEMP) return false;
+    }
+    aarray_for(i, splitter->all_defs) {
+        TB_Node* m = splitter->all_defs[i];
+        int t = m->type;
+        if (t == TB_MACH_COPY || t == TB_PHI || t == TB_MACH_PROJ || t == TB_MACH_TEMP || t == TB_NULL) continue;
+        int ml = uf_find(ra->uf, ra->uf_len, m->gvn);
+        if (ctx->vreg_map[ml] == vreg_id) return false;
+    }
+    size_t vmap_len = aarray_length(ctx->vreg_map);
+    size_t g2n_cap = ra->order_cap; // gvn2node is only order_cap long
+    for (size_t mi = 0; mi < vmap_len && mi < g2n_cap; mi++) {
+        if (ctx->vreg_map[mi] != vreg_id) continue;
+        TB_Node* mn = ra->gvn2node[mi];
+        if (mn == NULL) continue;
+        int t = mn->type;
+        if (t != TB_MACH_COPY && t != TB_PHI && t != TB_MACH_PROJ && t != TB_MACH_TEMP && t != TB_NULL) return false;
+    }
+    return true;
+}
+
 typedef struct {
     int head, tail;
 } SplitterLoop;
@@ -1616,6 +1651,11 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         TB_Node* n = splitter.all_defs[i];
         int leader = uf_find(ra->uf, ra->uf_len, n->gvn);
 
+        // TEMP DIAG
+        if (getenv("TB_OPT_RA_LOGPIN") && n->gvn == 48) {
+            fprintf(stderr, "[def48] in all_defs: type=%d leader=%u vreg_map[48]=%d vreg_map[leader]=%d\n",
+                n->type, leader, ctx->vreg_map[n->gvn], ctx->vreg_map[leader]);
+        }
         // PATCH(odin-tilde): relax zombie pinned copies. A pinned wrapper
         // copy whose pinned use was rewired away keeps its fixed def mask
         // forever (its own constraint re-pins the vreg every round) and can
@@ -1663,19 +1703,38 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             int spill_i = spill_map_get2(&splitter.spill_map, n);
             if (spill_i >= 0 && ((stk_only >> spill_i) & 1) &&
                 is_spill_store(n) && !is_reload(n)) {
+                // PATCH(odin-tilde): only pin PURE spill spaces — see
+                // spill_pin_is_pure. A vreg shared with a real op cannot
+                // be stack-resident (odin-tank runtime@_make_dynamic_
+                // array_len_cap: a cmovcc def sharing a spill class vreg
+                // pinned to STACK31, inst2 assert).
                 int stk_vreg_id = ctx->vreg_map[leader];
-                if (stk_vreg_id != 0) {
-                    VReg* stk_vreg = &ctx->vregs[stk_vreg_id];
-                    stk_vreg->mask = intern_regmask(ctx, REG_CLASS_STK, true, 0);
-                    stk_vreg->reg_width = tb__reg_width_from_dt(REG_CLASS_STK, n->dt);
-                    stk_vreg->spill_bias = -100.0f;
-                    stk_vreg->spill_cost = INFINITY;
-                    ctx->vreg_map[n->gvn] = stk_vreg_id;
-                    continue;
+                bool pure = stk_vreg_id != 0 &&
+                    spill_pin_is_pure(ctx, ra, &splitter, stk_vreg_id, n);
+                // TEMP DIAG
+                if (getenv("TB_OPT_RA_LOGPIN")) {
+                    fprintf(stderr, "[pin1] store gvn=%u leader=%u vreg=%d pure=%d\n",
+                        n->gvn, leader, stk_vreg_id, (int) pure);
+                }
+                if (pure) {
+                    {
+                        VReg* stk_vreg = &ctx->vregs[stk_vreg_id];
+                        stk_vreg->mask = intern_regmask(ctx, REG_CLASS_STK, true, 0);
+                        stk_vreg->reg_width = tb__reg_width_from_dt(REG_CLASS_STK, n->dt);
+                        stk_vreg->spill_bias = -100.0f;
+                        stk_vreg->spill_cost = INFINITY;
+                        ctx->vreg_map[n->gvn] = stk_vreg_id;
+                        continue;
+                    }
                 }
             }
         }
 
+        // TEMP DIAG
+        if (n->type == TB_STORE) {
+            fprintf(stderr, "[alldefs-store] gvn=%u leader=%u vreg_map=%d\n",
+                n->gvn, leader, ctx->vreg_map[leader]);
+        }
         RegMask* mask = ctx->constraint(ctx, n, NULL);
 
         int vreg_id = ctx->vreg_map[leader];
@@ -1709,15 +1768,14 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         // write a slot) — keeping the pin there re-poisons the split
         // loop (server@index_file).
         if (old_vm != NULL && reg_mask_is_spill(old_vm)) {
-            bool pure = true;
-            size_t pcnt;
-            TB_Node** parr = coalesce_set_array(ctx, ra, &n, &pcnt);
-            FOR_N(pi, 0, pcnt) {
-                int pt = parr[pi]->type;
-                if (pt != TB_MACH_COPY && pt != TB_PHI &&
-                    pt != TB_MACH_PROJ && pt != TB_MACH_TEMP) { pure = false; break; }
-            }
+            // PATCH(odin-tilde): only preserve the pin for PURE spill
+            // spaces — see spill_pin_is_pure.
+            bool pure = spill_pin_is_pure(ctx, ra, &splitter, vreg_id, n);
             if (pure) {
+                // TEMP DIAG
+                if (getenv("TB_OPT_RA_LOGPIN") && vreg_id == 121) {
+                    fprintf(stderr, "[pin2-121] RESTORE n_gvn=%u leader=%u vreg=%d\n", n->gvn, leader, vreg_id);
+                }
                 ctx->vregs[vreg_id].mask = old_vm;
                 ctx->vreg_map[n->gvn] = vreg_id;
                 continue;
@@ -1745,6 +1803,44 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             if (USERI(u) > 0 && USERI(u) < USERN(u)->input_count) {
                 RegMask* in_mask = constraint_in(ctx, USERN(u), USERI(u));
                 mask = tb__reg_mask_meet(ctx, mask, in_mask);
+            }
+        }
+
+        // PATCH(odin-tilde): restore hardware pins of every node that shares
+        // this vreg. The mask above is rebuilt from the segment leader's def
+        // constraint plus use meets only; a coalesced/hard-split member with
+        // an intrinsically fixed def (e.g. umulpair's RDX hi projection)
+        // never contributes its pin, and the relaxation guard below only
+        // fires when the mask is ALREADY fixed — a normie mask here detaches
+        // the projection from the register the parent instruction actually
+        // writes (div-by-10 magic wrong, strconv_decimal@assign loops
+        // forever).
+        {
+            size_t gcnt2;
+            TB_Node** garr2 = coalesce_set_array(ctx, ra, &n, &gcnt2);
+            FOR_N(gi, 0, gcnt2) {
+                TB_Node* gn = garr2[gi];
+                if (gn->type == TB_MACH_COPY || gn->type == TB_NULL) { continue; }
+                RegMask* gm = ctx->constraint(ctx, gn, NULL);
+                if (gm && gm != &TB_REG_EMPTY && fixed_reg_mask(gm) >= 0 &&
+                    mask != &TB_REG_EMPTY && mask->class == gm->class) {
+                    mask = tb__reg_mask_meet(ctx, mask, gm);
+                }
+            }
+            // coalesce sets are keyed by uf-leader and miss nodes that were
+            // hard-split onto this vreg (vreg_map says they belong, uf says
+            // otherwise) — e.g. umulpair's RDX-pinned hi projection.
+            size_t vmap_len = aarray_length(ctx->vreg_map);
+            size_t g2n_cap = ra->order_cap; // gvn2node is only order_cap long
+            for (size_t mi = 0; mi < vmap_len && mi < g2n_cap; mi++) {
+                if (ctx->vreg_map[mi] != vreg_id) { continue; }
+                TB_Node* mn = ra->gvn2node[mi];
+                if (mn == NULL || mn->type == TB_MACH_COPY || mn->type == TB_NULL) { continue; }
+                RegMask* mm = ctx->constraint(ctx, mn, NULL);
+                if (mm && mm != &TB_REG_EMPTY && fixed_reg_mask(mm) >= 0 &&
+                    mask != &TB_REG_EMPTY && mask->class == mm->class) {
+                    mask = tb__reg_mask_meet(ctx, mask, mm);
+                }
             }
         }
 
@@ -1777,6 +1873,25 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                     break;
                 }
             }
+            // PATCH(odin-tilde): coalesce groups are keyed by uf-leader and
+            // miss nodes that were hard-split onto this vreg (vreg_map says
+            // they belong, uf says otherwise) — e.g. umulpair's RDX-pinned hi
+            // projection. Such a node still has its hardware register written
+            // by the parent instruction; relaxing the mask detaches it
+            // (observed: div-by-10 magic wrong, assign loops forever).
+            if (!intrinsic) {
+                size_t vmap_len = aarray_length(ctx->vreg_map);
+                size_t g2n_cap = ra->order_cap; // gvn2node is only order_cap long
+                for (size_t mi = 0; mi < vmap_len && mi < g2n_cap; mi++) {
+                    if (ctx->vreg_map[mi] != vreg_id) { continue; }
+                    TB_Node* mn = ra->gvn2node[mi];
+                    if (mn && mn->type != TB_MACH_COPY && mn->type != TB_NULL &&
+                        fixed_reg_mask(ctx->constraint(ctx, mn, NULL)) >= 0) {
+                        intrinsic = true;
+                        break;
+                    }
+                }
+            }
             bool needed = false;
             if (!intrinsic) {
                 FOR_N(gi, 0, gcnt) {
@@ -1793,6 +1908,15 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                 }
             }
             if (!intrinsic && !needed) {
+                // TEMP DIAG: TB_OPT_RA_LOGPIN=2 logs ra_split relaxations
+                { static int rl2 = -1;
+                  if (rl2 < 0) { const char* s = getenv("TB_OPT_RA_LOGPIN"); rl2 = s ? atoi(s) : 0; }
+                  if (rl2 >= 2) {
+                      fprintf(stderr, "[ra2-relax] %s V%d leader_gvn=%u n_gvn=%u %s fx=%d\n",
+                          ctx->f->super.name ? ctx->f->super.name : "?", vreg_id, leader, n->gvn,
+                          tb_node_get_name(n->type), fx);
+                  }
+                }
                 mask = ctx->normie_mask[mask->class];
             }
         }
@@ -1812,6 +1936,24 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                 }
             }
         }
+        // TEMP DIAG
+        if (getenv("TB_OPT_RA_LOGPIN") && (n->gvn == 48 || vreg_id == 121)) {
+            fprintf(stderr, "[setmap] n_gvn=%u type=%d leader=%u vreg_id=%d mask_class=%d may_spill=%d\n",
+                n->gvn, n->type, leader, vreg_id,
+                mask ? mask->class : -1, mask ? (int) mask->may_spill : -1);
+        }
+        // PATCH(odin-tilde): a MACH_COPY's rebuilt mask can meet itself into
+        // TB_REG_EMPTY when one endpoint is a non-spillable register mask
+        // and the other is a stack mask (reg_mask_meet returns EMPTY for
+        // cross-class meets unless both may_spill — but a reg<->stack copy
+        // is perfectly emit-able and its live range is a single point).
+        // Without the fallback the vreg is poisoned empty, never colors,
+        // and the split loop re-queues it forever (gc_batch_loss ABI fix:
+        // io@query 34 vregs, 13 mach_copy mask=EMPTY residuals).
+        if (!getenv("TB_RA_NOEMPTYFB") && mask == &TB_REG_EMPTY && n->type == TB_MACH_COPY) { // TEMP BISECT
+            RegMask* own = ctx->constraint(ctx, n, NULL);
+            if (own != NULL && own != &TB_REG_EMPTY) { mask = own; }
+        }
         ctx->vregs[vreg_id].mask = mask;
         ctx->vreg_map[n->gvn] = vreg_id;
     }
@@ -1825,7 +1967,12 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             if (spill >= 0 && ((was_spilled_before >> spill) & 1)) {
                 int vreg_id = ctx->vreg_map[leader];
                 VReg* vreg  = &ctx->vregs[vreg_id];
-                if (vreg->mask->may_spill) {
+                // PATCH(odin-tilde): same purity rule as the other stk_only
+                // pins — never pin a vreg whose class contains a real op
+                // (odin-tank runtime@_make_dynamic_array_len_cap: cmovcc def
+                // mapped into the class at the setmap above, re-pinned here,
+                // inst2 assert).
+                if (vreg->mask->may_spill && spill_pin_is_pure(ctx, ra, &splitter, vreg_id, n)) {
                     TB_OPTDEBUG(REGALLOC3)(printf("  * V%u is now a proper spill\n", vreg_id));
 
                     vreg->spill_cost = INFINITY;

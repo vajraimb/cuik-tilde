@@ -488,10 +488,21 @@ static Lattice* value_call(TB_Function* f, TB_Node* n) {
 
             if (rets) {
                 TB_ASSERT(rets->tag == LATTICE_TUPLE);
-                TB_ASSERT(rets->_elem_count + 1 >= c->proj_count);
-                FOR_N(i, 0, c->proj_count) {
-                    // skip the RPC
-                    l->elems[i] = rets->elems[i + (i >= 2 ? 1 : 0)];
+                // PATCH(odin-tilde): the shifted read below reaches
+                // rets->elems[c->proj_count] (skip-RPC slot), so the tuple
+                // needs proj_count+1 elements. The old bound
+                // (rets->_elem_count + 1 >= proj_count) allowed reading one
+                // slot out of bounds and feeding arena garbage (observed as
+                // (Lattice*)-1) into the call's lattice tuple, crashing
+                // lattice_meet at stage2. On shape mismatch, fall back to
+                // the plain BOT/TOP path below.
+                if (rets->_elem_count < c->proj_count + 1) {
+                    rets = NULL;
+                } else {
+                    FOR_N(i, 0, c->proj_count) {
+                        // skip the RPC
+                        l->elems[i] = rets->elems[i + (i >= 2 ? 1 : 0)];
+                    }
                 }
             }
         }
@@ -708,10 +719,21 @@ static TB_Node* ideal_if(TB_Function* f, TB_Node* n) {
                     TB_Node* selector = tb_alloc_node(f, TB_SELECT, n->inputs[1]->dt, 4, 0);
                     TB_Node* false_node = make_int_node(f, n->inputs[1]->dt, 0);
                     if (index) {
-                        // TB_Node* true_node = make_int_node(f, n->inputs[1]->dt, 1);
-                        // a ? 0 : b
+                        // (a || b) => (a ? 1 : b)
+                        //
+                        // PATCH(odin-tilde): upstream wrote `a ? 0 : b` here
+                        // (true_node commented out) — that inverts the ||
+                        // short-circuit: when a is true the selector yields 0
+                        // and the branch falls to the continuation instead of
+                        // the shared edge. Odin lowers `switch` case lists to
+                        // if-chains that all jump to one merge region, so this
+                        // fold fires constantly at stage>=1 and miscompiled
+                        // e.g. fmt.println(42) (fmt@_fmt_int "unknown base"
+                        // panic with base=10). Upstream frontends apparently
+                        // never feed this shape; the arm must be 1, not 0.
+                        TB_Node* true_node = make_int_node(f, n->inputs[1]->dt, 1);
                         set_input(f, selector, cmp,          1);
-                        set_input(f, selector, false_node,   2);
+                        set_input(f, selector, true_node,    2);
                         set_input(f, selector, n->inputs[1], 3);
                     } else {
                         // a ? b : 0

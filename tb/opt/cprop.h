@@ -150,8 +150,15 @@ static void push_cprop(TB_Function* f, CProp* cprop, TB_Node* n) {
         node->in_cprop = true;
 
         // add to cprop worklist
+        // PATCH(odin-tilde): keep the prev chain valid, the old head's prev
+        // was never set which made cprop_split's middle-removal pick a stale
+        // predecessor and splice another partition's cprop list (later popped
+        // by cprop_propagate => "node->partition == p" assert)
         node->prev_cprop = NULL;
         node->next_cprop = node->partition->cprop;
+        if (node->next_cprop) {
+            node->next_cprop->prev_cprop = node;
+        }
         node->partition->cprop = node;
         node->partition->cprop_count += 1;
 
@@ -224,19 +231,27 @@ static CProp_Partition* cprop_split(TB_Function* f, CProp* cprop, CProp_Partitio
 
             if (node->in_cprop) {
                 // doubly-linked list removal
+                // PATCH(odin-tilde): fix both neighbors and clear the new head's
+                // stale prev; stock code only fixed prev->next (and only when the
+                // stale prev happened to be non-NULL), leaving dangling prev links
+                // that later removals follow into other partitions' lists.
                 CProp_Node* prev_cprop = node->prev_cprop;
                 if (prev_cprop) {
                     prev_cprop->next_cprop = node->next_cprop;
-                }
-                node->prev_cprop = prev_cprop;
-                if (z->cprop == node) {
+                } else {
                     z->cprop = node->next_cprop;
+                }
+                if (node->next_cprop) {
+                    node->next_cprop->prev_cprop = prev_cprop;
                 }
                 z->cprop_count -= 1;
 
                 // add to new cprop worklist
                 node->prev_cprop = NULL;
                 node->next_cprop = new_z->cprop;
+                if (new_z->cprop) {
+                    new_z->cprop->prev_cprop = node;
+                }
                 new_z->cprop = node;
                 new_z->cprop_count += 1;
 
@@ -415,6 +430,32 @@ static void cprop_split_by_what(TB_Function* f, CProp* cprop, CProp_Partition* r
             if (node->leader) {
                 root->follower_count -= 1;
                 p->follower_count += 1;
+            }
+
+            // PATCH(odin-tilde): same invariant as cprop_split — if this node is
+            // sitting on a cprop worklist, move it to the new partition's list.
+            if (node->in_cprop) {
+                CProp_Partition* z = root; // node is on root's cprop list (in_cprop invariant)
+                CProp_Node* prev_cprop = node->prev_cprop;
+                if (prev_cprop) {
+                    prev_cprop->next_cprop = node->next_cprop;
+                } else {
+                    z->cprop = node->next_cprop;
+                }
+                if (node->next_cprop) {
+                    node->next_cprop->prev_cprop = prev_cprop;
+                }
+                z->cprop_count -= 1;
+
+                node->prev_cprop = NULL;
+                node->next_cprop = p->cprop;
+                if (p->cprop) {
+                    p->cprop->prev_cprop = node;
+                }
+                p->cprop = node;
+                p->cprop_count += 1;
+
+                sparse_set_put(&cprop->cprop_ws, p->id);
             }
 
             root->member_count -= 1;

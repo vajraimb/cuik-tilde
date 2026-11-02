@@ -16,6 +16,32 @@ static void node_add_tmps(Ctx* restrict ctx, TB_Node* n);
 static MatchRule match_rules[];
 static MatchRuleID node_isel_raw(Ctx* ctx, TB_Function* f, Set* shared, TB_Node* n, int depth);
 
+// TEMP DIAG: segfault backtrace during codegen
+#include <signal.h>
+#include <unistd.h>
+static void segv_diag_handler(int sig) {
+    static const char msg[] = "SEGV_DIAG\n";
+    write(2, msg, sizeof(msg) - 1);
+    void* bt[32];
+    int bn = backtrace(bt, 32);
+    backtrace_symbols_fd(bt, bn, 2);
+    _exit(1);
+}
+__attribute__((constructor))
+static void segv_diag_install(void) {
+    // run the handler on an alternate signal stack so it still works when
+    // the fault is a stack overflow (e.g. runaway recursion in a graph walk)
+    static char altstack[256 * 1024];
+    stack_t ss = { .ss_sp = altstack, .ss_size = sizeof(altstack) };
+    sigaltstack(&ss, NULL);
+    struct sigaction sa = {
+        .sa_handler = segv_diag_handler,
+        .sa_flags = SA_ONSTACK,
+    };
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+
 // Machine-level peepholes happen once we're emitting ops, you can prune or edit the graph while
 // that's going on, if this function returns true we skip the node we're on.
 static bool node_peephole(Ctx* restrict ctx, TB_Node* n, TB_BasicBlock* bb, int i);
@@ -575,6 +601,31 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
             FOR_USERS(u, n) { worklist_push(ws, USERN(u)); }
         }
 
+        // PATCH(odin-tilde): the x64 DFA has no lowering for (z|s)ext with a
+        // bool result (x64.machine only covers i16/i32/i64 outputs), so an
+        // ext-to-bool survives selection and crashes the RA constraint walk.
+        // These show up when the optimizer retypes sext->zext in place
+        // (peep_int.h) on Odin bool values. bool and i8 are both one byte,
+        // so an ext whose source is bool or i8 is the identity — fold it
+        // away. This must run here rather than in the per-node isel loop:
+        // ext nodes are safe_to_dup, thus not in `shared`, thus never
+        // visited as isel roots — a failed parent match (e.g. a bool-typed
+        // STORE value) leaves them in the graph untouched. (Wider sources
+        // PATCH(odin-tilde): fold same-width extension nodes (zext/sext whose
+        // result datatype equals the source datatype). These are the identity
+        // and the x64 DFA has no lowering for them; worse, plain-ANY operand
+        // slots (e.g. STORE's $val in x64.dsl) accept operand nodes as-is
+        // without selecting them, so such an ext reaches RA unselected and
+        // crashes the constraint walk. This must run in the walker below
+        // rather than over ws->items: safe_to_dup nodes are not in `shared`,
+        // thus never pushed to ws nor visited as isel roots.
+        #define fold_ext_bool(n) \
+            (((n)->type == TB_ZERO_EXT || (n)->type == TB_SIGN_EXT) && \
+             (n)->input_count > 1 && (n)->inputs[1] && \
+             (n)->dt.raw == (n)->inputs[1]->dt.raw \
+                ? (subsume_node(f, (n), (n)->inputs[1]), true) \
+                : false)
+
         // dead node elim
         CUIK_TIMED_BLOCK("dead node elim") {
             for (TB_Node* n; n = worklist_pop(ws), n;) {
@@ -602,6 +653,15 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
                     if (in == NULL) { continue; }
                     if (!set_get(&visited, in->gvn)) {
                         set_put(&visited, in->gvn);
+                        // PATCH(odin-tilde): fold ext-to-bool before it can
+                        // slip into the graph unselected (see fold_ext_bool);
+                        // the slot was rewired to its identity source, so
+                        // descend into that instead.
+                        if (fold_ext_bool(in)) {
+                            in = c.n->inputs[c.index];
+                            if (in == NULL || set_get(&visited, in->gvn)) { continue; }
+                            set_put(&visited, in->gvn);
+                        }
                         aarray_push(walker, (NodeCursor){ in, in->input_count });
                         ready = false;
                         break;
@@ -704,6 +764,45 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
                     subsume_node(f, n, k);
                     n = k;
                 }
+            }
+
+            // PATCH(odin-tilde): x64 isel has no STORE pattern for values with
+            // a TB_TAG_BOOL datatype (x64.dsl guards on TB_IS_INT_OR_PTR, which
+            // starts at I8 — BOOL sorts below it), so a bool store never
+            // matches and the STORE survives to RA, crashing the constraint
+            // walk. bool is one byte in memory, exactly like i8. Route the
+            // byte through a MACH_COPY typed i8: mach nodes need no pattern,
+            // and a plain zext wrapper would NOT work here — STORE's $val is
+            // a plain-ANY operand which isel takes as-is (never selected),
+            // and a zext whose source later retypes to i8 (e.g. a cmp lowered
+            // to setcc, which produces i8) has no lowering rule at all.
+            // The optimizer may fold zext(cmp) back into a bool-typed cmp,
+            // so this must run post-optimization (here).
+            // Known gap, same root cause: LOAD of dt=bool has no pattern
+            // either; left unfixed until it shows up in practice.
+            if (n->type == TB_STORE && n->input_count > 3 && n->inputs[3] &&
+                n->inputs[3]->dt.type == TB_TAG_BOOL) {
+                TB_Node* c = tb_alloc_node(f, TB_MACH_COPY, TB_TYPE_I8, 2, sizeof(TB_NodeMachCopy));
+                set_input(f, c, n->inputs[3], 1);
+                TB_NodeMachCopy* e = TB_NODE_GET_EXTRA(c);
+                e->def = ctx.normie_mask[REG_CLASS_GPR];
+                e->use = ctx.normie_mask[REG_CLASS_GPR];
+                set_input(f, n, c, 3);
+            }
+
+            // PATCH(odin-tilde): safety net for same-width extension nodes
+            // (zext/sext where result and source have the same datatype).
+            // These are the identity and the x64 DFA has no lowering for
+            // them; via plain-ANY operand slots (e.g. STORE's $val) they
+            // reach RA unselected and crash the constraint walk. The walker
+            // pass above catches them before isel; this catches any created
+            // later.
+            if ((n->type == TB_ZERO_EXT || n->type == TB_SIGN_EXT) &&
+                n->input_count > 1 && n->inputs[1] &&
+                n->dt.raw == n->inputs[1]->dt.raw) {
+                TB_Node* src = n->inputs[1];
+                subsume_node(f, n, src);
+                continue;
             }
 
             // create new nodes in the new-space

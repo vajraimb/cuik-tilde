@@ -1,5 +1,6 @@
 #include <hashes.h>
 #include <math.h>
+#include <execinfo.h>
 
 static Lattice TOMBSTONE         = { 0 };
 
@@ -284,15 +285,24 @@ static Lattice* lattice_tuple_from_node(TB_Function* f, TB_Node* n) {
     assert(n->dt.type == TB_TAG_TUPLE);
     TB_Arena* arena = get_permanent_arena(f->super.module);
 
-    // count projs
-    int projs = 0;
+    // PATCH(odin-tilde): projections can be sparse once peepholes kill
+    // unused outputs (e.g. dead control projections of calls), so size the
+    // tuple by the highest live index instead of the live count — the old
+    // code left holes (and wrote out of bounds) for sparse indices, feeding
+    // arena garbage into lattice_meet at stage2.
+    int max_index = -1;
     FOR_USERS(u, n) {
-        if (IS_PROJ(USERN(u))) { projs++; }
+        if (IS_PROJ(USERN(u))) {
+            int index = TB_NODE_GET_EXTRA_T(USERN(u), TB_NodeProj)->index;
+            if (index > max_index) { max_index = index; }
+        }
     }
 
-    size_t size = sizeof(Lattice) + projs*sizeof(Lattice*);
+    size_t size = sizeof(Lattice) + (max_index + 1)*sizeof(Lattice*);
     Lattice* l = tb_arena_alloc(arena, size);
-    *l = (Lattice){ LATTICE_TUPLE, ._elem_count = projs };
+    *l = (Lattice){ LATTICE_TUPLE, ._elem_count = max_index + 1 };
+    // slots without a live projection carry no information
+    FOR_N(i, 0, max_index + 1) { l->elems[i] = &TOP_IN_THE_SKY; }
     FOR_USERS(u, n) {
         if (!IS_PROJ(USERN(u))) { continue; }
         int index = TB_NODE_GET_EXTRA_T(USERN(u), TB_NodeProj)->index;
@@ -451,6 +461,12 @@ static bool lattice_is_float64_nan(Lattice* l) {
 
 // greatest lower bound between a and b, note that we expect interned lattices here
 static Lattice* lattice_meet(TB_Function* f, Lattice* a, Lattice* b) {
+    // TEMP DIAG: catch garbage lattices with a stack trace
+    if (a == (Lattice*)-1 || b == (Lattice*)-1 || (uintptr_t)a < 0x1000 || (uintptr_t)b < 0x1000) {
+        fprintf(stderr, "[lattice_meet] bad ptr: a=%p b=%p\n", (void*)a, (void*)b);
+        { void* bt[24]; int bn = backtrace(bt, 24); backtrace_symbols_fd(bt, bn, 2); }
+        abort();
+    }
     // a ^ a = a
     if (a == b) return a;
 

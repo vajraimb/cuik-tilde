@@ -87,6 +87,11 @@ static void inst2(TB_CGEmitter* restrict e, InstType type, const Val* a, const V
             EMIT1(e, 0x66);
         }
 
+        // TEMP DIAG: report the offending op/operand before dying
+        if (!(b->type == VAL_GPR || b->type == VAL_IMM)) {
+            fprintf(stderr, "[inst2] BAD secondary op: type=%d op=%02x cat=%d a_type=%d a_reg=%d b_type=%d b_reg=%d\n",
+                type, inst->op, inst->cat, a->type, a->reg, b->type, b->reg);
+        }
         assert((b->type == VAL_GPR || b->type == VAL_IMM) && "secondary operand is invalid!");
     } else {
         // movd/movq add the ADDR16 prefix for reasons?

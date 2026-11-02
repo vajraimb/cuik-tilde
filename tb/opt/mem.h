@@ -580,6 +580,13 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                         TB_OPTLOG(MEMORY, printf("    DEAD-STORE %%%u\n", st_mem->gvn));
                         st_mem->type = TB_DEAD_STORE;
                         worklist_push(ctx->dead_worklist, st_mem);
+
+                        // PATCH(odin-tilde): the dead entry stays in the set with
+                        // mem->type == TB_DEAD_STORE which trips the TB_STORE assert
+                        // in the load-elim path (and would forward the stale value).
+                        // Replace it with the new store, which keeps the ordering
+                        // intact (idx is the first entry with offset >= ref.offset).
+                        set->stores[idx] = ref;
                     } else {
                         bool clobber = false;
                         if (idx > 0 && set->stores[idx - 1].offset + set->stores[idx - 1].size > ref.offset) {
@@ -694,8 +701,19 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                 if (set) {
                     int idx = find_aliasing_store(ctx, set, ref.offset);
                     if (idx < set->cnt && set->stores[idx].index == ref.index && set->stores[idx].offset == ref.offset && set->stores[idx].size == ref.size) {
-                        TB_ASSERT(set->stores[idx].mem->type == TB_STORE);
-                        val = set->stores[idx].mem->inputs[3];
+                        TB_Node* st = set->stores[idx].mem;
+                        // PATCH(odin-tilde): after region merges the set is a union
+                        // of per-path stores, the matched store may come from a
+                        // sibling branch that never reaches this load. Forwarding
+                        // it unconditionally miscompiled bufio@writer_write's err
+                        // load at stage2 (unconditional .Negative_Write=11, no
+                        // output). Require the store to dominate the load.
+                        TB_Node* st_ctrl = st->inputs[0];
+                        TB_Node* ld_ctrl = use_n->inputs[0];
+                        if (st_ctrl != NULL && ld_ctrl != NULL && fast_dommy(st_ctrl, ld_ctrl)) {
+                            TB_ASSERT(st->type == TB_STORE);
+                            val = st->inputs[3];
+                        }
                     }
                 }
             } else if (!ctx->renames[cat - 1].is_mem) {

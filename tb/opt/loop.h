@@ -56,6 +56,17 @@ static void loop_add_kid(TB_LoopTree* kid, TB_LoopTree* mom) {
 
 static void loop_compute_depth(TB_LoopTree* loop, int d) {
     while (loop) {
+        // PATCH(odin-tilde): the kid/parent links can form a cycle when a
+        // header is shared between SCC-merged loops (seen in
+        // tank@game_init_random: stack overflow here, thousands of frames
+        // deep). -2 is an on-current-path sentinel (real depths are >= 1);
+        // it must be cleared only AFTER the kid subtree is done, otherwise
+        // self-loops (A.kid == A) slip past the check.
+        if (loop->depth == -2) { break; }
+
+        TB_LoopTree* next = loop->next;
+        loop->depth = -2;
+
         #if TB_OPTDEBUG_LOOP
         FOR_N(i, 0, d) { printf("  "); }
         printf("  Loop%d(depth: %d", loop->id, d);
@@ -65,11 +76,11 @@ static void loop_compute_depth(TB_LoopTree* loop, int d) {
         printf(")\n");
         #endif
 
-        loop->depth = d;
         if (loop->kid) {
             loop_compute_depth(loop->kid, d + 1);
         }
-        loop = loop->next;
+        loop->depth = d;
+        loop = next;
     }
 }
 
@@ -411,6 +422,18 @@ static ArenaArray(TB_Node*) loop_clone_ztc(LoopOpt* ctx, TB_Worklist* ws, size_t
     aarray_for(i, cloned_list) {
         TB_Node* n = cloned_list[i];
         if (n == header || (n->type == TB_PHI && n->inputs[0] == header)) {
+            continue;
+        }
+
+        // PATCH(odin-tilde): never route loads/stores through the rotated
+        // value phi. Their values are already carried iteration-correctly by
+        // the memory edge threading (the original node's mem input resolves
+        // per-edge through the header region). Giving them a value phi pins
+        // the backedge to the load's entry-mem reaching definition — the
+        // stored update never reaches the next iteration and the loop spins
+        // on a stale value (observed: strconv_decimal@shift_right tail loop
+        // after a re-rotation, digit loop never terminates).
+        if (n->type == TB_LOAD || n->type == TB_STORE) {
             continue;
         }
 
@@ -1360,12 +1383,15 @@ static bool loop_opt_remove_safepoints(TB_Function* f, LoopOpt* ctx) {
 // canonicalize regions into natural loop headers (or affine loops) and
 // join all backedges into one pred path on the header
 static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp_ws) {
+    // TEMP DIAG: TB_SKIP_CANON=1 returns immediately, isolating loop_opt_begin
+    if (getenv("TB_SKIP_CANON")) { return false; }
     size_t cloned_cap = (f->node_count * 3) / 2;
     TB_Node** cloned  = cuik_malloc(cloned_cap * sizeof(TB_Node*));
     log_debug("allocating clone array %zu (%zu)", cloned_cap, f->node_count);
 
     bool progress = false;
     DynArray(ptrdiff_t) backedges = NULL;
+    DynArray(TB_Node*) extra_exit_edges = NULL;
     aarray_for(i, ctx->cfg.loops) {
         TB_LoopTree* loop = ctx->cfg.loops[i];
         if (!loop->is_natural) { continue; }
@@ -1386,7 +1412,12 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
 
         // as part of loop simplification we convert backedges (and entries) into one.
         ptrdiff_t single_backedge = backedges[0];
-        if (dyn_array_length(backedges) > 1 || header->input_count > 2) {
+        // TEMP DIAG: TB_SKIP_MERGE=1 disables the multi-backedge region split
+        static int tb_skip_merge = -2;
+        if (tb_skip_merge == -2) { const char* s = getenv("TB_SKIP_MERGE"); tb_skip_merge = s ? atoi(s) : 0; }
+        bool do_merge = (dyn_array_length(backedges) > 1 || header->input_count > 2) && !tb_skip_merge;
+        if (do_merge) {
+            if (getenv("TB_MERGE_DEBUG")) { fprintf(stderr, "[merge-debug] fn=%s loop_hdr=%%%u backedges=%zu header_ic=%zu\n", f->super.name, header->gvn, dyn_array_length(backedges), header->input_count); }
             // we're splitting regions, usually the peeps would join these together but that doesn't apply
             // to loop regions.
             TB_OPTDEBUG(LOOP)(printf("region split on loop header %%%u\n", header->gvn));
@@ -1502,8 +1533,39 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
             // rotated if there's things attached to the backedge cproj, they should've been moved above it.
             TB_Node* header_end = end_of_bb(header);
             TB_Node* exit_proj = get_simple_loop_exit(ctx, loop, header, header_end);
+            // PATCH(odin-tilde): the exit block may have extra predecessors from
+            // inside the loop (e.g. labeled breaks sharing the same exit block).
+            // Rotating would move the escape phis onto a join that those edges
+            // bypass, leaving them undefined on the break path. Pre-scan: bail
+            // out if any extra pred is outside the loop, otherwise remember it
+            // so it can be rerouted through the join.
+            TB_Node* exit_block = exit_proj ? USERN(cfg_next_user(exit_proj)) : NULL;
+            dyn_array_clear(extra_exit_edges);
+            bool exit_block_ok = true;
+            if (exit_block) {
+                FOR_N(j, 0, exit_block->input_count) {
+                    TB_Node* pred = exit_block->inputs[j];
+                    if (pred == exit_proj) { continue; }
+                    TB_LoopTree* pred_loop = nl_table_get(&ctx->loop_map, ctx->ctrl[pred->gvn]);
+                    if (pred_loop == NULL || !loop_inside(loop, pred_loop)) { exit_block_ok = false; break; }
+                    dyn_array_put(extra_exit_edges, pred);
+                }
+            }
             // if (exit_proj && (!cfg_is_cproj(exit_proj) || exit_proj->inputs[0] != header->inputs[1]->inputs[0] || header->inputs[1]->user_count != 1)) {
-            if (exit_proj && (!cfg_is_cproj(exit_proj) || header->inputs[1]->user_count != 1)) {
+            if (getenv("TB_ROT_DEBUG")) { fprintf(stderr, "[rot-debug] fn=%s loop_hdr=%%%u exit_proj=%%%u exit_block=%%%u ic=%zu extras=%zu ok=%d rot=%d\n", f->super.name, header->gvn, exit_proj?exit_proj->gvn:0, exit_block?exit_block->gvn:0, exit_block?exit_block->input_count:0, dyn_array_length(extra_exit_edges), (int)exit_block_ok, (int)(exit_proj && exit_block_ok && (!cfg_is_cproj(exit_proj) || header->inputs[1]->user_count != 1))); }
+            // TEMP DIAG: TB_ROT_SKIP=<gvn> skips rotation of that loop header;
+            // TB_ROT_SKIP_ALL=1 disables rotation entirely (to separate merge vs rotate).
+            static int tb_rot_skip = -3;
+            static int tb_rot_skip_all = -1;
+            if (tb_rot_skip == -3) { const char* s = getenv("TB_ROT_SKIP"); tb_rot_skip = s ? atoi(s) : -2; }
+            if (tb_rot_skip_all == -1) { const char* s = getenv("TB_ROT_SKIP_ALL"); tb_rot_skip_all = s ? atoi(s) : 0; }
+            // PATCH(odin-tilde): skip rotation of freshly-merged multi-backedge loops.
+            // After the backedge-merge above, header->inputs[1] is a REGION (the synthetic
+            // back_region) rather than a control proj. Stock rotation miscompiles these
+            // (seen in tank@backward-2: wrong gradients). Rotation is only an optimization,
+            // so leaving them un-rotated preserves correctness.
+            bool backedge_is_merged_region = !cfg_is_cproj(header->inputs[1]);
+            if (exit_proj && exit_block_ok && !backedge_is_merged_region && !tb_rot_skip_all && tb_rot_skip != (int)header->gvn && (!cfg_is_cproj(exit_proj) || header->inputs[1]->user_count != 1)) {
                 #if 1
                 TB_OPTDEBUG(PASSES)(printf("      * Rotating loop %%%u %p\n", header->gvn, exit_proj));
 
@@ -1558,6 +1620,11 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
                 subsume_node2(f, exit_proj, join);
                 set_input(f, join, exit_loop, 0);
                 set_input(f, join, exit_proj, 1);
+                // PATCH(odin-tilde): the exit block keeps its extra in-loop preds
+                // (labeled breaks). After the subsume its pred list is
+                // [join, e1..ek] which is a normal multi-pred region — no
+                // duplicate edges. The escape phis get an extra wrapper phi
+                // on the exit block instead (see the fixup below).
                 // any non-CFG nodes attached to this exit projection
                 // should be moved down to the new shared join point.
                 // loop_hoist_ops(f, exit_proj, join);
@@ -1617,6 +1684,8 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
 
                     // lazily constructed
                     TB_Node* p = NULL;
+                    // PATCH(odin-tilde): wrapper phi on the exit block, see below
+                    TB_Node* q = NULL;
                     for (size_t i = 0; i < n->user_count;) {
                         TB_Node* un = USERN(&n->users[i]);
                         int ui      = USERI(&n->users[i]);
@@ -1657,6 +1726,23 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
                                         loop_set_ctrl(ctx, p, join);
                                         mark_node(f, p);
 
+                                        // PATCH(odin-tilde): when the exit block has extra
+                                        // in-loop preds (labeled breaks), the join does not
+                                        // dominate it, so out-of-loop uses must see a wrapper
+                                        // phi on the exit block: input for the join edge is p
+                                        // (which already merges ZTC vs rotated-loop values),
+                                        // inputs for the break edges carry the current value n.
+                                        if (dyn_array_length(extra_exit_edges) > 0) {
+                                            size_t eb_n = exit_block->input_count;
+                                            q = tb_alloc_node(f, TB_PHI, n->dt, 1 + eb_n, 0);
+                                            set_input(f, q, exit_block, 0);
+                                            FOR_N(k, 0, eb_n) {
+                                                set_input(f, q, exit_block->inputs[k] == join ? p : n, k + 1);
+                                            }
+                                            loop_set_ctrl(ctx, q, exit_block);
+                                            mark_node(f, q);
+                                        }
+
                                         #if TB_OPTDEBUG_LOOP
                                         printf("   ");
                                         tb_print_dumb_node(NULL, p);
@@ -1672,7 +1758,7 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
                                     printf(", %d)\n", ui);
                                     #endif
 
-                                    set_input(f, un, p, ui);
+                                    set_input(f, un, q ? q : p, ui);
                                     continue;
                                 }
                             }
@@ -1682,6 +1768,7 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
                     }
 
                     if (p != NULL) { mark_node_n_users(f, p); }
+                    if (q != NULL) { mark_node_n_users(f, q); }
                 }
 
                 progress = true;
@@ -1788,5 +1875,6 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
         }
     }
 
+    dyn_array_destroy(extra_exit_edges);
     return progress;
 }
