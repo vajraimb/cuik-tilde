@@ -16,33 +16,19 @@
 // Xn refers to the 64bit variants of the registers,
 // usually the 32bit aliases are Wn (we don't have enums
 // for them because it's not that important, they're equal)
-ENUM(GPR) {
-    R0,  R1,  R2,  R3,  R4,  R5,  R6,  R7,
-    R8,  R9,  R10, R11, R12, R13, R14, R15,
-    R16, R17, R18, R19, R20, R21, R22, R23,
-    R24, R25, R26, R27, R28, R29, R30,
-
-    // frame pointer
-    FP = 29,
-    // link register is basically just the RPC
-    LR = 30,
-    // It's context specific because ARM lmao
-    ZR = 31, SP = 31,
-
-    // not a real gpr
-    GPR_NONE = -1,
+// NOTE(odin-tilde): GPR/FPR 寄存器枚举由 DSL reg_class 生成（见 a64_gen.h，
+// 含 GPR_NONE/FPR_NONE 哨兵），这里只保留别名。
+enum {
+    FP = 29,   // frame pointer
+    LR = 30,   // link register (RPC)
+    SP = 31,   // context specific because ARM lmao (== ZR)
 };
 
-ENUM(FPR) {
-    V0,  V1,  V2,  V3,  V4,  V5,  V6,  V7,
-    V8,  V9, V10, V11, V12, V13, V14, V15,
-    V16, V17, V18, V19, V20, V21, V22, V23,
-    V24, V25, V26, V27, V28, V29, V30, V31,
-    FPR_NONE = -1,
-};
-
+// NOTE(odin-tilde): 成员加 A64_ 前缀，避免与 x64 DSL 生成到 tb_gen_private.h 的
+// Cond 枚举（O/NO/B/NB/E/NE/BE/A/S/NS/P/NP/L/GE/LE/G）撞名。
 ENUM(Condition) {
-    EQ, NE, CS, CC, MI, PL, VS, VC, HI, LS, GE, LT, GT, LE, AL, NV,
+    A64_EQ, A64_NE, A64_CS, A64_CC, A64_MI, A64_PL, A64_VS, A64_VC,
+    A64_HI, A64_LS, A64_GE, A64_LT, A64_GT, A64_LE, A64_AL, A64_NV,
 };
 
 ENUM(ShiftType) {
