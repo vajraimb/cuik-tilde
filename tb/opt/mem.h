@@ -716,9 +716,19 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                         }
                     }
                 }
+                { static const char* dbg = (const char*)-1;
+                  if (dbg == (const char*)-1) { dbg = getenv("TB_DBG_MEMFIX"); }
+                  if (dbg && f->super.name && strstr(f->super.name, dbg)) {
+                      printf("MEMFIX %s LOAD %%%u cat=0 base=%%%u off=%"PRId64" size=%"PRId64" val=%s\n", f->super.name, use_n->gvn, base->gvn, ref.offset, ref.size, val ? "SET" : "null");
+                  } }
             } else if (!ctx->renames[cat - 1].is_mem) {
                 TB_ASSERT(use_n->type == TB_LOAD);
                 val = node_or_poison(f, latest[cat], use_n->dt);
+                { static const char* dbg = (const char*)-1;
+                  if (dbg == (const char*)-1) { dbg = getenv("TB_DBG_MEMFIX"); }
+                  if (dbg && f->super.name && strstr(f->super.name, dbg)) {
+                      printf("MEMFIX %s LOAD %%%u cat=%d latest=%%%u latestdt=%d lddt=%d\n", f->super.name, use_n->gvn, cat, latest[cat] ? latest[cat]->gvn : 0, latest[cat] ? (int)latest[cat]->dt.type : -1, (int)use_n->dt.type);
+                  } }
             }
 
             if (val != NULL) {

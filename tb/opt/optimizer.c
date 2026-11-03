@@ -1782,8 +1782,12 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "Compact"));
         }
 
-        if (dirty & LOOP_DIRTY) {
+        // diagnostic: TB_OPT_NO_LOOPS=1 skips the loop-opt block
+        { static int tb_no_loops = -1;
+          if (tb_no_loops < 0) { const char* s = getenv("TB_OPT_NO_LOOPS"); tb_no_loops = s ? atoi(s) : 0; }
+          if (dirty & LOOP_DIRTY) {
             dirty &= ~LOOP_DIRTY;
+            if (!tb_no_loops) {
 
             TB_OPTLOG(PEEP, printf("=== LOOPS OPTS ===\n"));
             TB_OPTDEBUG(PASSES)(printf("    * Loops\n"));
@@ -1896,6 +1900,8 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             { static const char* tb_dump_ir4 = (const char*)-1;
               if (tb_dump_ir4 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir4 = s; }
               if (tb_dump_ir4 && f->super.name && strstr(f->super.name, tb_dump_ir4)) { printf("=== AFTER LOOP BLOCK (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
+        }
+        }
         }
         // don't worry, we'll scan all the nodes regardless
         worklist_clear(f->worklist);
