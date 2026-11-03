@@ -1573,8 +1573,11 @@ static int odin_rotate_idiom_pass(TB_Function* f, TB_Worklist* ws) {
 // PATCH(odin-tilde, 2026-10-31, stage-1 vectorization experiment): env-gated
 // escape hatch TB_OPT_STAGE to re-test the full pipeline and reproduce the
 // two documented blockers on minimal cases:
-//   unset / "0" — peeps only (original behavior)
-//   "2"         — full tb_opt minus SLP (safe pipeline)
+//   unset / "2" — full tb_opt minus SLP (DEFAULT since 2026-11-03: stage2
+//                 passed the full tank validation & 42/42 regression, and
+//                 gives gradcheck -27% wall time vs peeps-only)
+//   "0"         — peeps only (original behavior; escape hatch back to the
+//                 bit-exact baseline)
 //   "1"         — full tb_opt incl. SLP (reproduces the XMM lane-emitter
 //                 blocker on bytes.index_byte: SLP lane values reach scalar
 //                 integer movs/binops with BYTE/WORD dts)
@@ -1582,7 +1585,8 @@ TB_API bool tb_opt_peeps_only(TB_Function* f, TB_Worklist* ws) {
     static int stage = -1;
     if (stage < 0) {
         const char* s = getenv("TB_OPT_STAGE");
-        stage = s ? atoi(s) : 0;
+        // PATCH(odin-tilde, 2026-11-03): default flipped 0 -> 2 (see block above)
+        stage = s ? atoi(s) : 2;
     }
     // PATCH(odin-tilde): per-function override (driver's degraded recompile
     // after an RA bail); -1 falls back to the env gate.
@@ -1820,8 +1824,11 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             // its lane values stay XMM-resident and reach scalar integer ops
             // (x86_mov/binop with BYTE/WORD dts), which the x64 emitter
             // cannot encode. Stage 2 = full pipeline minus SLP.
+            // PATCH(odin-tilde, 2026-11-03): default flipped 0 -> 2 so that the
+            // default (unset) runs full pipeline WITHOUT SLP; explicit =1 still
+            // reaches this branch and reproduces the blocker.
             static int tb_opt_stage = -1;
-            if (tb_opt_stage < 0) { const char* s = getenv("TB_OPT_STAGE"); tb_opt_stage = s ? atoi(s) : 0; }
+            if (tb_opt_stage < 0) { const char* s = getenv("TB_OPT_STAGE"); tb_opt_stage = s ? atoi(s) : 2; }
             if (tb_opt_stage < 2)
             {
             TB_OPTDEBUG(PASSES)(printf("    * Vectorize\n"));

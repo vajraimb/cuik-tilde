@@ -288,10 +288,49 @@ static TB_Node* insert_range_check(Ctx* ctx, TB_Function* f, TB_Node* n, TB_Node
             }
         }
     } else {
-        TB_Node* r = tb_alloc_node(f, TB_REGION, TB_TYPE_CONTROL, 2, sizeof(TB_NodeRegion));
-        set_input(f, r, default_case, 0);
-        set_input(f, r, early_exit,   1);
-        set_input(f, USERN(&default_succ), r, USERI(&default_succ));
+        // PATCH(odin-tilde, 2026-11-03): the default block's entry region was
+        // folded away (the stage>=1 optimizers merge the empty passthrough
+        // between the switch's default edge and the body), so the first ctrl
+        // consumer of the default edge is a mid-body node — typically an
+        // already-lowered call. Splicing the early-exit merge before that
+        // node (old behavior) lets a range-check miss skip the rest of the
+        // default body: any_switch_probe's `switch v in val { case: ... }`
+        // printed an empty line at stage2 (and crashed in fmt on garbage).
+        // Re-materialize the block entry: a fresh region takes over all ctrl
+        // users of the default edge, then early_exit joins as a second pred,
+        // so both paths execute the whole default body. No mem-phi fixup is
+        // needed (no effectful node sits between the branch and the default
+        // body on either path) and phis are cloned from the default path.
+        // The machine CFG is computed after isel, so late regions are
+        // picked up (upstream's own splice below relies on the same).
+        size_t uc = default_case->user_count;
+        TB_Node** saved = tb_arena_alloc(&f->tmp_arena, (uc + 1) * sizeof(TB_Node*));
+        size_t sn = 0;
+        FOR_USERS(u, default_case) { saved[sn++] = USERN(u); }
+
+        TB_Node* entry = tb_alloc_node(f, TB_REGION, TB_TYPE_CONTROL, 1, sizeof(TB_NodeRegion));
+        set_input(f, entry, default_case, 0);
+        FOR_N(i, 0, sn) {
+            TB_Node* un = saved[i];
+            if (un == entry) { continue; }
+            if (un->type == TB_PHI && un->inputs[0] == default_case) {
+                set_input(f, un, entry, 0);
+                continue;
+            }
+            FOR_N(slot, 0, un->input_count) {
+                if (un->inputs[slot] == default_case) {
+                    set_input(f, un, entry, slot);
+                    break;
+                }
+            }
+        }
+        add_input_late(f, entry, early_exit);
+        FOR_USERS(u, entry) {
+            TB_Node* phi = USERN(u);
+            if (phi->type == TB_PHI && phi->inputs[0] == entry) {
+                add_input_late(f, phi, phi->inputs[1]);
+            }
+        }
     }
 
     return into_table;

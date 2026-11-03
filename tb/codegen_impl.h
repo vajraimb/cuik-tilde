@@ -542,6 +542,10 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
         log_debug("%s: tmp_arena=%.1f KiB, ir_arena=%.1f KiB (pre isel)", f->super.name, tb_arena_current_size(&f->tmp_arena) / 1024.0f, (tb_arena_current_size(&f->arena)) / 1024.0f);
 
         // rewrite the root node
+        // TEMP DIAG: TB_DUMP_ISEL=<substr> prints the IR right before isel
+        { static const char* tb_dump_isel = (const char*)-1;
+          if (tb_dump_isel == (const char*)-1) { const char* s = getenv("TB_DUMP_ISEL"); tb_dump_isel = s; }
+          if (tb_dump_isel && f->super.name && strstr(f->super.name, tb_dump_isel)) { printf("=== PRE ISEL ===\n"); tb_print(f); fflush(stdout); } }
         construct_prologue_epilogue(&ctx, f);
 
         TB_ArenaSavepoint pins_sp = tb_arena_save(&f->tmp_arena);
