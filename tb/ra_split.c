@@ -509,11 +509,17 @@ static uint64_t update_phi_edges(Ctx* ctx, Rogers* ra, RegSplitter* splitter, ui
             if (bb_phis[k]) {
                 // PATCH(odin-tilde): pred_def can be NULL when slot k has no
                 // split def on this edge (the phi-input use itself sets the
-                // live_out bit); keep the program-specified input instead of
-                // writing NULL into the phi
-                if (pred_def != NULL) {
-                    set_input(f, bb_phis[k], pred_def, 1+pred_path);
-                }
+                // live_out bit). The slot then flows through the latch
+                // UNCHANGED, so the backedge input is the phi itself —
+                // self-inputs are explicitly skipped by the phi-pruning pass
+                // below (in == phi). Keeping the previously-written input
+                // (the forward-pred def copied in at phi creation) instead
+                // makes both phi inputs identical, the phi gets pruned to
+                // that single forward def, and the loop-carried assignment
+                // is silently dropped (sort_probe: smoothsort's trinkle
+                // "trusty" bool read its parameter forever, skipping the
+                // cycle+sift fixup pass on every iteration after the first).
+                set_input(f, bb_phis[k], pred_def ? pred_def : bb_phis[k], 1+pred_path);
             }
         } else {
             if (bb_defs[k] == NULL) {

@@ -265,6 +265,32 @@ static void dump_sched(Ctx* restrict ctx) {
     }
 }
 
+// PATCH(odin-tilde): placement helper for reload copies feeding phi
+// inputs. "Right before the use" is correct for ordinary uses, but a
+// phi's position is the TOP of its block — inserting there lands the
+// copy inside a (possibly loop-header) block and it re-executes on
+// every backedge, re-loading the original value over the loop-carried
+// slot content (sort_probe: smoothsort trinkle "trusty" read its
+// parameter forever). Phi-input copies belong at the END of the
+// corresponding predecessor block, like rogers_remat's phi-use path.
+static void insert_phi_edge_copy(Ctx* ctx, TB_Function* f, TB_Node* use_n, int use_i, TB_Node* cpy) {
+    TB_Node* pred = cfg_get_pred(&ctx->cfg, use_n->inputs[0], use_i - 1);
+    TB_BasicBlock* pred_bb = f->scheduled[pred->gvn];
+    TB_ASSERT(pred->input_count != 0 && pred->type != TB_DEAD);
+
+    size_t pos = aarray_length(pred_bb->items);
+    TB_Node* last = pred_bb->items[pos - 1];
+    if (IS_PROJ(last)) { last = last->inputs[0]; }
+    if (tb_node_is_terminator(last)) {
+        pos--;
+        while (pos > 0 && pred_bb->items[pos] != pred_bb->start && IS_PROJ(pred_bb->items[pos])) {
+            pos--;
+        }
+    }
+    aarray_insert(pred_bb->items, pos, cpy);
+    f->scheduled[cpy->gvn] = pred_bb;
+}
+
 static void spill_entire_lifetime(Ctx* ctx, VReg* to_spill, RegMask* spill_mask, TB_Node* n, bool conflict) {
     TB_Function* f = ctx->f;
     TB_OPTDEBUG(REGALLOC)(printf("\x1b[33m#   V%zu: spill  (%%%u)\x1b[0m\n", to_spill - ctx->vregs, n->gvn));
@@ -320,8 +346,20 @@ static void spill_entire_lifetime(Ctx* ctx, VReg* to_spill, RegMask* spill_mask,
             TB_NODE_SET_EXTRA(to_stk, TB_NodeMachCopy, .def = in_mask, .use = xfer_mask);
 
             // schedule the split right before use
-            tb__insert_before(ctx, ctx->f, to_reg, use_n);
-            tb__insert_before(ctx, ctx->f, to_stk, use_n);
+            if (use_n->type == TB_PHI) {
+                insert_phi_edge_copy(ctx, f, use_n, use_i, to_reg);
+                // to_stk reads to_reg: keep the pair in order
+                TB_BasicBlock* pb = f->scheduled[to_reg->gvn];
+                size_t after = 0;
+                aarray_for(t, pb->items) {
+                    if (pb->items[t] == to_reg) { after = t + 1; break; }
+                }
+                aarray_insert(pb->items, after, to_stk);
+                f->scheduled[to_stk->gvn] = pb;
+            } else {
+                tb__insert_before(ctx, ctx->f, to_reg, use_n);
+                tb__insert_before(ctx, ctx->f, to_stk, use_n);
+            }
 
             VReg* to_reg_vreg = tb__set_node_vreg(ctx, to_reg);
             to_reg_vreg->mask = xfer_mask;
@@ -347,7 +385,11 @@ static void spill_entire_lifetime(Ctx* ctx, VReg* to_spill, RegMask* spill_mask,
             }
 
             // schedule the split right before use
-            tb__insert_before(ctx, ctx->f, reload_n, use_n);
+            if (use_n->type == TB_PHI) {
+                insert_phi_edge_copy(ctx, f, use_n, use_i, reload_n);
+            } else {
+                tb__insert_before(ctx, ctx->f, reload_n, use_n);
+            }
             VReg* reload_vreg = tb__set_node_vreg(ctx, reload_n);
             reload_vreg->reg_width = tb__reg_width_from_dt(in_mask->class, reload_n->dt);
             reload_vreg->mask = in_mask;

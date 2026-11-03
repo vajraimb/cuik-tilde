@@ -398,8 +398,30 @@ static void rogers_uncoalesce(Ctx* restrict ctx, Rogers* restrict ra, int x) {
 static TB_Node* rogers_hard_split(Ctx* restrict ctx, Rogers* restrict ra, TB_Node* n, TB_Node* in, RegMask* rm, int vreg_id) {
     TB_Function* f = ctx->f;
 
+    // PATCH(odin-tilde): rematerializing `in` next to a *different* use (e.g.
+    // a phi-edge clone of an lea) copies `in`'s inputs verbatim — but an input
+    // that is a member of n's coalesce group may have been clobbered by
+    // another group member between in's position and the clone's: the group's
+    // location then holds the *latest member def*, not the input value `in`
+    // originally read. sort_probe's smoothsort sift hit exactly this: the
+    // group {head phi, rt=lea(head,-width)} gained a phi-edge lea clone whose
+    // base input was the head phi, but the group location already held rt at
+    // the clone point, so the loop-carried "head" became rt+off. Fall back
+    // to a plain copy of `in` — in's own location still holds the value.
+    bool remat_ok = can_remat(ctx, in);
+    if (remat_ok && ra->uf != NULL && n->gvn < ra->uf_len) {
+        int group = uf_find(ra->uf, ra->uf_len, n->gvn);
+        FOR_N(j, 0, in->input_count) {
+            TB_Node* inp = in->inputs[j];
+            if (inp != NULL && inp->gvn < ra->uf_len && uf_find(ra->uf, ra->uf_len, inp->gvn) == group) {
+                remat_ok = false;
+                break;
+            }
+        }
+    }
+
     TB_Node* move;
-    if (can_remat(ctx, in)) {
+    if (remat_ok) {
         size_t extra = extra_bytes(in);
         move = tb_alloc_node(f, in->type, in->dt, in->input_count, extra);
         memcpy(move->extra, in->extra, extra);

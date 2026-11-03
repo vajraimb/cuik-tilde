@@ -1190,6 +1190,11 @@ static bool node_remat(TB_Node* n) {
         return true;
     } */
 
+    // DIAG EXPERIMENT: disable lea remat to confirm miscompile source.
+    if (getenv("TB_NO_LEA_REMAT")) {
+        return n->type == TB_x86_cmp || n->type == TB_x86_test || n->type == TB_x86_ucomi || n->type == TB_x86_bt;
+    }
+
     return n->type == TB_x86_lea || n->type == TB_x86_cmp || n->type == TB_x86_test || n->type == TB_x86_ucomi || n->type == TB_x86_bt;
 }
 
