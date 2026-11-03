@@ -460,7 +460,26 @@ static uint64_t update_phi_edges(Ctx* ctx, Rogers* ra, RegSplitter* splitter, ui
             } else if (!is_stk && should_stk && splitter->spill_mask[k]) {
                 // spilling.
                 // int spill = spill_map_get2(&splitter->spill_map, pred_def);
-                pred_def = insert_spill(ctx, ra, splitter, &ctx->cfg.blocks[pred_id], pred_def, k, NULL);
+                // PATCH(odin-tilde): never spill-store a vreg whose class has
+                // no spill mask (FLAGS). The store+reload pair would cross
+                // classes (stack <-> FLAGS); the emitter has no
+                // load-flags-from-memory instruction so the reload silently
+                // emits nothing and the consumer (jcc/setcc) runs on stale
+                // flags (fmt@fmt_bit_field took its layout branch from
+                // fmt_value's leftover RFLAGS). Such vregs are remat-able by
+                // construction (the split-decision guard in tb__rogers drops
+                // non-remat no-spill-mask splits), so insert_reload clones
+                // the def (x86_test/x86_cmp) next to each use instead.
+                {
+                    RegMask* def_rm = (pred_def->type == TB_MACH_COPY)
+                        ? TB_NODE_GET_EXTRA_T(pred_def, TB_NodeMachCopy)->def
+                        : ctx->constraint(ctx, pred_def, NULL);
+                    if (def_rm != NULL && ctx->mayspill_mask[def_rm->class] == NULL) {
+                        add_splitter_def(splitter, pred_def);
+                    } else {
+                        pred_def = insert_spill(ctx, ra, splitter, &ctx->cfg.blocks[pred_id], pred_def, k, NULL);
+                    }
+                }
 
                 #if 0
                 if (pred_def->type == TB_MACH_COPY && !reg_mask_is_stack(TB_NODE_GET_EXTRA_T(pred_def, TB_NodeMachCopy)->use)) {
@@ -1376,7 +1395,19 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         if (defer_spill) {
             FOR_N(j, 0, num_spills) {
                 if ((((W & defer_spill & splitter.live_out[bb_id]) >> j) & 1) && bb_defs[j]) {
-                    bb_defs[j] = insert_spill(ctx, ra, &splitter, bb, bb_defs[j], j, NULL);
+                    // PATCH(odin-tilde): same no-spill-mask guard as the
+                    // phi-edge path above — never manufacture a stack<->FLAGS
+                    // spill pair for a remat-able def (test/cmp); insert_reload
+                    // rematerializes it at each use instead.
+                    TB_Node* d = bb_defs[j];
+                    RegMask* def_rm = (d->type == TB_MACH_COPY)
+                        ? TB_NODE_GET_EXTRA_T(d, TB_NodeMachCopy)->def
+                        : ctx->constraint(ctx, d, NULL);
+                    if (def_rm != NULL && ctx->mayspill_mask[def_rm->class] == NULL) {
+                        // keep the remat-able def as-is; no store needed.
+                    } else {
+                        bb_defs[j] = insert_spill(ctx, ra, &splitter, bb, d, j, NULL);
+                    }
                 }
             }
         }

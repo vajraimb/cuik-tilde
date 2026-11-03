@@ -2325,6 +2325,14 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         case TB_MACH_COPY: {
             TB_X86_DataType dt = legalize(n->dt);
 
+            // PATCH(odin-tilde): a copy involving the FLAGS class can never
+            // be emitted (x86 has no mov to/from RFLAGS). If the RA ever
+            // routes one here the instruction silently vanishes and the
+            // flags consumer (jcc/setcc/cmovcc) runs on stale flags — fail
+            // loudly in debug builds instead.
+            TB_NodeMachCopy* mcopy = TB_NODE_GET_EXTRA(n);
+            TB_ASSERT(mcopy->def->class != REG_CLASS_FLAGS && mcopy->use->class != REG_CLASS_FLAGS);
+
             Val dst = op_at(ctx, n);
             Val src = op_at(ctx, n->inputs[1]);
             if (!is_value_match(&dst, &src)) {
