@@ -25,8 +25,17 @@ static ptrdiff_t compatible_with_configs(size_t config_count, AggregateConfig* c
     FOR_N(i, 0, config_count) {
         int64_t max2 = configs[i].offset + configs[i].size;
 
-        if (offset >= configs[i].offset && max <= max2) {
-            // they overlap... but is it a clean overlap?
+        // PATCH(odin-tilde): bail on ANY overlap that isn't an exact match.
+        // The old containment test only rejected a new range extending past
+        // an existing one when it started inside it; a wider access starting
+        // AT the same offset (i64 load over an i32 store config) fell through
+        // as "no match" and got added as a second config. The split then
+        // subsumed the same address node twice, disconnected the load from
+        // both stores, and lane data was silently rebuilt from one store
+        // (simd u64x2 -> u32x2 narrow printed <300, 0> instead of
+        // <300, 70000> at stage2).
+        bool disjoint = (max <= configs[i].offset) || (max2 <= offset);
+        if (!disjoint) {
             if (offset == configs[i].offset && max == max2 && dt.raw == configs[i].dt.raw) {
                 return i;
             }
