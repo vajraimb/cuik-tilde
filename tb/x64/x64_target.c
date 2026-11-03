@@ -2976,7 +2976,14 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 MOVSXD,
             };
 
-            TB_X86_DataType dt = legalize_int(TB_NODE_GET_EXTRA_T(n, X86MemOp)->extra_dt);
+            // The emitted width must be the DESTINATION width (n->dt): it
+            // drives the REX.W bit (i64 results need movsbq/movswq/movslq —
+            // a 32-bit movsbl leaves the upper half of the dst register
+            // stale) and the 0x66 prefix for 16-bit results. extra_dt only
+            // tells us the source is byte-wide; the emitter forces a (possibly
+            // empty) REX for MOVSXB/MOVZXB so byte regs ≥ 4 address
+            // sil/dil/bpl/spl instead of bh/ch/dh.
+            TB_X86_DataType dt = legalize_int(n->dt);
             Val dst = op_at(ctx, n);
             Val src = parse_cisc_operand(ctx, n, NULL, TB_NODE_GET_EXTRA(n));
 

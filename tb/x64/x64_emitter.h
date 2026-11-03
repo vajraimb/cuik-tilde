@@ -125,7 +125,10 @@ static void inst2(TB_CGEmitter* restrict e, InstType type, const Val* a, const V
 
     // if the REX stays as 0x40 then it's default and doesn't need
     // to be here.
-    if (rex_prefix != 0x40 || dt == TB_X86_BYTE || type == MOVZXB) {
+    // PATCH(odin-tilde): MOVSXB must force REX like MOVZXB — without it, a
+    // byte-source register ≥ 4 (sil/dil/bpl/spl) decodes as the legacy
+    // high-byte regs (bh/ch/dh), silently reading the wrong byte.
+    if (rex_prefix != 0x40 || dt == TB_X86_BYTE || type == MOVZXB || type == MOVSXB) {
         EMIT1(e, rex_prefix);
     }
 
