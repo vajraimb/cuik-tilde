@@ -3679,7 +3679,8 @@ int is_pack_op_supported(TB_Function* f, TB_DataType dt, TB_Node* n, int width) 
         case TB_FMUL:
         case TB_FDIV:
         case TB_FMIN:
-        case TB_FMAX: {
+        case TB_FMAX:
+        case TB_VSHUFFLE: {
             return bits == 128 || bits == 256 || bits == 512;
         }
 

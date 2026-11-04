@@ -2216,12 +2216,28 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         case TB_FMIN:
         case TB_FMAX: {
             static_assert(TB_FADD + 1 == TB_FSUB && TB_FSUB + 1 == TB_FMUL && TB_FMUL + 1 == TB_FDIV && TB_FDIV + 1 == TB_FMIN && TB_FMIN + 1 == TB_FMAX, "enum values not consecutive");
-            FPtype type = n->dt.type == TB_TAG_F64 ? Double : Single;
-            FPDP2op  op = (FPDP2op[]){FADD, FSUB, FMUL, FDIV, FMIN, FMAX}[n->type - TB_FADD];
-            int     dst = op_reg_at(ctx, n,            REG_CLASS_FPR);
-            int     lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_FPR);
-            int     rhs = op_reg_at(ctx, n->inputs[2], REG_CLASS_FPR);
-            simd_dp_floatdp2(e, type, op, dst, lhs, rhs);
+            int dst = op_reg_at(ctx, n, REG_CLASS_FPR);
+            int lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_FPR);
+            int rhs = op_reg_at(ctx, n->inputs[2], REG_CLASS_FPR);
+            if (TB_IS_VECTOR_TYPE(n->dt)) {
+                // NEON 三同（three same）向量形式，基模板来自 clang 实测
+                // （v0,v0,v0 定寄存器剥离）：0 Q 0 1110 op sz 1 Rm opcode 1 Rn Rd。
+                // sz = bit22（1=2D，0=4S，仅 f64x2/f32x4 两种 V128 浮点）。
+                uint32_t sz = n->dt.elem_or_addrspace == TB_TAG_F64 ? (1u<<22) : 0;
+                uint32_t base = (uint32_t[]){
+                    [TB_FADD - TB_FADD] = 0x4E20D400,
+                    [TB_FSUB - TB_FADD] = 0x4EA0D400,
+                    [TB_FMUL - TB_FADD] = 0x6E20DC00,
+                    [TB_FDIV - TB_FADD] = 0x6E20FC00,
+                    [TB_FMAX - TB_FADD] = 0x4E20F400,
+                    [TB_FMIN - TB_FADD] = 0x4EA0F400,
+                }[n->type - TB_FADD];
+                EMIT4(e, base | sz | ((uint32_t)rhs<<16) | ((uint32_t)lhs<<5) | (uint32_t)dst);
+            } else {
+                FPtype type = n->dt.type == TB_TAG_F64 ? Double : Single;
+                FPDP2op  op = (FPDP2op[]){FADD, FSUB, FMUL, FDIV, FMIN, FMAX}[n->type - TB_FADD];
+                simd_dp_floatdp2(e, type, op, dst, lhs, rhs);
+            }
             break;
         }
 
@@ -2269,13 +2285,23 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                     a64_ldst_ex(e, true,  n->dt, rt, SP, doff, A64_SCRATCH2);
                     break;
                 }
-                // spill（reg→栈）/ reload（栈→reg），经 SP 寻址
-                bool fp = TB_IS_FLOAT_TYPE(n->dt) || TB_IS_VECTOR_TYPE(n->dt);
+                // spill（reg→栈）/ reload（栈→reg），经 SP 寻址。寄存器类以
+                // vreg 为准：整数可能住在 FPR（如 VBROADCAST 的标量输入），
+                // 此时访存须用同宽度的 SIMD&FP 形式。
+                int cls = (dst_stk ? vsrc : vdst)->class;
                 int64_t off = a64_stk_offset(ctx, (dst_stk ? vdst : vsrc)->assigned);
-                int reg = dst_stk
-                    ? op_reg_at(ctx, src, fp ? REG_CLASS_FPR : REG_CLASS_GPR)
-                    : op_reg_at(ctx, n,   fp ? REG_CLASS_FPR : REG_CLASS_GPR);
-                a64_ldst_ex(e, dst_stk, n->dt, reg, SP, off, A64_SCRATCH);
+                int reg = dst_stk ? op_reg_at(ctx, src, cls) : op_reg_at(ctx, n, cls);
+                TB_DataType mem_dt = n->dt;
+                bool dt_fp = TB_IS_FLOAT_TYPE(mem_dt) || TB_IS_VECTOR_TYPE(mem_dt);
+                if (cls == REG_CLASS_FPR && !dt_fp) {
+                    mem_dt = tb_data_type_bit_size(ctx->module, mem_dt.type) <= 32 ? TB_TYPE_F32 : TB_TYPE_F64;
+                } else if (cls == REG_CLASS_GPR && dt_fp) {
+                    mem_dt = tb_data_type_bit_size(ctx->module, mem_dt.type) <= 32 ? TB_TYPE_I32 : TB_TYPE_I64;
+                }
+                a64_ldst_ex(e, dst_stk, mem_dt, reg, SP, off, A64_SCRATCH);
+                break;
+            }
+            if (vdst->class == vsrc->class && vdst->assigned == vsrc->assigned) {
                 break;
             }
             if (vdst->class == REG_CLASS_GPR && vsrc->class == REG_CLASS_GPR) {
@@ -2283,20 +2309,21 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 dpreg_log_shift(e, wide, ORR, vdst->assigned, vsrc->assigned, ZR, 0, 0);
             } else
                 if (vdst->class == REG_CLASS_FPR && vsrc->class == REG_CLASS_FPR) {
-                FPtype type = src->dt.type == TB_TAG_F64 ? Double : Single;
-                simd_dp_floatdp1(e, type, FMOV, vdst->assigned, vsrc->assigned);
+                // 整寄存器拷贝 mov Vd.16b, Vn.16b（orr 向量形式）：dt 可能是
+                // V128、住在 FPR 的整数或 callee-saved 恢复，fmov s/d 会截断
+                EMIT4(e, 0x4EA01C00u | ((uint32_t)vsrc->assigned << 16) | ((uint32_t)vsrc->assigned << 5) | (uint32_t)vdst->assigned);
             } else
                 if (vdst->class == REG_CLASS_FPR && vsrc->class == REG_CLASS_GPR) {
                 // wide/type 都由 GPR 侧整数宽度决定：配对必须一致
                 // （fmov d,x / fmov s,w）。dst 可能是 V128（SLP 广播的
                 // 标量拷贝），按 dst 的 FP 类型推会拼出 sf=1+S 的
                 // 未分配指令（odin-tank arena_destroy 实撞 SIGILL）。
-                bool   wide = src->dt.type == TB_TAG_I64;
+                bool   wide = tb_data_type_bit_size(ctx->module, src->dt.type) > 32;
                 FPtype type = wide ? Double : Single;
                 simd_dp_float2int(e, wide, type, FMOV_I2F, vdst->assigned, vsrc->assigned, false);
             } else
                 if (vdst->class == REG_CLASS_GPR && vsrc->class == REG_CLASS_FPR) {
-                bool   wide = dst->dt.type == TB_TAG_I64;
+                bool   wide = tb_data_type_bit_size(ctx->module, dst->dt.type) > 32;
                 FPtype type = wide ? Double : Single;
                 simd_dp_float2int(e, wide, type, FMOV_F2I, vdst->assigned, vsrc->assigned, false);
             }
@@ -2574,6 +2601,16 @@ static int is_pack_op_supported(TB_Function* f, TB_DataType dt, TB_Node* n, int 
         case TB_LOAD:
         case TB_STORE:
         return bits == 128;
+
+        // 浮点算术：NEON 三同 Q 形式已发射（f32x4/f64x2）
+        case TB_FADD:
+        case TB_FSUB:
+        case TB_FMUL:
+        case TB_FDIV:
+        case TB_FMIN:
+        case TB_FMAX:
+        return bits == 128 && (dt.type == TB_TAG_F32 || dt.type == TB_TAG_F64);
+
         default:
         return 0;
     }

@@ -114,6 +114,63 @@ static bool is_adjacent_ref(MemRef a, MemRef b) {
     return a.base == b.base && a.size == b.size && (a.offset + a.size == b.offset || b.offset + b.size == a.offset);
 }
 
+// PATCH(odin-tilde): 同 base 同大小的相邻偏移（纯几何相邻，不看 mem 链）。
+static bool same_index(MemRef a, MemRef b) {
+    if (a.index_count != b.index_count) { return false; }
+    FOR_N(i, 0, a.index_count) {
+        if (a.index[i] != b.index[i] || a.stride[i] != b.stride[i]) { return false; }
+    }
+    return true;
+}
+
+static bool is_offset_adjacent(MemRef a, MemRef b) {
+    return a.base == b.base && same_index(a, b) && a.size == b.size && a.offset + a.size == b.offset;
+}
+
+// PATCH(odin-tilde): load 对的 mem 链回溯。从 later 的 mem 输入沿链回溯到
+// earlier 的 mem 输入：沿途遇到 STORE 检查是否同 base 区间重叠（重叠=危险），
+// 遇到 LOAD 继续回溯，遇到 call/memcpy/atomic 等无法识别的有效节点或链断开
+// （回溯不到 target）一律视为危险。load 自己不写内存，链上唯一的危险源是
+// 中间对同地址写的 store——比独立集检查（independent()）经 mem 链的误判
+// 精确（independent 会把同链上的 load-load 判成依赖）。
+static bool bases_never_alias(TB_Node* a, TB_Node* b) {
+    if (a == NULL || b == NULL || a == b) { return false; }
+    bool a_obj = a->type == TB_LOCAL || a->type == TB_SYMBOL;
+    bool b_obj = b->type == TB_LOCAL || b->type == TB_SYMBOL;
+    if (a->type == TB_SYMBOL && b->type == TB_SYMBOL) {
+        return TB_NODE_GET_EXTRA_T(a, TB_NodeSymbol)->sym != TB_NODE_GET_EXTRA_T(b, TB_NodeSymbol)->sym;
+    }
+    return a_obj && b_obj;
+}
+
+static bool loads_chain_hazard(TB_Function* f, TB_Node* earlier, TB_Node* later) {
+    TB_Node* target = earlier->inputs[1];
+    TB_Node* curr = later->inputs[1];
+    MemRef ea = compute_mem_ref(f, earlier);
+    MemRef la = compute_mem_ref(f, later);
+    for (size_t steps = 0; curr != NULL && steps < f->node_count; steps++) {
+        if (curr == target) { return false; }
+        if (curr->type == TB_STORE) {
+            MemRef s = compute_mem_ref(f, curr);
+            if (s.base == ea.base) {
+                if (!same_index(s, ea)) { return true; }
+                bool overlap_a = s.offset < ea.offset + ea.size && ea.offset < s.offset + s.size;
+                bool overlap_b = s.offset < la.offset + la.size && la.offset < s.offset + s.size;
+                if (overlap_a || overlap_b) { return true; }
+            } else if (!bases_never_alias(s.base, ea.base)) {
+                // 不同的指针参数/派生指针可能互为别名
+                return true;
+            }
+            curr = curr->inputs[1];
+        } else if (curr->type == TB_LOAD) {
+            curr = curr->inputs[1];
+        } else {
+            return true; // 无法识别的有效节点（call/memcpy/atomic/入口投影等）
+        }
+    }
+    return true; // 链分叉/回溯不到
+}
+
 static bool can_pack(TB_Function* f, PairSet* pairs, TB_Node* a, TB_Node* b, TB_Node* top) {
     if (a == b || pairs->l_map[a->gvn] || pairs->r_map[b->gvn]) {
         return false;
@@ -124,21 +181,27 @@ static bool can_pack(TB_Function* f, PairSet* pairs, TB_Node* a, TB_Node* b, TB_
         isomorphic(a, b) &&
         a->inputs[0] == b->inputs[0])
     {
-        // stores don't do independence checks, packable ones are actually dependent
-        // it's just treated as a special kind (adjacent and chained up nicely)
-        if (a->type != TB_STORE && !independent(f, pairs, a, b)) {
-            return false;
-        }
-
-        // if it's a memory op then it should share a base, we can't do sparse loads
         if (a->type == TB_LOAD || a->type == TB_STORE) {
             MemRef aa = compute_mem_ref(f, a);
             MemRef bb = compute_mem_ref(f, b);
-            if (!is_adjacent_ref(aa, bb)) {
-                return false;
+            if (!is_offset_adjacent(aa, bb)) { return false; }
+
+            if (a->type == TB_LOAD) {
+                // 同 mem 输入（同链相邻）天然安全；跨 mem 链（中间隔了其他
+                // 访存）靠链回溯确认中间没有写同地址的 store。
+                if (a->inputs[1] != b->inputs[1] && loads_chain_hazard(f, a, b)) { return false; }
+            } else {
+                // store：同 lane（同 mem 输入，TB splitmem 语义保证可任意
+                // 重排）或链式相邻均可合并为单个向量 store。
+                if (a->inputs[1] != b->inputs[1] && a != b->inputs[1] && b != a->inputs[1]) { return false; }
             }
+            return true;
         }
 
+        // 纯数据运算：独立性检查
+        if (!independent(f, pairs, a, b)) {
+            return false;
+        }
         return true;
     }
 
@@ -385,10 +448,21 @@ static bool viable_vector(TB_Function* f, NL_Table* ops, TB_DataType v_dt, Vecto
     }
 
     // all have to share the same vector source... for now
+    bool ordered = find_vector_index(leader_op, leader) == 0;
     FOR_N(i, 1, op->width) {
         TB_Node* src = op->ops[i]->inputs[index];
         VectorOp* src_op = nl_table_get(ops, src);
         if (src_op != leader_op) {
+            return false;
+        }
+        if (find_vector_index(src_op, src) != i) { ordered = false; }
+    }
+
+    // 乱序需要 VSHUFFLE，后端不支持就不能连
+    if (!ordered) {
+        TB_Node probe = { .type = TB_VSHUFFLE };
+        TB_DataType elem_dt = slp_node_data_type(op->ops[0]);
+        if (!f->super.module->codegen->is_pack_op_supported(f, elem_dt, &probe, op->width)) {
             return false;
         }
     }
@@ -469,11 +543,15 @@ static void schedule_packs(TB_Function* f, NL_Table* ops, Set* visited, DynArray
     set_put(visited, op->id);
 
     // push inputs first
+    int type = op->ops[0]->type;
     FOR_N(j, 1, op->ops[0]->input_count) {
         FOR_N(i, 0, op->width) {
+            // 向量 load 只挂在 lane 0 的 mem 上（其余 lane 的 mem 依赖已由
+            // loads_chain_hazard 证明可越过），否则 load/store 包之间会成环
+            if (j == 1 && type == TB_LOAD && i > 0) { continue; }
             if (op->ops[i]->inputs[j]) {
                 VectorOp* in = nl_table_get(ops, op->ops[i]->inputs[j]);
-                if (in) {
+                if (in && in != op) {
                     schedule_packs(f, ops, visited, schedule, in);
                 }
             }
@@ -763,7 +841,6 @@ bool compile_packs(TB_Function* f, PairSet* pairs, TB_LoopTree* loop) {
         if (op == NULL) {
             continue;
         }
-
         // convert these ops into a packed op
         TB_Node* first = op->ops[0];
         TB_DataType v_dt = op->v_dt;
@@ -807,7 +884,7 @@ bool compile_packs(TB_Function* f, PairSet* pairs, TB_LoopTree* loop) {
             }
 
             subsume_node2(f, last, n);
-        } else if (first->type == TB_FADD || first->type == TB_FMUL) {
+        } else if (first->type >= TB_FADD && first->type <= TB_FMAX) {
             TB_Node* lhs = gimme_vector(f, &ops, op, 1);
             TB_Node* rhs = gimme_vector(f, &ops, op, 2);
 

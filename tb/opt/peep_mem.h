@@ -332,6 +332,25 @@ static TB_Node* ideal_load(TB_Function* f, TB_Node* n) {
             return n;
         } */
 
+        // 根对象是两个不同的 LOCAL/SYMBOL 时绝不重叠
+        TB_Node* ld_root = addr;
+        while (ld_root->type == TB_PTR_OFFSET) { ld_root = ld_root->inputs[1]; }
+        TB_Node* st_root = mem->inputs[2];
+        while (st_root->type == TB_PTR_OFFSET) { st_root = st_root->inputs[1]; }
+        bool ld_obj = ld_root->type == TB_LOCAL || ld_root->type == TB_SYMBOL;
+        bool st_obj = st_root->type == TB_LOCAL || st_root->type == TB_SYMBOL;
+        if (ld_obj && st_obj && ld_root != st_root) {
+            bool distinct = true;
+            if (ld_root->type == TB_SYMBOL && st_root->type == TB_SYMBOL) {
+                distinct = TB_NODE_GET_EXTRA_T(ld_root, TB_NodeSymbol)->sym != TB_NODE_GET_EXTRA_T(st_root, TB_NodeSymbol)->sym;
+            }
+            if (distinct) {
+                set_input(f, n, mem->inputs[1], 1);
+                mark_node_n_users(f, mem);
+                return n;
+            }
+        }
+
         ArrayAccess A = compute_array_access(f, n);
         ArrayAccess B = compute_array_access(f, n->inputs[1]);
 
