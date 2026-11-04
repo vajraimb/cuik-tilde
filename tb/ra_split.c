@@ -1126,7 +1126,15 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             if (nl_table_get(&splitter.uses_spill, n)) {
                 uuu++;
 
+                // PATCH(odin-tilde): input_cap sweeps past input_count into the
+                // extra-dep area (scheduling anti-dependency edges added by
+                // add_input_late, see TB_Node in tb.h). Those edges are
+                // ordering-only, not value uses — re-attaching a split def to
+                // them hits the slot < input_count assertion in set_input.
                 FOR_N(k, 1, n->input_cap) {
+                    if (k >= n->input_count) {
+                        break;
+                    }
                     TB_Node* in = n->inputs[k];
                     if (in == NULL) {
                         continue;

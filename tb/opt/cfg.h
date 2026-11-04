@@ -17,6 +17,16 @@ typedef struct Block {
 static TB_Node* cfg_next_control0(TB_Node* n) {
     FOR_USERS(u, n) {
         if (USERI(u) == 0 && cfg_is_control(USERN(u))) {
+            // PATCH(odin-tilde): odin lowering can leave constant-conditioned
+            // if/branch projections with zero users in the graph (the SCCP
+            // fold that would kill them hasn't run yet, or ran with stale
+            // lattice). end_of_bb() walking onto such a dead projection makes
+            // create_block() treat it as a BB end with no successor and hit
+            // the tb_todo() below. A projection nobody uses is dead — skip it
+            // and keep walking toward the live successor.
+            if (USERN(u)->user_count == 0 && IS_PROJ(USERN(u))) {
+                continue;
+            }
             return USERN(u);
         }
     }
@@ -61,12 +71,20 @@ static Block* create_block(TB_Arena* arena, TB_Function* f, TB_Node* n) {
         .end    = end,
         .succ_i = succ_count,
     };
+    // PATCH(odin-tilde): zero the succ array — dead projections skipped below
+    // (and unused slots of sparse tuples) must read as NULL, not arena garbage.
+    memset(top->succ, 0, succ_count*sizeof(TB_Node*));
 
     if (tb_node_is_fork_ctrl(end)) {
         // this does imply the successors take up the bottom indices on the tuple... idk if thats
         // necessarily a problem tho.
         FOR_USERS(u, end) {
             if (cfg_is_cproj(USERN(u))) {
+                // PATCH(odin-tilde): odin lowering can leave constant-folded
+                // if/branch projections with zero users in the graph (the SCCP
+                // fold hasn't cleaned them yet). They are not successors of
+                // anything — skip instead of making a block for a dead end.
+                if (USERN(u)->user_count == 0) { continue; }
                 int index = TB_NODE_GET_EXTRA_T(USERN(u), TB_NodeProj)->index;
                 top->succ[index] = cfg_next_bb_after_cproj(USERN(u));
             }
@@ -112,7 +130,8 @@ TB_CFG tb_compute_cfg(TB_Function* f, TB_Worklist* ws, TB_Arena* arena, bool dom
         if (top->succ_i > 0) {
             // push next unvisited succ
             TB_Node* succ = top->succ[--top->succ_i];
-            if (!worklist_test_n_set(ws, succ)) {
+            // PATCH(odin-tilde): NULL = dead/unfilled successor slot (see above)
+            if (succ != NULL && !worklist_test_n_set(ws, succ)) {
                 Block* new_top = create_block(tmp_arena, f, succ);
                 new_top->parent = top;
                 new_top->pre_index = pre_n++;

@@ -461,12 +461,6 @@ static bool lattice_is_float64_nan(Lattice* l) {
 
 // greatest lower bound between a and b, note that we expect interned lattices here
 static Lattice* lattice_meet(TB_Function* f, Lattice* a, Lattice* b) {
-    // TEMP DIAG: catch garbage lattices with a stack trace
-    if (a == (Lattice*)-1 || b == (Lattice*)-1 || (uintptr_t)a < 0x1000 || (uintptr_t)b < 0x1000) {
-        fprintf(stderr, "[lattice_meet] bad ptr: a=%p b=%p\n", (void*)a, (void*)b);
-        { void* bt[24]; int bn = backtrace(bt, 24); backtrace_symbols_fd(bt, bn, 2); }
-        abort();
-    }
     // a ^ a = a
     if (a == b) return a;
 

@@ -24,12 +24,8 @@ enum {
     SP = 31,   // context specific because ARM lmao (== ZR)
 };
 
-// NOTE(odin-tilde): 成员加 A64_ 前缀，避免与 x64 DSL 生成到 tb_gen_private.h 的
-// Cond 枚举（O/NO/B/NB/E/NE/BE/A/S/NS/P/NP/L/GE/LE/G）撞名。
-ENUM(Condition) {
-    A64_EQ, A64_NE, A64_CS, A64_CC, A64_MI, A64_PL, A64_VS, A64_VC,
-    A64_HI, A64_LS, A64_GE, A64_LT, A64_GT, A64_LE, A64_AL, A64_NV,
-};
+// NOTE(odin-tilde)：Condition 枚举由 DSL 生成（见 a64.machine 的 (enum Condition ...)，
+// 落在 tb_gen_private.h，供生成代码与 emitter 共同使用）。
 
 ENUM(ShiftType) {
     LSL, LSR, ASR, ROR,
@@ -324,7 +320,7 @@ static void dpreg_dp_2src(TB_CGEmitter* restrict e, bool wide, DPR2op op, GPR Rd
     inst |= PUT_BITS(16, 5, Rm);
     inst |= PUT_BITS(10, 6, op);
     inst |= PUT_BITS( 5, 5, Rn);
-    inst |= PUT_BITS( 0, 5, Rn);
+    inst |= PUT_BITS( 0, 5, Rd);
     inst &= ~MASK_dpreg_dp_2src;
     inst |=  BITS_dpreg_dp_2src;
     EMIT4(e, inst);
@@ -425,6 +421,21 @@ static void dpreg_addsub_shift(TB_CGEmitter* restrict e, bool wide, AddOp op, GP
     inst |= PUT_BITS( 0, 5, Rd);
     inst &= ~MASK_dpreg_addsub_shift;
     inst |=  BITS_dpreg_addsub_shift;
+    EMIT4(e, inst);
+}
+
+/* add/sub (extended register, 64-bit) —— Rn 允许 SP（shifted register 的
+    31 是 ZR，extended 的 31 是 SP，这是两者唯一差别）。Rm 按 UXTX 恒等
+    扩展。模板 0x0B206000 取自 clang `add x0,x0,w1,sxtw`=0x8B21C000 实测：
+    S=0、01011@28-24、00@23-22、option=UXTX(3)@15-13、imm3=0@12-10。
+*/
+static void dpreg_addsub_ext64(TB_CGEmitter* restrict e, AddOp op, GPR Rd, GPR Rn, GPR Rm) {
+    uint32_t inst = 0x0B206000u;
+    inst |= PUT_BITS(31, 1, 1);   // 64-bit only
+    inst |= PUT_BITS(30, 1, op);
+    inst |= PUT_BITS(16, 5, Rm);
+    inst |= PUT_BITS( 5, 5, Rn);
+    inst |= PUT_BITS( 0, 5, Rd);
     EMIT4(e, inst);
 }
 
@@ -604,6 +615,7 @@ ENUM(FPDP1op) {
     //       oooooo
     FMOV = 0b000000,
     FNEG = 0b000010,
+    FSQRT = 0b000011,
 };
 static void simd_dp_floatdp1(TB_CGEmitter* restrict e, FPtype type, FPDP1op op, GPR Rd, GPR Rn) {
     uint32_t inst = 0;
@@ -658,8 +670,8 @@ static void simd_dp_floatdp2(TB_CGEmitter* restrict e, FPtype type, FPDP2op op, 
     inst |= PUT_BITS(12, 4, op);
     inst |= PUT_BITS( 5, 5, Rn);
     inst |= PUT_BITS( 0, 5, Rd);
-    inst &= ~MASK_simd_dp_floatdp1;
-    inst |=  BITS_simd_dp_floatdp1;
+    inst &= ~MASK_simd_dp_floatdp2;
+    inst |=  BITS_simd_dp_floatdp2;
     EMIT4(e, inst);
 }
 
@@ -683,6 +695,119 @@ static void ldst_loadlit(TB_CGEmitter* restrict e, bool wide, bool fp, GPR Rt, i
     inst |= PUT_BITS( 0,  5, Rt);
     inst &= ~MASK_ldst_loadlit;
     inst |=  BITS_ldst_loadlit;
+    EMIT4(e, inst);
+}
+
+////////////////
+// NOTE(odin-tilde): 以下为阶段2补充的 load/store 与浮点编码函数。
+////////////////
+
+/* load/store register (unsigned immediate, scaled)
+    1x 111 0 01 iiiiiiiiiiii nnnnn ttttt
+    [31:30] size (log2 bytes), [26] V (0=GPR,1=SIMD&FP),
+    [23:22] opc: 00=store, 01=load zero-extend,
+                  10=load sign-extend to 32 (或 LDRSW), 11=load sign-extend to 64,
+    imm12 = offset >> size（caller 保证对齐）, Rn=base（允许 SP）, Rt
+    覆盖 STRB..STRX / LDRB..LDRX / LDRSB/SH/SW（符号扩展）。
+*/
+static void ldst_mem_imm(TB_CGEmitter* restrict e, bool fp, int size_log2, int opc, GPR Rt, GPR Rn, uint32_t imm12) {
+    uint32_t inst = 0;
+    inst |= PUT_BITS(30,  2, size_log2);
+    inst |= PUT_BITS(26,  1, fp);
+    inst |= PUT_BITS(22,  2, opc);
+    inst |= PUT_BITS(10, 12, imm12);
+    inst |= PUT_BITS( 5,  5, Rn);
+    inst |= PUT_BITS( 0,  5, Rt);
+    // LDR X0,[X1] = 0xF9400020, STR X0,[X1] = 0xF9000020
+    inst |= 0x39000000;
+    EMIT4(e, inst);
+}
+
+/* load/store register (unscaled 9-bit signed offset, LDUR/STUR 家族)
+    1x 111 0 00 0 iiiiiiiiii 00 nnnnn ttttt
+    与 ldst_mem_imm 相同的 size/opc 语义，但 offset 为 -256..255 的原始字节数。
+*/
+static void ldst_mem_unscaled(TB_CGEmitter* restrict e, bool fp, int size_log2, int opc, GPR Rt, GPR Rn, int16_t simm9) {
+    uint32_t inst = 0;
+    inst |= PUT_BITS(30,  2, size_log2);
+    inst |= PUT_BITS(26,  1, fp);
+    inst |= PUT_BITS(22,  2, opc);
+    inst |= PUT_BITS(12,  9, simm9 & 0x1FF);
+    inst |= PUT_BITS( 5,  5, Rn);
+    inst |= PUT_BITS( 0,  5, Rt);
+    // LDUR X0,[X1] = 0xF8400020, STUR X0,[X1] = 0xF8000020
+    inst |= 0x38000000;
+    EMIT4(e, inst);
+}
+
+/* floating-point compare
+    000 11110 tt 1 mmmmm 0010 00 nnnnn 000000
+    type: 00=single 01=double
+    结果写 NZCV：a>b→N0 Z0 C1 V0；a==b→N0 Z1 C1 V0；
+              a<b→N1 Z0 C0 V0；unordered→N0 Z0 C1 V1
+    因此 GT=GE? 映射：FLT→MI、FLE→LS、FEQ→EQ、FNE→NE、FGT→GT、FGE→GE。
+*/
+static void simd_dp_fcmp(TB_CGEmitter* restrict e, FPtype type, GPR Rn, GPR Rm) {
+    uint32_t inst = 0;
+    inst |= PUT_BITS(22,  2, type);
+    inst |= PUT_BITS(21,  1, 1);
+    inst |= PUT_BITS(16,  5, Rm);
+    inst |= PUT_BITS( 5,  5, Rn);
+    // FCMP S0,S0 = 0x1E202000 / D0,D0 = 0x1E602000（基值含 bit21+bit13）
+    inst |= 0x1E202000;
+    EMIT4(e, inst);
+}
+
+/* floating-point conditional select
+    000 11110 tt 0 mmmmm cccc 11 nnnnn ddddd
+*/
+static void simd_dp_fcsel(TB_CGEmitter* restrict e, FPtype type, GPR Rd, GPR Rn, GPR Rm, Condition cond) {
+    uint32_t inst = 0;
+    inst |= PUT_BITS(22,  2, type);
+    inst |= PUT_BITS(21,  1, 1);
+    inst |= PUT_BITS(16,  5, Rm);
+    inst |= PUT_BITS(12,  4, cond);
+    inst |= PUT_BITS(10,  2, 0b11);
+    inst |= PUT_BITS( 5,  5, Rn);
+    inst |= PUT_BITS( 0,  5, Rd);
+    // FCSEL S0,S0,S0,EQ = 0x1E200C00
+    inst |= 0x1E200400;
+    EMIT4(e, inst);
+}
+
+/* floating-point convert (scalar, S<->D)
+    000 11110 0x10001 000000 nnnnn ddddd
+    fcvt_sd: double → single；fcvt_ds: single → double
+*/
+static void simd_dp_fcvt_sd(TB_CGEmitter* restrict e, GPR Rd, GPR Rn) { // d = (float) n(double)
+    uint32_t inst = 0x1E624000;
+    inst |= PUT_BITS( 5, 5, Rn);
+    inst |= PUT_BITS( 0, 5, Rd);
+    EMIT4(e, inst);
+}
+static void simd_dp_fcvt_ds(TB_CGEmitter* restrict e, GPR Rd, GPR Rn) { // d = (double) n(single)
+    uint32_t inst = 0x1E22C000;
+    inst |= PUT_BITS( 5, 5, Rn);
+    inst |= PUT_BITS( 0, 5, Rd);
+    EMIT4(e, inst);
+}
+
+/* bitfield move (SBFM/UBFM)：符号/零扩展、位提取
+    x 10 100110 N immr imms nnnnn ddddd
+    N = wide；UBFM: opc=10, SBFM: opc=00
+    常用别名：UXTB=UBFM #0,#7  SXTB=SBFM #0,#7  UXTH #0,#15  SXTH #0,#15
+              UXTW/SXTW #0,#31（64 位形式）
+*/
+static void dpimm_bitfield(TB_CGEmitter* restrict e, bool wide, bool sign, GPR Rd, GPR Rn, uint8_t immr, uint8_t imms) {
+    uint32_t inst = 0;
+    inst |= PUT_BITS(31,  1, wide);
+    inst |= PUT_BITS(22,  1, wide); // N
+    inst |= PUT_BITS(16,  6, immr);
+    inst |= PUT_BITS(10,  6, imms);
+    inst |= PUT_BITS( 5,  5, Rn);
+    inst |= PUT_BITS( 0,  5, Rd);
+    // UBFM W0,W0,#0,#7 = 0x53001C00；SBFM X0,X0,#0,#31 = 0x93407C00
+    inst |= sign ? 0x13000000 : 0x53000000;
     EMIT4(e, inst);
 }
 

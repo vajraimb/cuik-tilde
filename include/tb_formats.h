@@ -27,6 +27,9 @@ typedef enum {
     // Aarch64 only
     TB_OBJECT_RELOC_BRANCH26, // 26bit displacement for B and BL instructions
     TB_OBJECT_RELOC_REL21,    // for ADR instructions
+    TB_OBJECT_RELOC_PAGEOFF12, // low 12 bits of a page for ADD (imm12) instructions
+    TB_OBJECT_RELOC_GOT_PAGE21,     // adrp Xt, sym@GOTPAGE
+    TB_OBJECT_RELOC_GOT_PAGEOFF12,  // ldr Xt, [Xt, sym@GOTPAGEOFF]
 
     // TODO(NeGate): fill in the rest of this later
 } TB_ObjectRelocType;

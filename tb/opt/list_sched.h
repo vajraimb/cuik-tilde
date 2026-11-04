@@ -256,51 +256,77 @@ void tb_list_scheduler(TB_Function* f, TB_CFG* cfg, TB_Worklist* ws, TB_BasicBlo
         #endif
 
         // Cycle detection
+        // PATCH(odin-tilde, 2026-11-04): 原实现用 "DFS users-walk 弹出序 +
+        // depth 数组" 判环，但 DFS 弹出序对跨边（同一节点经多条路径到达）
+        // 不是逆拓扑序——odin-tank fmt_bit_set 里 local 被 isel 重挂
+        // input 后 users 顺序变化，load 先经 addr 链入栈、memcpy 后经
+        // mem 链入栈，导致输入先于依赖弹出、depth 未写（-1）→ 误报
+        // CYCLE 并 __debugbreak。改为 Kahn 拓扑排序做真环检测；边集定义
+        // 与原检查一致（块内 input 边含 extra 反依赖，排除 MACH_TEMP，
+        // PHI/REGION 不参与）。
         {
-            bool cycle = false;
-            FOR_REV_N(i, 0, cnt) {
-                TB_Node* n = ordered[i];
-                int max_depth = 0;
+            int* indeg = tb_arena_alloc(&f->tmp_arena, f->node_count * sizeof(int));
+            memset(indeg, 0, f->node_count * sizeof(int));
 
+            int cnt2 = 0;
+            aarray_for(i, bb->items) {
+                TB_Node* n = bb->items[i];
+                if (f->scheduled[n->gvn] != bb) { continue; }
                 if (n->type != TB_PHI && !NODE_ISA(n, REGION)) {
-                    FOR_N(i, 0, n->input_cap) {
-                        TB_Node* in = n->inputs[i];
+                    FOR_N(j, 0, n->input_cap) {
+                        TB_Node* in = n->inputs[j];
                         if (in && in->type != TB_MACH_TEMP && f->scheduled[in->gvn] == bb) {
-                            int d = depth[in->gvn];
-                            #ifndef NDEBUG
-                            if (d < 0) {
-                                tb_print_dumb(f);
-                                printf("CYCLE DETECTED BETWEEN %%%u and %%%u!!!\n", n->gvn, in->gvn);
-                                cycle = true;
-                            }
-                            #endif
-                            max_depth = TB_MAX(max_depth, d);
+                            indeg[n->gvn] += 1;
                         }
                     }
                 }
-
-                depth[n->gvn] = max_depth + 1;
+                ordered[cnt2++] = n;
+                depth[n->gvn] = -1;
             }
 
-            if (cycle) {
-                printf("digraph G {\n");
-                FOR_REV_N(i, 0, cnt) {
-                    TB_Node* n = ordered[i];
-                    printf("N%d [label=\"%%%u: %s\"]\n", n->gvn, n->gvn, tb_node_get_name(n->type));
+            int* queue = tb_arena_alloc(&f->tmp_arena, cnt2 * sizeof(int));
+            int qh = 0, qt = 0;
+            FOR_N(i, 0, cnt2) {
+                if (indeg[ordered[i]->gvn] == 0) { queue[qt++] = i; }
+            }
 
-                    int max_depth = 0;
-                    if (n->type != TB_PHI && n != top) {
-                        FOR_N(i, 0, n->input_cap) {
-                            TB_Node* in = n->inputs[i];
-                            if (in && f->scheduled[in->gvn] == bb) {
-                                printf("N%d -> N%d\n", in->gvn, n->gvn);
-                            }
+            int processed = 0;
+            while (qh < qt) {
+                TB_Node* n = ordered[queue[qh++]];
+                int max_depth = 0;
+                if (n->type != TB_PHI && !NODE_ISA(n, REGION)) {
+                    FOR_N(j, 0, n->input_cap) {
+                        TB_Node* in = n->inputs[j];
+                        if (in && in->type != TB_MACH_TEMP && f->scheduled[in->gvn] == bb) {
+                            max_depth = TB_MAX(max_depth, depth[in->gvn]);
                         }
                     }
                 }
-                printf("}\n");
+                depth[n->gvn] = max_depth + 1;
+                processed += 1;
+
+                FOR_USERS(u, n) {
+                    TB_Node* un = USERN(u);
+                    if (f->scheduled[un->gvn] == bb && un->type != TB_PHI && !NODE_ISA(un, REGION)) {
+                        if (--indeg[un->gvn] == 0) {
+                            FOR_N(k, 0, cnt2) if (ordered[k] == un) { queue[qt++] = k; break; }
+                        }
+                    }
+                }
+            }
+
+            if (processed < cnt2) {
+                tb_print_dumb(f);
+                printf("CYCLE DETECTED IN BLOCK (real)!!! processed=%d/%d\n", processed, cnt2);
+                FOR_N(i, 0, cnt2) {
+                    if (depth[ordered[i]->gvn] < 0) {
+                        printf("  stuck: "), tb_print_dumb_node(NULL, ordered[i]), printf("\n");
+                    }
+                }
+                fflush(stdout);
                 __debugbreak();
             }
+            cnt = cnt2;
         }
     }
     #endif

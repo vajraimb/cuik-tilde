@@ -542,10 +542,6 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
         log_debug("%s: tmp_arena=%.1f KiB, ir_arena=%.1f KiB (pre isel)", f->super.name, tb_arena_current_size(&f->tmp_arena) / 1024.0f, (tb_arena_current_size(&f->arena)) / 1024.0f);
 
         // rewrite the root node
-        // TEMP DIAG: TB_DUMP_ISEL=<substr> prints the IR right before isel
-        { static const char* tb_dump_isel = (const char*)-1;
-          if (tb_dump_isel == (const char*)-1) { const char* s = getenv("TB_DUMP_ISEL"); tb_dump_isel = s; }
-          if (tb_dump_isel && f->super.name && strstr(f->super.name, tb_dump_isel)) { printf("=== PRE ISEL ===\n"); tb_print(f); fflush(stdout); } }
         construct_prologue_epilogue(&ctx, f);
 
         TB_ArenaSavepoint pins_sp = tb_arena_save(&f->tmp_arena);
@@ -613,15 +609,6 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
                 }
             }
         }
-
-        // TEMP DIAG: TB_OPT_DUMP_PREISEL=<substr> dumps the IR after all
-        // optimization rounds, immediately before isel — pinpoints whether a
-        // miscompile visible post-RA originates in the optimizer or codegen.
-        { static const char* pre_isel = (const char*)-1;
-          if (pre_isel == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_PREISEL"); pre_isel = s; }
-          if (pre_isel && f->super.name && strstr(f->super.name, pre_isel)) {
-              printf("=== PRE-ISEL ===\n"); tb_print(f); fflush(stdout);
-          } }
 
         // find all subtrees we'll be selecting
         ArenaArray(NodeCursor) walker = aarray_create(&f->tmp_arena, NodeCursor, 128);
@@ -894,15 +881,6 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
         worklist_clear(ws);
         tb_arena_restore(&f->tmp_arena, pins_sp);
         log_phase_end(f, og_size, "isel");
-
-        // TEMP DIAG: TB_OPT_DUMP_POSTISEL=<substr> dumps the machine graph
-        // right after isel (before renumber/GCM/RA) to trace miscompiled
-        // machine nodes back to their isel origins.
-        { static const char* post_isel = (const char*)-1;
-          if (post_isel == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_POSTISEL"); post_isel = s; }
-          if (post_isel && f->super.name && strstr(f->super.name, post_isel)) {
-              printf("=== POST-ISEL ===\n"); tb_print_dumb(f); fflush(stdout);
-          } }
 
         TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "ISel"));
         STATS_EXIT(MACH_ISEL);

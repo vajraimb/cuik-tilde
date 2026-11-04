@@ -32,11 +32,8 @@ static bool tb_node_is_no_gvn(TB_Node* n) { return tb_node_flags[n->type] & NODE
 static bool tb_node_is_compare(TB_Node* n) { return tb_node_flags[n->type] & NODE_COMPARE; }
 
 #define NODE_ISA(s, t) tb_node_isa((s)->type, TB_ ## t)
-static bool tb_node_is_a64(TB_Node* n) { return n->type >= 154 && n->type < 155; }
 static bool tb_node_is_x86(TB_Node* n) { return n->type >= 110 && n->type < 154; }
-
-#if 1 // namespace: a64
-#endif
+static bool tb_node_is_a64(TB_Node* n) { return n->type >= 154 && n->type < 161; }
 
 #if 1 // namespace: x86
 typedef enum Cond {
@@ -93,6 +90,46 @@ enum {
 
 #endif
 
+#if 1 // namespace: a64
+typedef struct A64Imm12 {
+    uint32_t imm;
+} A64Imm12;
+
+typedef enum Condition {
+    A64_EQ = 0,
+    A64_NE = 1,
+    A64_CS = 2,
+    A64_CC = 3,
+    A64_MI = 4,
+    A64_PL = 5,
+    A64_VS = 6,
+    A64_VC = 7,
+    A64_HI = 8,
+    A64_LS = 9,
+    A64_GE = 10,
+    A64_LT = 11,
+    A64_GT = 12,
+    A64_LE = 13,
+    A64_AL = 14,
+    A64_NV = 15,
+} Condition;
+
+typedef struct A64Cond {
+    uint8_t cond;
+    TB_DataType extra_dt;
+    int64_t imm;
+    float prob;
+} A64Cond;
+
+typedef struct A64JmpMulti {
+    int succ_count;
+    TB_Global* table;
+    size_t entry_count;
+    int* entries;
+} A64JmpMulti;
+
+#endif
+
 #ifndef TB_GEN_IMPL
 TB_NodeFlagsEnum tb_node_get_flags(TB_Node* n);
 const char* tb_node_get_name(TB_NodeTypeEnum n_type);
@@ -118,6 +155,8 @@ const uint16_t* tb_node_subtypes[TB_NODE_TYPE_MAX] = {
     [TB_TAILCALL]            = (uint16_t[]){ 2, 27, 29 },
     [TB_x86_jcc]             = (uint16_t[]){ 2, 18, 115 },
     [TB_x86_call]            = (uint16_t[]){ 2, 27, 121 },
+    [TB_a64_jcc]             = (uint16_t[]){ 2, 18, 157 },
+    [TB_a64_jcc_imm]         = (uint16_t[]){ 2, 18, 158 },
 };
 
 const uint64_t tb_node_flags[TB_NODE_TYPE_MAX] = {
@@ -177,6 +216,9 @@ const uint64_t tb_node_flags[TB_NODE_TYPE_MAX] = {
     [TB_x86_jcc]             = NODE_CTRL|NODE_FORK_CTRL|NODE_PINNED|NODE_TERMINATOR,
     [TB_x86_jmp_MULTI]       = NODE_CTRL|NODE_FORK_CTRL|NODE_PINNED|NODE_TERMINATOR,
     [TB_x86_call]            = NODE_CTRL|NODE_EFFECT|NODE_MEMORY_IN|NODE_MEMORY_OUT|NODE_PINNED|NODE_SAFEPOINT,
+    [TB_a64_jcc]             = NODE_CTRL|NODE_FORK_CTRL|NODE_PINNED|NODE_TERMINATOR,
+    [TB_a64_jcc_imm]         = NODE_CTRL|NODE_FORK_CTRL|NODE_PINNED|NODE_TERMINATOR,
+    [TB_a64_jmp_multi]       = NODE_CTRL|NODE_FORK_CTRL|NODE_PINNED|NODE_TERMINATOR,
 };
 
 TB_NodeFlagsEnum tb_node_get_flags(TB_Node* n) {
@@ -341,6 +383,12 @@ const char* tb_node_get_name(TB_NodeTypeEnum n_type) {
         case TB_x86_movsx32: return "x86_movsx32";
         case TB_x86_vxor: return "x86_vxor";
         case TB_a64_add_imm12: return "a64_add_imm12";
+        case TB_a64_COND: return "a64_cond";
+        case TB_a64_COND_IMM: return "a64_cond_imm";
+        case TB_a64_jcc: return "a64_jcc";
+        case TB_a64_jcc_imm: return "a64_jcc_imm";
+        case TB_a64_csel: return "a64_csel";
+        case TB_a64_jmp_multi: return "a64_jmp_multi";
         default: tb_todo(); return NULL;
     }
 }
@@ -501,7 +549,13 @@ size_t tb_node_extra_bytes(TB_NodeTypeEnum n_type) {
         case TB_x86_movzx16: return sizeof(X86MemOp);
         case TB_x86_movsx32: return sizeof(X86MemOp);
         case TB_x86_vxor: return sizeof(X86MemOp);
-        case TB_a64_add_imm12: return 0;
+        case TB_a64_add_imm12: return sizeof(A64Imm12);
+        case TB_a64_COND: return sizeof(A64Cond);
+        case TB_a64_COND_IMM: return sizeof(A64Cond);
+        case TB_a64_jcc: return sizeof(A64Cond);
+        case TB_a64_jcc_imm: return sizeof(A64Cond);
+        case TB_a64_csel: return sizeof(A64Cond);
+        case TB_a64_jmp_multi: return sizeof(A64JmpMulti);
         default: tb_todo(); return 0;
     }
 }

@@ -221,6 +221,8 @@ static bool cfg_is_unreachable(TB_Node* n) {
 
 static TB_Node* cfg_next_control(TB_Node* n) {
     FOR_USERS(u, n) {
+        // PATCH(odin-tilde): dead projections (zero users) are not successors
+        if (USERN(u)->user_count == 0 && IS_PROJ(USERN(u))) { continue; }
         if (cfg_is_control(USERN(u))) { return USERN(u); }
     }
 
@@ -317,7 +319,9 @@ static bool succ_iter_next(SuccIter* restrict it) {
     // if we're in this loop, we know we're scanning for CProjs
     while (it->index < n->user_count) {
         TB_Node* un = USERN(&n->users[it->index++]);
-        if (cfg_is_cproj(un)) {
+        // PATCH(odin-tilde): dead projections (zero users) are not successors;
+        // see create_block in cfg.h.
+        if (cfg_is_cproj(un) && un->user_count > 0) {
             it->succ = un;
             return true;
         }

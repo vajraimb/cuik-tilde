@@ -1058,7 +1058,16 @@ static TB_Node* try_as_const(TB_Function* f, TB_Node* n, Lattice* l) {
                     }
                 }
 
-                if (n->type != TB_IF && n->type != TB_AFFINE_LATCH) {
+                // PATCH(odin-tilde): upstream only folded TB_IF (and AFFINE_LATCH)
+                // here. Odin lowers switch statements to multi-way TB_BRANCH with
+                // a key input; when the key folds to a constant, value_branch
+                // resolves the lattice to "goto taken" but this rewrite never
+                // fired, leaving the dead branch_projections attached to a
+                // still-reachable branch (no users) — the next tb_compute_cfg
+                // then trips cfg.h's "BB end with no successor" tb_todo (seen
+                // compiling any `switch <const> { case 'a','b': ... }`), and in
+                // milder shapes the lattice/graph mismatch miscompiles code.
+                if (n->type != TB_IF && n->type != TB_AFFINE_LATCH && n->type != TB_BRANCH) {
                     return NULL;
                 }
 
@@ -1071,6 +1080,14 @@ static TB_Node* try_as_const(TB_Function* f, TB_Node* n, Lattice* l) {
                 }
 
                 if (trues == 1) {
+                    // bail if anything besides projections references the
+                    // branch — we can only rewire the projection users (mirrors
+                    // the only_projs guard in ideal_if: stale TB_SYMBOL_TABLE
+                    // users have been observed on odin branches).
+                    FOR_USERS(u, n) {
+                        if (!IS_PROJ(USERN(u))) { return NULL; }
+                    }
+
                     TB_Node* dead = dead_node(f);
                     TB_Node* ctrl = n->inputs[0];
 
@@ -1699,18 +1716,6 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
     int dirty = ALL_DIRTY;
     do {
         rounds++;
-        // TEMP DIAG: TB_OPT_DUMP_IR0=<substr> dumps the raw IR before any
-        // optimization round (TB_OPT_DUMP_IR's earliest gate runs after peeps).
-        // In debug builds also enables f->enable_log so TB_OPTLOG(PEEP) traces
-        // this proc (the field does not exist under NDEBUG).
-        { static const char* tb_dump_ir0 = (const char*)-1;
-          if (tb_dump_ir0 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR0"); tb_dump_ir0 = s; }
-          if (tb_dump_ir0 && f->super.name && strstr(f->super.name, tb_dump_ir0)) {
-              #ifndef NDEBUG
-              f->enable_log = true;
-              #endif
-              printf("=== INITIAL (round %d) ===\n", rounds); tb_print(f); fflush(stdout);
-          } }
         TB_OPTDEBUG(PASSES)(printf("  * ROUND %d:\n", rounds));
         TB_OPTDEBUG(PASSES)(printf("    * Minor rewrites\n"));
 
@@ -1727,10 +1732,6 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             }
             STATS_EXIT(PEEPHOLES);
             TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "Peepholes"));
-            // TEMP DIAG: TB_OPT_DUMP_IR1=<substr> dumps after each peeps drain
-            { static const char* tb_dump_ir1 = (const char*)-1;
-              if (tb_dump_ir1 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR1"); tb_dump_ir1 = s; }
-              if (tb_dump_ir1 && f->super.name && strstr(f->super.name, tb_dump_ir1)) { printf("=== AFTER PEEPS (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
 
             #if TB_OPTDEBUG_STATS
             if (f->stats.solver_n > 0) {
@@ -1743,10 +1744,6 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             // work when it returns true.
             TB_OPTDEBUG(PASSES)(printf("      * Locals\n"));
             TB_OPTLOG(PEEP, printf("=== LOCALS ===\n"));
-            // diagnostic: TB_OPT_DUMP_IR also dumps right before locals (after peeps)
-            { static const char* tb_dump_ir4 = (const char*)-1;
-              if (tb_dump_ir4 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir4 = s; }
-              if (tb_dump_ir4 && f->super.name && strstr(f->super.name, tb_dump_ir4)) { printf("=== BEFORE LOCALS (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
             STATS_ENTER(MEMORY);
             if ((k = tb_opt_locals(f), k > 0)) {
                 TB_OPTDEBUG(PASSES)(printf("        * Folded %d locals into SSA\n", k));
@@ -1755,18 +1752,8 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             STATS_EXIT(MEMORY);
 
             TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "Memory"));
-
-            // diagnostic: TB_OPT_DUMP_IR=<substr> also dumps right after locals
-            { static const char* tb_dump_ir2 = (const char*)-1;
-              if (tb_dump_ir2 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir2 = s; }
-              if (tb_dump_ir2 && f->super.name && strstr(f->super.name, tb_dump_ir2)) { printf("=== AFTER LOCALS (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
         }
         cuikperf_region_end();
-
-        // diagnostic: TB_OPT_DUMP_IR=<substr> prints post-minor-opts IR
-        { static const char* tb_dump_ir = (const char*)-1;
-          if (tb_dump_ir == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir = s; }
-          if (tb_dump_ir && f->super.name && strstr(f->super.name, tb_dump_ir)) { tb_print(f); fflush(stdout); } }
 
         // avoids bloating up my arenas with freed nodes
         float dead_factor = (float)f->dead_node_bytes / (float)tb_arena_current_size(&f->arena);
@@ -1816,10 +1803,6 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             progress |= loop_opt_canonicalize(f, &ctx, &tmp_ws);
             STATS_EXIT(LOOP_ROTATE);
             TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "Loop rotation"));
-            // diagnostic: TB_OPT_DUMP_IR=<substr> dumps right after rotate
-            { static const char* tb_dump_ir5 = (const char*)-1;
-              if (tb_dump_ir5 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir5 = s; }
-              if (tb_dump_ir5 && f->super.name && strstr(f->super.name, tb_dump_ir5)) { printf("=== AFTER ROTATE (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
             ////////////////////////////////
             // 4. SLP vectorizer
             ////////////////////////////////
@@ -1896,10 +1879,6 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             if (progress) {
                 dirty |= CPROP_DIRTY;
             }
-            // diagnostic: TB_OPT_DUMP_IR=<substr> dumps after the loop block
-            { static const char* tb_dump_ir4 = (const char*)-1;
-              if (tb_dump_ir4 == (const char*)-1) { const char* s = getenv("TB_OPT_DUMP_IR"); tb_dump_ir4 = s; }
-              if (tb_dump_ir4 && f->super.name && strstr(f->super.name, tb_dump_ir4)) { printf("=== AFTER LOOP BLOCK (round %d) ===\n", rounds); tb_print(f); fflush(stdout); } }
         }
         }
         }

@@ -101,6 +101,30 @@ void tb_clear_anti_deps(TB_Function* f, TB_Worklist* ws) {
     }
 }
 
+// PATCH(odin-tilde): true-dependency 可达性（只走 inputs[0..input_count)，
+// 不走 extra 反依赖边）。用于 add_anti_deps 的成环防护。
+static bool node_true_dep_reaches(TB_Function* f, TB_Node* from, TB_Node* to) {
+    if (from == to) { return true; }
+
+    Set visited = set_create_in_arena(&f->tmp_arena, f->node_count);
+    ArenaArray(TB_Node*) stack = aarray_create(&f->tmp_arena, TB_Node*, 64);
+    aarray_push(stack, from);
+
+    bool found = false;
+    while (aarray_length(stack) && !found) {
+        TB_Node* n = aarray_pop(stack);
+        if (set_get(&visited, n->gvn)) { continue; }
+        set_put(&visited, n->gvn);
+        FOR_N(i, 0, n->input_count) {
+            TB_Node* in = n->inputs[i];
+            if (in == NULL) { continue; }
+            if (in == to) { found = true; break; }
+            aarray_push(stack, in);
+        }
+    }
+    return found;
+}
+
 static void add_anti_deps(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* mem, TB_BasicBlock* early) {
     if (mem->type == TB_SPLITMEM) {
         return;
@@ -111,6 +135,12 @@ static void add_anti_deps(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* mem
         if (USERI(u) <= un->input_count) {
             // phis don't actually write to memory so we can move around them
             if (un->type != TB_PHI && tb_node_is_memory_out(un)) {
+                // PATCH(odin-tilde): ld 已经真依赖 un（地址/数据来自它）时，
+                // 加"store 排在 load 后"的 anti-dep 会成环（odin-tank a64
+                // 实撞：store → load(过 mem 链) → 用 load 值算地址 → 再
+                // load(挂在 store 之前的 mem 上)）。mem SSA 走到这一步
+                // 已默认二者无别名，排序边既多余又有害。
+                if (node_true_dep_reaches(f, ld, un)) { continue; }
                 tb_node_add_extra(f, un, ld);
             }
         }

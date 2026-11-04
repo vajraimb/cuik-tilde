@@ -17,9 +17,10 @@
 
 (reg_class "FLAGS")
 
-// 浮点常量走位容器（a64 无浮点立即数）
-pat (F32CONST $root value=$value) => (ICONST dt=TB_TYPE_I32 $root value="*(uint32_t*) &$value")
-pat (F64CONST $root value=$value) => (ICONST dt=TB_TYPE_I32 $root value="*(uint64_t*) &$value")
+// 浮点常量：不在这里改写节点类型（改写 ICONST 会把整型节点挂进 f64 phi，
+// 混型 phi 在 RA 里撞类断言——odin-tank math@atan2_f64 实撞）。改为保留
+// F32CONST/F64CONST 原类型，约束给 FPR（见 node_constraint CONSTANTS 段），
+// 发射用 ldr (literal) 从函数尾 literal pool 加载（见 emit/post_emit）。
 
 // a64 没有 rotate left
 pat (ROL dt=$dt ___ $lhs $rhs) =>
@@ -43,8 +44,98 @@ pat (SMOD dt=$dt ___ $lhs $rhs) =>
 			$rhs
 			(SDIV dt=$dt ___ $lhs $rhs)))
 
-// ADD + 12位立即数（可选优化，暂不上线）
-// pat (ADD dt=$dt ___ $a (ICONST ... value=$b)) where "($b == ($b & 07777)) || ($b == ($b & 077770000))" => (a64_add_imm12 dt=$dt ___ $a imm=$b)
+// ADD + 12位立即数（base + 小偏移合并，extra 携带立即数）
+(struct A64Imm12
+    (imm uint32_t)
+)
+(node add_imm12 extra=A64Imm12)
 
-(node add_imm12)
+pat (PTR_OFFSET ___ $base ($off: ICONST ...)) where "a64_fits_addsub_imm(a64_as_int64($off))" => (a64_add_imm12 dt=TB_TYPE_PTR ___ $base imm="(uint32_t)a64_as_int64($off)")
+
+////////////////////////////////
+// 阶段2：比较/分支/选择机器节点
+////////////////////////////////
+
+// 条件码（生成到 tb_gen_private.h，机器节点与 emitter 共用；
+// 注意必须加 A64_ 前缀——裸 EQ/NE/CS... 会与 x64 Cond 撞名）
+(enum Condition A64_EQ A64_NE A64_CS A64_CC A64_MI A64_PL A64_VS A64_VC A64_HI A64_LS A64_GE A64_LT A64_GT A64_LE A64_AL A64_NV)
+
+// 条件码 + 被比较的数据类型 + cmp_imm 的立即数 + jcc 的分支概率
+(struct A64Cond
+    (cond uint8_t)
+    (extra_dt TB_DataType)
+    (imm int64_t)
+    (prob float)
+)
+
+// 多路跳转表描述（jump table 全局符号 + 表项；
+// 不能给 jmp_multi 挂 parent=BRANCH——NODE_ISA(jmp_multi, BRANCH) 会让
+// cfg.h 的 create_block 按 TB_NodeBranch extra 读 succ_count，越界/错读，
+// 走通用 TUPLE 分支（数 cproj 用户）才对，与 x64 jmp_MULTI（无 parent）一致）
+(struct A64JmpMulti
+    (succ_count int)
+    (table (ptr TB_Global))
+    (entry_count size_t)
+    (entries (ptr int))
+)
+
+// FLAGS 产生/消费节点。设计决策（2026-11-04，odin-tank 攻坚）：cmp 与
+// 消费方（CSET/CSEL/b.cond）融合成单一机器节点，FLAGS 不作为跨节点
+// 的 vreg 存在。理由：NZCV 只有一个物理寄存器，cmp 单独成节点时，
+// list scheduler 在 def 与 use 之间插入另一个 cmp 即产生不可着色的
+// 活区间重叠（bytes@index_byte / os@_file_stream_proc-0 实撞，记分板
+// 打补丁也堵不住 fallback 路径）。融合后 cmp 发射内联在消费方里，
+// 硬件语义天然正确，RA 彻底不见 FLAGS 类。
+// COND = cmp/fcmp + CSET（i8 条件值）；COND_IMM = cmp_imm + CSET。
+// jcc/jcc_imm = cmp/cmp_imm + b.cond（二分叉）。
+// csel = cmp pred,#0 + CSEL/FCSEL（csel 的 cond 即对 pred 的比较条件，
+// 发射时内联 cmp，cond 从 extra 读）。
+(node COND     extra=A64Cond)
+(node COND_IMM extra=A64Cond)
+// 二分叉（继承 TB_IF 的 CTRL/TERMINATOR/FORK_CTRL 语义）
+(node jcc      parent=IF extra=A64Cond)
+(node jcc_imm  parent=IF extra=A64Cond)
+// 条件选择（cmp pred,#0 + CSEL/FCSEL 一体，直接吃 $pred）
+(node csel     extra=A64Cond)
+// 多路跳转（switch jump table，extra=A64JmpMulti，见上；
+// flags 必须与 x64.dsl 的 jmp_MULTI 完全一致：CTRL TERMINATOR FORK_CTRL PINNED，
+// 缺 PINNED 会让 GCM 把它当普通节点搬走/不停止 BB 扫描，缺 FORK_CTRL 让 CFG
+// 不识别分叉——两者都会让 compute_cfg 只找到零星几个块）
+(node jmp_multi CTRL TERMINATOR FORK_CTRL PINNED extra=A64JmpMulti)
+
+// ---- 多路分支降低：线性/完美哈希 jump table（C 回调，见 aarch64_target.c）----
+pat (BRANCH dt=$dt $ctrl $x) => "a64_multi_way_branch(ctx, f, n)"
+
+// ---- 整数比较：rhs 为可编码立即数 → COND_IMM（cmp_imm + CSET 一体）----
+pat (CMP_EQ cmp_dt=$dt ___ $lhs ($rhs: ICONST ...)) where "TB_IS_BOOL_INT_PTR($dt) && a64_fits_addsub_imm(a64_as_int64($rhs))" => (a64_COND_IMM dt=TB_TYPE_I8 ___ $lhs cond=A64_EQ extra_dt=$dt imm="a64_as_int64($rhs)")
+pat (CMP_NE cmp_dt=$dt ___ $lhs ($rhs: ICONST ...)) where "TB_IS_BOOL_INT_PTR($dt) && a64_fits_addsub_imm(a64_as_int64($rhs))" => (a64_COND_IMM dt=TB_TYPE_I8 ___ $lhs cond=A64_NE extra_dt=$dt imm="a64_as_int64($rhs)")
+pat (CMP_SLT cmp_dt=$dt ___ $lhs ($rhs: ICONST ...)) where "TB_IS_BOOL_INT_PTR($dt) && a64_fits_addsub_imm(a64_as_int64($rhs))" => (a64_COND_IMM dt=TB_TYPE_I8 ___ $lhs cond=A64_LT extra_dt=$dt imm="a64_as_int64($rhs)")
+pat (CMP_SLE cmp_dt=$dt ___ $lhs ($rhs: ICONST ...)) where "TB_IS_BOOL_INT_PTR($dt) && a64_fits_addsub_imm(a64_as_int64($rhs))" => (a64_COND_IMM dt=TB_TYPE_I8 ___ $lhs cond=A64_LE extra_dt=$dt imm="a64_as_int64($rhs)")
+pat (CMP_ULT cmp_dt=$dt ___ $lhs ($rhs: ICONST ...)) where "TB_IS_BOOL_INT_PTR($dt) && a64_fits_addsub_imm(a64_as_int64($rhs))" => (a64_COND_IMM dt=TB_TYPE_I8 ___ $lhs cond=A64_CC extra_dt=$dt imm="a64_as_int64($rhs)")
+pat (CMP_ULE cmp_dt=$dt ___ $lhs ($rhs: ICONST ...)) where "TB_IS_BOOL_INT_PTR($dt) && a64_fits_addsub_imm(a64_as_int64($rhs))" => (a64_COND_IMM dt=TB_TYPE_I8 ___ $lhs cond=A64_LS extra_dt=$dt imm="a64_as_int64($rhs)")
+
+// ---- 整数比较：寄存器-寄存器 → COND（cmp + CSET 一体）----
+pat (CMP_EQ cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_BOOL_INT_PTR($dt)" => (a64_COND dt=TB_TYPE_I8 ___ $lhs $rhs cond=A64_EQ extra_dt=$dt)
+pat (CMP_NE cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_BOOL_INT_PTR($dt)" => (a64_COND dt=TB_TYPE_I8 ___ $lhs $rhs cond=A64_NE extra_dt=$dt)
+pat (CMP_SLT cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_BOOL_INT_PTR($dt)" => (a64_COND dt=TB_TYPE_I8 ___ $lhs $rhs cond=A64_LT extra_dt=$dt)
+pat (CMP_SLE cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_BOOL_INT_PTR($dt)" => (a64_COND dt=TB_TYPE_I8 ___ $lhs $rhs cond=A64_LE extra_dt=$dt)
+pat (CMP_ULT cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_BOOL_INT_PTR($dt)" => (a64_COND dt=TB_TYPE_I8 ___ $lhs $rhs cond=A64_CC extra_dt=$dt)
+pat (CMP_ULE cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_BOOL_INT_PTR($dt)" => (a64_COND dt=TB_TYPE_I8 ___ $lhs $rhs cond=A64_LS extra_dt=$dt)
+
+// ---- 浮点比较：FCMP 的 NZCV 语义 FLT→MI FLE→LS（NaN 得 false，与 x64 ucomi 路径一致）----
+pat (CMP_EQ cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (a64_COND dt=TB_TYPE_I8 ___ $lhs $rhs cond=A64_EQ extra_dt=$dt)
+pat (CMP_NE cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (a64_COND dt=TB_TYPE_I8 ___ $lhs $rhs cond=A64_NE extra_dt=$dt)
+pat (CMP_FLT cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (a64_COND dt=TB_TYPE_I8 ___ $lhs $rhs cond=A64_MI extra_dt=$dt)
+pat (CMP_FLE cmp_dt=$dt ___ $lhs $rhs) where "TB_IS_FLOAT_TYPE($dt)" => (a64_COND dt=TB_TYPE_I8 ___ $lhs $rhs cond=A64_LS extra_dt=$dt)
+
+// ---- IF 降低：jcc_imm 内联 cmp x,#0（x!=0 走 then）----
+// 不能把 cmp 拆成独立节点跨块共享（见节点声明处的 Flags 融合决策）。
+// 先把 AFFINE_LATCH 归一化成 IF（C 回调返回 NULL 表示交给后续模式）
+pat (IF ...) => "a64_isel_if_branch(ctx, f, n)"
+pat (AFFINE_LATCH ...) => "a64_isel_if_branch(ctx, f, n)"
+pat (IF dt=$dt $ctrl $x prob=$prob) => (a64_jcc_imm dt=TB_TYPE_TUPLE $ctrl $x cond=A64_NE extra_dt="n->inputs[1]->dt" imm=0 prob=$prob)
+
+// ---- SELECT 降低：csel 内联 cmp pred,#0（pred!=0 选 a）----
+pat (SELECT dt=$dt ___ $pred $a $b) => (a64_csel dt=$dt ___ $pred $a $b cond=A64_NE)
+
 )

@@ -256,19 +256,35 @@ TB_ExportBuffer tb_macho_write_output(TB_Module* m, TB_Arena* dst_arena, const I
                 if (p->internal) continue;
 
                 uint32_t type;
-                switch (p->type) {
-                    case TB_OBJECT_RELOC_REL32:
-                    case TB_OBJECT_RELOC_PLT32: type = X86_64_RELOC_BRANCH;   break;
-                    case TB_OBJECT_RELOC_ADDR64: type = X86_64_RELOC_UNSIGNED; break;
-                    case TB_OBJECT_RELOC_ADDR32: type = X86_64_RELOC_SIGNED;   break;
-                    default: tb_todo();
+                bool pcrel;
+                uint32_t length;
+                if (m->target_arch == TB_ARCH_AARCH64) {
+                    // odin-tilde: arm64 Mach-O relocation types
+                    // (ARM64_RELOC_UNSIGNED=0, BRANCH26=2, PAGE21=3, PAGEOFF12=4)
+                    switch (p->type) {
+                        case TB_OBJECT_RELOC_BRANCH26: type = 2; pcrel = true;  length = 2; break;
+                        case TB_OBJECT_RELOC_REL21:    type = 3; pcrel = true;  length = 2; break;
+                        case TB_OBJECT_RELOC_PAGEOFF12:type = 4; pcrel = false; length = 2; break;
+                        case TB_OBJECT_RELOC_GOT_PAGE21:    type = 5; pcrel = true;  length = 2; break;
+                        case TB_OBJECT_RELOC_GOT_PAGEOFF12: type = 6; pcrel = false; length = 2; break;
+                        case TB_OBJECT_RELOC_ADDR64:   type = 0; pcrel = false; length = 3; break;
+                        default: tb_todo();
+                    }
+                } else {
+                    switch (p->type) {
+                        case TB_OBJECT_RELOC_REL32:
+                        case TB_OBJECT_RELOC_PLT32: type = X86_64_RELOC_BRANCH;   pcrel = true;  length = 2; break;
+                        case TB_OBJECT_RELOC_ADDR64: type = X86_64_RELOC_UNSIGNED; pcrel = false; length = 3; break;
+                        case TB_OBJECT_RELOC_ADDR32: type = X86_64_RELOC_SIGNED;   pcrel = false; length = 2; break;
+                        default: tb_todo();
+                    }
                 }
 
                 *relocs++ = (MO_RelocInfo){
                     .r_address   = source_offset + p->pos,
                     .r_symbolnum = p->target->symbol_id,
-                    .r_pcrel     = (p->type == TB_OBJECT_RELOC_REL32 || p->type == TB_OBJECT_RELOC_PLT32),
-                    .r_length    = (p->type == TB_OBJECT_RELOC_ADDR64) ? 3 : 2,
+                    .r_pcrel     = pcrel,
+                    .r_length    = length,
                     .r_extern    = 1,
                     .r_type      = type,
                 };

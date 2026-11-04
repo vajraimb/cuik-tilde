@@ -187,5 +187,11 @@ typedef enum TB_NodeTypeEnum {
     TB_x86_movsx32         = 152,
     TB_x86_vxor            = 153,
     TB_a64_add_imm12       = 154,
+    TB_a64_COND            = 155,
+    TB_a64_COND_IMM        = 156,
+    TB_a64_jcc             = 157,
+    TB_a64_jcc_imm         = 158,
+    TB_a64_csel            = 159,
+    TB_a64_jmp_multi       = 160,
     TB_NODE_TYPE_MAX,
 } TB_NodeTypeEnum;

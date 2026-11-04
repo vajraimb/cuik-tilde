@@ -1234,6 +1234,31 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                     if (n && f->scheduled[n->gvn]) {
                         fprintf(stderr, " bb=%td", f->scheduled[n->gvn] - ctx->cfg.blocks);
                     }
+                    // failure-path diagnostic: who keeps this value alive
+                    if (n) {
+                        fprintf(stderr, "\n[ra]   users:");
+                        FOR_USERS(u, n) {
+                            TB_Node* un = USERN(u);
+                            fprintf(stderr, " g%u(%s)", un->gvn, tb_node_get_name(un->type));
+                            if (f->scheduled[un->gvn]) {
+                                fprintf(stderr, "@[bb%td]", f->scheduled[un->gvn] - ctx->cfg.blocks);
+                            }
+                        }
+                        // odin-tilde: dump sibling FLAGS-class vregs (single-reg class —
+                        // any overlap with another live flags range is the uncolorable cause)
+                        if (v->mask && v->mask->class == 3) {
+                            fprintf(stderr, "\n[ra]   flags-class vregs:");
+                            FOR_N(vi, 0, aarray_length(ctx->vregs)) {
+                                VReg* sv = &ctx->vregs[vi];
+                                if (sv->mask == NULL || sv->mask->class != 3 || sv->n == NULL) { continue; }
+                                fprintf(stderr, " V%zu=g%u(%s)", vi, sv->n->gvn, tb_node_get_name(sv->n->type));
+                                if (f->scheduled[sv->n->gvn]) {
+                                    fprintf(stderr, "@[bb%td]", f->scheduled[sv->n->gvn] - ctx->cfg.blocks);
+                                }
+                                fprintf(stderr, " assigned=%d", sv->assigned);
+                            }
+                        }
+                    }
                     // failure-path diagnostic: dump mach_copy endpoints and input chain
                     if (n && n->type == TB_MACH_COPY) {
                         TB_NodeMachCopy* mc = TB_NODE_GET_EXTRA(n);

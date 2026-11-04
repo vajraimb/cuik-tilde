@@ -1533,7 +1533,11 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
             // bypass, leaving them undefined on the break path. Pre-scan: bail
             // out if any extra pred is outside the loop, otherwise remember it
             // so it can be rerouted through the join.
-            TB_Node* exit_block = exit_proj ? USERN(cfg_next_user(exit_proj)) : NULL;
+            // PATCH(odin-tilde): exit_proj can be a zero-user dead projection after
+            // constant branch folding; cfg_next_user() would deref garbage. No
+            // control user means there is no live exit block to rotate.
+            TB_User* exit_user = exit_proj ? cfg_next_user(exit_proj) : NULL;
+            TB_Node* exit_block = exit_user ? USERN(exit_user) : NULL;
             dyn_array_clear(extra_exit_edges);
             bool exit_block_ok = true;
             if (exit_block) {

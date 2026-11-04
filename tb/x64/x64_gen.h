@@ -1129,8 +1129,8 @@ static TB_Node* mach_dfa_accept_33(Ctx* ctx, TB_Function* f, TB_Node* n) {
     TB_Node* $ctrl = n->inputs[0];
     TB_Node* $cmp = n->inputs[1]->inputs[0];
     uint64_t $cond = TB_NODE_GET_EXTRA_T(n->inputs[1], X86MemOp)->cond;
-    TB_DataType $dt = n->dt;
     float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+    TB_DataType $dt = n->dt;
 
     size_t k0_i = 0;
     TB_Node* k0 = tb_alloc_node(f, TB_x86_jcc, TB_TYPE_TUPLE, 2, sizeof(X86MemOp));
@@ -1149,8 +1149,8 @@ static TB_Node* mach_dfa_accept_34(Ctx* ctx, TB_Function* f, TB_Node* n) {
 
     TB_Node* $ctrl = n->inputs[0];
     TB_Node* $x = n->inputs[1];
-    TB_DataType $dt = n->dt;
     float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+    TB_DataType $dt = n->dt;
 
     size_t k0_i = 0;
     TB_Node* k0 = tb_alloc_node(f, TB_x86_test, TB_TYPE_I64, 4, sizeof(X86MemOp));
@@ -1191,8 +1191,8 @@ static TB_Node* mach_dfa_accept_36(Ctx* ctx, TB_Function* f, TB_Node* n) {
     TB_Node* $mem = n->inputs[1]->inputs[1];
     TB_Node* $x = n->inputs[1]->inputs[2];
     uint64_t $flags = TB_NODE_GET_EXTRA_T(n->inputs[1]->inputs[2], X86MemOp)->flags;
-    TB_DataType $dt = n->dt;
     float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+    TB_DataType $dt = n->dt;
 
     size_t k0_i = 0;
     TB_Node* k0 = tb_alloc_node(f, TB_x86_cmp, TB_TYPE_I64, 4, sizeof(X86MemOp));
@@ -1228,8 +1228,8 @@ static TB_Node* mach_dfa_accept_37(Ctx* ctx, TB_Function* f, TB_Node* n) {
     TB_Node* $ctrl = n->inputs[0];
     TB_Node* $x = n->inputs[1]->inputs[1];
     TB_Node* $y = n->inputs[1]->inputs[2];
-    TB_DataType $dt = n->dt;
     float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+    TB_DataType $dt = n->dt;
 
     size_t k0_i = 0;
     TB_Node* k0 = tb_alloc_node(f, TB_x86_test, TB_TYPE_I64, 5, sizeof(X86MemOp));
@@ -2023,11 +2023,6 @@ static TB_Node* mach_dfa_accept_65(Ctx* ctx, TB_Function* f, TB_Node* n) {
     k0_i++;
     set_input(f, k0, $src, k0_i++);
     X86MemOp* k0_extra = TB_NODE_GET_EXTRA(k0);
-    // PATCH(odin-tilde): extra_dt must be the SOURCE width (matches x64.machine):
-    // legalize_int(extra_dt) drives the emitter's byte-op REX rule — with the
-    // result dt (i32) here a movsx8 from sil/dil/bpl+ encoded 0F BE without REX,
-    // silently reading bh/ch/dh instead (build-dependent garbage, stage2 only
-    // since stage0 keeps the ext on a memory operand).
     k0_extra->extra_dt = $src->dt;
     k0 = tb_opt_gvn_node(f, k0);
     
@@ -2494,8 +2489,8 @@ static MatchRuleID mach_dfa_rule_14(Ctx* ctx, TB_Function* f, TB_Node* n, int de
     // { 0 }
     {
         uint64_t $cond = TB_NODE_GET_EXTRA_T(n->inputs[1], X86MemOp)->cond;
-        TB_DataType $dt = n->dt;
         float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+        TB_DataType $dt = n->dt;
         return 33;
     }
 }
@@ -2513,8 +2508,8 @@ static MatchRuleID mach_dfa_rule_15(Ctx* ctx, TB_Function* f, TB_Node* n, int de
         // (ANY_OP $ctrl (ANY_OP ___ ___ $x $x))
         case 18: {
             {
-                TB_DataType $dt = n->dt;
                 float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+                TB_DataType $dt = n->dt;
                 return 34;
             }
         }
@@ -2538,8 +2533,8 @@ static MatchRuleID mach_dfa_rule_16(Ctx* ctx, TB_Function* f, TB_Node* n, int de
     // { 0 }
     {
         uint64_t $flags = TB_NODE_GET_EXTRA_T(n->inputs[1]->inputs[2], X86MemOp)->flags;
-        TB_DataType $dt = n->dt;
         float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+        TB_DataType $dt = n->dt;
         return 36;
     }
 }
@@ -2552,8 +2547,8 @@ static MatchRuleID mach_dfa_rule_17(Ctx* ctx, TB_Function* f, TB_Node* n, int de
 
     // { 0 }
     {
-        TB_DataType $dt = n->dt;
         float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+        TB_DataType $dt = n->dt;
         return 37;
     }
 }
