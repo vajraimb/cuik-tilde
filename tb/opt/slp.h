@@ -859,13 +859,15 @@ bool compile_packs(TB_Function* f, PairSet* pairs, TB_LoopTree* loop) {
                 first = first->inputs[1];
             }
 
-            int align = TB_NODE_GET_EXTRA_T(first, TB_NodeMemAccess)->align;
+            // lane 0 holds the lowest address, which may not be the earliest in the mem chain
+            TB_Node* lane0 = op->ops[0];
+            int align = TB_NODE_GET_EXTRA_T(lane0, TB_NodeMemAccess)->align;
             TB_Node* src = gimme_vector(f, &ops, op, 3);
 
             TB_Node* n = tb_alloc_node(f, TB_STORE, TB_TYPE_MEMORY, 4, sizeof(TB_NodeMemAccess));
             set_input(f, n, first->inputs[0], 0);
             set_input(f, n, first->inputs[1], 1);
-            set_input(f, n, first->inputs[2], 2);
+            set_input(f, n, lane0->inputs[2], 2);
             set_input(f, n, src, 3);
             TB_NODE_SET_EXTRA(n, TB_NodeMemAccess, .align = align);
 

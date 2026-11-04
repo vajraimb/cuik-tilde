@@ -587,13 +587,15 @@ ENUM(FPconvINTop) {
 };
 static void simd_dp_float2int(TB_CGEmitter* restrict e, bool wide, FPtype type, FPconvINTop op, GPR Rd, GPR Rn, bool top_half) {
     uint32_t inst = 0;
-    if (op == FCVTZS || op == FCVTZU) top_half = 0b11;
-    if (op == SCVTF  || op == UCVTF)  top_half = 0b00;
+    // rmode 是 2 位字段，不能存进 bool（0b11 会塌成 1 = FCVTP*，向 +inf 舍入）
+    uint32_t rmode = top_half;
+    if (op == FCVTZS || op == FCVTZU) rmode = 0b11;
+    if (op == SCVTF  || op == UCVTF)  rmode = 0b00;
     uint32_t s = 0; // always 0
     inst |= PUT_BITS(31, 1, wide);
     inst |= PUT_BITS(29, 1, s);
     inst |= PUT_BITS(22, 2, type);
-    inst |= PUT_BITS(19, 2, top_half);
+    inst |= PUT_BITS(19, 2, rmode);
     inst |= PUT_BITS(16, 3, op);
     inst |= PUT_BITS( 5, 5, Rn);
     inst |= PUT_BITS( 0, 5, Rd);

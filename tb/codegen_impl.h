@@ -867,7 +867,9 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
                 n = n->inputs[0];
             }
 
-            if (added) {
+            // a64 不改写 TB_CALL（无 isel 规则），也得登记出参槽（call_usage），
+            // 否则栈传参与 LOCAL 共用 [sp+0]
+            if (added || n->type == TB_CALL) {
                 node_add_tmps(&ctx, n);
             }
         }

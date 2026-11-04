@@ -717,6 +717,8 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
                     // bool 投影同理）任意 GPR；Odin 侧 cxchg 的 bool 是自己
                     // cmp 出来的（tilde_builtin.cpp），不依赖这里
                     return ctx->normie_mask[REG_CLASS_GPR];
+                } else if (n->inputs[0]->type == TB_UMULPAIR || n->inputs[0]->type == TB_SMULPAIR) {
+                    return ctx->normie_mask[REG_CLASS_GPR];
                 }
             }
         }
@@ -767,10 +769,9 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
 
         case TB_UMULPAIR:
         case TB_SMULPAIR:
-        // a64 无专用 mulpair 发射器（撞到会 tb_todo），但先给约束
-        // 与 x64 对齐：lhs 钉 R0（宽乘法低半在 R0 的约定由发射器定）
+        // mul + umulh/smulh，无隐式寄存器；lo/hi 投影任意 GPR
         if (ins) {
-            ins[1] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << 0);
+            ins[1] = ctx->normie_mask[REG_CLASS_GPR];
             ins[2] = ctx->normie_mask[REG_CLASS_GPR];
         }
         return &TB_REG_EMPTY;
@@ -1409,10 +1410,14 @@ static void a64_ldst(TB_CGEmitter* e, bool is_store, TB_DataType dt, int rt, int
 // 寄存器——垃圾高位会翻转比较结果（实测：odin-tank fmt 的 is_digit 全假，
 // le_b/lt_b/eq_b 等 byte 参数比较全部反相/错乱）。比较前把操作数掩到
 // extra_dt 的宽度（UBFM #0,#7 / #0,#15）。返回可用寄存器（无需掩码时原样）。
-static int a64_mask_cmp_op(TB_CGEmitter* e, int reg, TB_DataType cmp_dt, int scratch) {
+// 有符号条件（MI/PL/GE/LT/GT/LE）须符号扩展（SBFM），否则 i8 -100 会按
+// 156 比较；cond < 0 表示只做相等/真假判断。
+static int a64_mask_cmp_op(TB_CGEmitter* e, int reg, TB_DataType cmp_dt, int scratch, int cond) {
+    int c = cond & 0xF;
+    bool sign = cond >= 0 && (c == A64_MI || c == A64_PL || (c >= A64_GE && c <= A64_LE));
     switch (cmp_dt.type) {
-        case TB_TAG_I8:  case TB_TAG_BOOL: dpimm_bitfield(e, false, false, scratch, reg, 0, 7);  return scratch;
-        case TB_TAG_I16:                  dpimm_bitfield(e, false, false, scratch, reg, 0, 15); return scratch;
+        case TB_TAG_I8:  case TB_TAG_BOOL: dpimm_bitfield(e, false, sign, scratch, reg, 0, 7);  return scratch;
+        case TB_TAG_I16:                  dpimm_bitfield(e, false, sign, scratch, reg, 0, 15); return scratch;
         default: return reg;
     }
 }
@@ -1456,7 +1461,8 @@ static void pre_emit(Ctx* restrict ctx, TB_CGEmitter* e, TB_Node* n) {
         a64_sp_change(e, true, stack_usage);
     }
     if (has_calls) {
-        ldst_mem_imm(e, false, 3, 0, LR, SP, (uint32_t)((stack_usage - 8) >> 3));
+        // 大帧（>32KB）超出 imm12 缩放范围，走带 scratch 的通用形式
+        a64_ldst_ex(e, true, TB_TYPE_I64, LR, SP, (int64_t)(stack_usage - 8), A64_SCRATCH);
     }
     ctx->prologue_length = e->count;
 }
@@ -1648,7 +1654,7 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             size_t pos = e->count;
             bool has_calls = ctx->call_usage > 0;
             if (has_calls) {
-                ldst_mem_imm(e, false, 3, 1, LR, SP, (uint32_t)((ctx->stack_usage - 8) >> 3));
+                a64_ldst_ex(e, false, TB_TYPE_I64, LR, SP, (int64_t)(ctx->stack_usage - 8), A64_SCRATCH);
             }
             if (ctx->stack_usage > 0) {
                 a64_sp_change(e, false, ctx->stack_usage);
@@ -1916,19 +1922,18 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             // 因此旧值投影从 exp 寄存器搬（曾误从 newv 搬：newv 寄存器
             // 内容不变，恒等于新值 → cmp 恒失败 → odin-tank 运行时
             // __tilde_tls_base 的 CAS claimed 永远 false，自旋死循环）。
-            // 注意：casal 会覆写 exp 寄存器（RA 视角它是只读输入）——与
-            // x64 钉 RAX 同款风险，仅期望值节点在他处还有后续使用时才有
-            // 隐患（odin-tank 全部是常量期望值，安全）。
+            // casal 会覆写 Rs，而 exp 在 RA 视角是只读输入（循环外提的常量
+            // 期望值会被下一轮读到旧值：thread_test 的 mutex lock_slow 实撞），
+            // 故经 scratch 做 CAS。
             TB_Node* dproj = USERN(proj_with_index(n, 1));
             int old  = op_reg_at(ctx, dproj,        REG_CLASS_GPR);
             int newv = op_reg_at(ctx, n->inputs[4], REG_CLASS_GPR);
             int exp  = op_reg_at(ctx, n->inputs[3], REG_CLASS_GPR);
             int ptr  = op_reg_at(ctx, n->inputs[2], REG_CLASS_GPR);
             int sz   = a64_size_log2(dproj->dt);
-            EMIT4(e, 0x08E0FC00u | ((uint32_t)sz << 30) | ((uint32_t)exp << 16) | ((uint32_t)ptr << 5) | (uint32_t)newv); // casal
-            if (old != exp) {
-                dpreg_log_shift(e, true, ORR, old, exp, ZR, 0, 0); // mov old, exp
-            }
+            dpreg_log_shift(e, true, ORR, A64_SCRATCH, exp, ZR, 0, 0); // mov x16, exp
+            EMIT4(e, 0x08E0FC00u | ((uint32_t)sz << 30) | ((uint32_t)A64_SCRATCH << 16) | ((uint32_t)ptr << 5) | (uint32_t)newv); // casal
+            dpreg_log_shift(e, true, ORR, old, A64_SCRATCH, ZR, 0, 0); // mov old, x16
             break;
         }
 
@@ -2109,7 +2114,7 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             // cmp cond,#0 置 NZCV，然后 cond!=0 → lhs
             // PATCH(odin-tilde): bool/i8 的 cond 寄存器高位可能是垃圾（参数/coalesce），
             // 先掩到 8 位再比较，否则 select 走向会反。
-            if (!flt) { cond = a64_mask_cmp_op(e, cond, n->inputs[1]->dt, A64_SCRATCH); }
+            if (!flt) { cond = a64_mask_cmp_op(e, cond, n->inputs[1]->dt, A64_SCRATCH, -1); }
             dpimm_addsub_imm(e, true, SUB, ZR, cond, 0, false, true);
             if (flt) {
                 FPtype type = n->dt.type == TB_TAG_F64 ? Double : Single;
@@ -2133,6 +2138,12 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             DPR1op op = (DPR1op[4]){REV, CLZ, CTZ, CNT}[n->type - TB_BSWAP];
             int   dst = op_reg_at(ctx, n,            REG_CLASS_GPR);
             int   src = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
+            if (n->type == TB_BSWAP) {
+                // opc 000010 在 sf=1 下是 REV32（逐 32 位字翻转），64 位 REV 是 000011；
+                // i16 用 REV16（低半字内交换）
+                int bits = tb_data_type_bit_size(ctx->module, n->dt.type);
+                op = bits == 64 ? (DPR1op) 0b000011 : bits == 16 ? REV16 : REV;
+            }
             dpreg_dp_1src(e, wide, op, dst, src);
             break;
         }
@@ -2199,12 +2210,45 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             int   dst = op_reg_at(ctx, n,            REG_CLASS_GPR);
             int   lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
             int   rhs = op_reg_at(ctx, n->inputs[2], REG_CLASS_GPR);
+            // i8/i16 高位不保证是扩展位：右移/除法前按符号性扩到 32 位
+            int bits = tb_data_type_bit_size(ctx->module, n->dt.type);
+            if (bits < 32 && n->type != TB_SHL && n->type != TB_ROR) {
+                bool sign = n->type == TB_SAR || n->type == TB_SDIV;
+                dpimm_bitfield(e, false, sign, A64_SCRATCH, lhs, 0, bits - 1);
+                lhs = A64_SCRATCH;
+                if (n->type == TB_UDIV || n->type == TB_SDIV) {
+                    dpimm_bitfield(e, false, sign, A64_SCRATCH2, rhs, 0, bits - 1);
+                    rhs = A64_SCRATCH2;
+                }
+            }
             dpreg_dp_2src(e, wide, op, dst, lhs, rhs);
             break;
         }
 
         case TB_UMOD:
         case TB_SMOD: tb_unreachable(); break;
+
+        case TB_UMULPAIR:
+        case TB_SMULPAIR: {
+            // 投影 0 = 低 64 位，1 = 高 64 位。投影寄存器可能与输入重叠，
+            // 高半先进 scratch，算完低半再搬。
+            int lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
+            int rhs = op_reg_at(ctx, n->inputs[2], REG_CLASS_GPR);
+            TB_User* lo_u = proj_with_index(n, 0);
+            TB_User* hi_u = proj_with_index(n, 1);
+            TB_Node* lo = lo_u && ctx->vreg_map[USERN(lo_u)->gvn] > 0 ? USERN(lo_u) : NULL;
+            TB_Node* hi = hi_u && ctx->vreg_map[USERN(hi_u)->gvn] > 0 ? USERN(hi_u) : NULL;
+            if (hi) {
+                dpreg_dp_3src(e, true, n->type == TB_UMULPAIR ? UMULH : SMULH, A64_SCRATCH, lhs, rhs, ZR);
+            }
+            if (lo) {
+                dpreg_dp_3src(e, true, MADD, op_reg_at(ctx, lo, REG_CLASS_GPR), lhs, rhs, ZR);
+            }
+            if (hi) {
+                dpreg_log_shift(e, true, ORR, op_reg_at(ctx, hi, REG_CLASS_GPR), A64_SCRATCH, ZR, 0, 0);
+            }
+            break;
+        }
 
         ////////////////////////////////
         // Float arithmatic
@@ -2393,8 +2437,8 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 int lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
                 int rhs = op_reg_at(ctx, n->inputs[2], REG_CLASS_GPR);
                 bool wide = tb_data_type_bit_size(ctx->module, op->extra_dt.type) == 64;
-                lhs = a64_mask_cmp_op(e, lhs, op->extra_dt, A64_SCRATCH);
-                rhs = a64_mask_cmp_op(e, rhs, op->extra_dt, A64_SCRATCH2);
+                lhs = a64_mask_cmp_op(e, lhs, op->extra_dt, A64_SCRATCH, op->cond);
+                rhs = a64_mask_cmp_op(e, rhs, op->extra_dt, A64_SCRATCH2, op->cond);
                 dpreg_addsub_shift(e, wide, SUB, ZR, lhs, rhs, 0, 0, true);
             }
             int dst = op_reg_at(ctx, n, REG_CLASS_GPR);
@@ -2404,7 +2448,7 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         case TB_a64_COND_IMM: {
             A64Cond* op = TB_NODE_GET_EXTRA(n);
             int lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
-            lhs = a64_mask_cmp_op(e, lhs, op->extra_dt, A64_SCRATCH);
+            lhs = a64_mask_cmp_op(e, lhs, op->extra_dt, A64_SCRATCH, op->cond);
             bool wide = tb_data_type_bit_size(ctx->module, op->extra_dt.type) == 64;
             TB_ASSERT(op->imm >= 0 && op->imm <= 0xFFF && "isel 的 where 已保证 12 位无符号");
             dpimm_addsub_imm(e, wide, SUB, ZR, lhs, (uint16_t) op->imm, false, true);
@@ -2419,8 +2463,8 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             int lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
             int rhs = op_reg_at(ctx, n->inputs[2], REG_CLASS_GPR);
             bool wide = tb_data_type_bit_size(ctx->module, op->extra_dt.type) == 64;
-            lhs = a64_mask_cmp_op(e, lhs, op->extra_dt, A64_SCRATCH);
-            rhs = a64_mask_cmp_op(e, rhs, op->extra_dt, A64_SCRATCH2);
+            lhs = a64_mask_cmp_op(e, lhs, op->extra_dt, A64_SCRATCH, op->cond);
+            rhs = a64_mask_cmp_op(e, rhs, op->extra_dt, A64_SCRATCH2, op->cond);
             dpreg_addsub_shift(e, wide, SUB, ZR, lhs, rhs, 0, 0, true);
             a64_emit_jcc_branches(ctx, e, n, (Condition)(op->cond & 0xF));
             break;
@@ -2428,7 +2472,7 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         case TB_a64_jcc_imm: {
             A64Cond* op = TB_NODE_GET_EXTRA(n);
             int lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
-            lhs = a64_mask_cmp_op(e, lhs, op->extra_dt, A64_SCRATCH);
+            lhs = a64_mask_cmp_op(e, lhs, op->extra_dt, A64_SCRATCH, op->cond);
             bool wide = tb_data_type_bit_size(ctx->module, op->extra_dt.type) == 64;
             TB_ASSERT(op->imm >= 0 && op->imm <= 0xFFF && "isel/构造处已保证 12 位无符号");
             dpimm_addsub_imm(e, wide, SUB, ZR, lhs, (uint16_t) op->imm, false, true);
@@ -2491,7 +2535,7 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             // pred 是整型条件值（bool/i8）：cmp pred,#0 置 NZCV
             // PATCH(odin-tilde): pred 高位可能是垃圾，先掩到 8 位（与 TB_SELECT 同因）。
             int pred = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
-            pred = a64_mask_cmp_op(e, pred, n->inputs[1]->dt, A64_SCRATCH);
+            pred = a64_mask_cmp_op(e, pred, n->inputs[1]->dt, A64_SCRATCH, -1);
             dpimm_addsub_imm(e, false, SUB, ZR, pred, 0, false, true);
             int dst = op_reg_at(ctx, n,            flt ? REG_CLASS_FPR : REG_CLASS_GPR);
             int lhs = op_reg_at(ctx, n->inputs[2], flt ? REG_CLASS_FPR : REG_CLASS_GPR);

@@ -831,6 +831,17 @@ static TB_Node* generate_loop_trip_count(TB_Function* f, TB_InductionVar var) {
     return range;
 }
 
+// n 是否（传递地）依赖 header 或其 phi；预算耗尽时保守返回 true。
+static bool lsr_depends_on_header(TB_Node* n, TB_Node* header, int* budget) {
+    if (n == NULL) { return false; }
+    if (n == header || (n->type == TB_PHI && n->inputs[0] == header)) { return true; }
+    if (--*budget < 0) { return true; }
+    FOR_N(i, 0, n->input_count) {
+        if (lsr_depends_on_header(n->inputs[i], header, budget)) { return true; }
+    }
+    return false;
+}
+
 static bool loop_strength_reduce(TB_Function* f, TB_Node* header) {
     TB_Node* latch = affine_loop_latch(header);
     if (latch == NULL) {
@@ -1056,7 +1067,12 @@ static bool loop_strength_reduce(TB_Function* f, TB_Node* header) {
 
                 // if the IV is always used as the index to some pointer, it might
                 // make sense to just make a pointer IV.
-                if (reduce->type == TB_PTR_OFFSET && reduce->inputs[2] == n) {
+                // 基址会被搬到循环外（init/limit），必须循环不变：for-in 切片
+                // 的基址 load 挂在循环 mem phi 上时，改写会让 phi 入口值依赖
+                // 循环内节点（core_stress 的 strings.join 求和为 0）
+                int lsr_budget = 64;
+                if (reduce->type == TB_PTR_OFFSET && reduce->inputs[2] == n &&
+                    !lsr_depends_on_header(reduce->inputs[1], header, &lsr_budget)) {
                     LSRVar new_var = *var;
                     new_var.init = make_ptr_offset(f, reduce->inputs[1], var->init);
                     new_var.op = TB_PTR_OFFSET;
