@@ -2287,17 +2287,43 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 simd_dp_floatdp1(e, type, FMOV, vdst->assigned, vsrc->assigned);
             } else
                 if (vdst->class == REG_CLASS_FPR && vsrc->class == REG_CLASS_GPR) {
+                // wide/type 都由 GPR 侧整数宽度决定：配对必须一致
+                // （fmov d,x / fmov s,w）。dst 可能是 V128（SLP 广播的
+                // 标量拷贝），按 dst 的 FP 类型推会拼出 sf=1+S 的
+                // 未分配指令（odin-tank arena_destroy 实撞 SIGILL）。
                 bool   wide = src->dt.type == TB_TAG_I64;
-                FPtype type = dst->dt.type == TB_TAG_F64 ? Double : Single;
+                FPtype type = wide ? Double : Single;
                 simd_dp_float2int(e, wide, type, FMOV_I2F, vdst->assigned, vsrc->assigned, false);
             } else
                 if (vdst->class == REG_CLASS_GPR && vsrc->class == REG_CLASS_FPR) {
-                bool   wide = src->dt.type == TB_TAG_I64;
-                FPtype type = dst->dt.type == TB_TAG_F64 ? Double : Single;
+                bool   wide = dst->dt.type == TB_TAG_I64;
+                FPtype type = wide ? Double : Single;
                 simd_dp_float2int(e, wide, type, FMOV_F2I, vdst->assigned, vsrc->assigned, false);
             }
             break;
         }
+        // 标量广播成向量：DUP Vd.T, Vn.T[0]。
+        // 标量经约束钉在 FPR（int 标量由 MACH_COPY 的 FMOV_I2F 搬进
+        // S 寄存器，lane0 有效位宽足够，按 B/H/S/D 读 lane0 即可）。
+        // 编码（DUP element）：0 Q 0 01110 000 imm5 00000000 Rn Rd，
+        // imm5 = 1<<size_log2 | lane<<(size_log2+1)（最低 set bit 表元素大小）。
+        case TB_VBROADCAST: {
+            int dst = op_reg_at(ctx, n, REG_CLASS_FPR);
+            int src = op_reg_at(ctx, n->inputs[1], REG_CLASS_FPR);
+            int esize_log2;
+            switch (n->dt.elem_or_addrspace) {
+                case TB_TAG_I8: case TB_TAG_BOOL: esize_log2 = 0; break;
+                case TB_TAG_I16:                  esize_log2 = 1; break;
+                case TB_TAG_I32: case TB_TAG_F32: esize_log2 = 2; break;
+                case TB_TAG_I64: case TB_TAG_F64: esize_log2 = 3; break;
+                default: tb_todo(); return;
+            }
+            uint32_t imm5 = 1u << esize_log2; // lane 0
+            uint32_t inst = 0x0E000400u | (1u<<30) | (imm5<<16) | ((uint32_t)src<<5) | (uint32_t)dst;
+            EMIT4(e, inst);
+            break;
+        }
+
         case TB_MACH_JUMP: {
             TB_Node* succ_n = cfg_next_control(n);
             TB_BasicBlock* succ_bb = nl_map_get_checked(ctx->cfg.node_to_block, succ_n);
@@ -2454,6 +2480,10 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         }
 
         default: {
+            // TEMP DEBUG: 打印撞进来的未处理节点类型
+            if (getenv("TB_EMIT_DEBUG")) {
+                fprintf(stderr, "a64 emit TODO: node type=%d dt.raw=%#x gvn=%u\n", n->type, n->dt.raw, n->gvn);
+            }
             tb_todo();
             break;
         }
@@ -2531,12 +2561,38 @@ static float edge_prob(TB_Node* n) {
     return 0.0f;
 }
 
+// SLP 向量化钩子（NEON，128-bit 向量）。
+// max_pack_width：每元素 lane 数与 x64 SSE 行一致（NEON 也是 128-bit）。
+// is_pack_op_supported：发射层目前只实现了向量 ld/st 的 Q 形式编码
+// （simd&fp LDR/STR），算术/搬移的 Q 形式尚未实现，所以只放行
+// load/store，其余返回 0 让 slp 剪掉该 pack（不崩、不静默错码）。
+// 注意必须 static：x64_target.c 里有同名全局符号，libtb 同时编进两个后端。
+static int is_pack_op_supported(TB_Function* f, TB_DataType dt, TB_Node* n, int width) {
+    int elem_bits = tb_data_type_bit_size(f->super.module, dt.type);
+    int bits = elem_bits * width;
+    switch (n->type) {
+        case TB_LOAD:
+        case TB_STORE:
+        return bits == 128;
+        default:
+        return 0;
+    }
+}
+
+static int max_pack_width_for_op(TB_Function* f, TB_DataType dt, TB_Node* n) {
+    static int limits[7] = { 16, 8, 4, 2, 0, 4, 2 };
+    TB_ASSERT(dt.type >= 2);
+    return limits[dt.type - 2];
+}
+
 ICodeGen tb__aarch64_codegen = {
     .minimum_addressable_size = 8,
     .pointer_size = 64,
     .global_init = global_init,
     .edge_prob = edge_prob,
     .print_extra = print_extra,
+    .is_pack_op_supported = is_pack_op_supported,
+    .max_pack_width_for_op = max_pack_width_for_op,
     .emit_win64eh_unwind_info = NULL,
     .emit_call_patches  = emit_call_patches,
     .compile_function   = compile_function,
