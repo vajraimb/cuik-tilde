@@ -1356,19 +1356,30 @@ static int a64_size_log2(TB_DataType dt) {
         case TB_TAG_I8: case TB_TAG_BOOL: return 0;
         case TB_TAG_I16:                  return 1;
         case TB_TAG_I32: case TB_TAG_F32: return 2;
-        default:                          return 3; // I64/F64/PTR
+        default:                          return 3; // I64/F64/PTR/V64
     }
 }
 static void a64_ldst_ex(TB_CGEmitter* e, bool is_store, TB_DataType dt, int rt, int rn, int64_t off, int scratch) {
     bool fp = TB_IS_FLOAT_TYPE(dt) || TB_IS_VECTOR_TYPE(dt);
+    // PATCH(odin-tilde): NEON 向量访存编码。SIMD&FP LDR/STR 的 128-bit
+    // （Q）形式是 size=00 + opc=1x（标量 D/ V64 是 size=11 + opc=0x），
+    // imm12 按 16 字节缩放；旧代码对向量 dt 落到 default size=3，把
+    // 16B 向量访存发成 8 字节（SLP 向量化后实撞）。
     int size_log2 = a64_size_log2(dt);
     int opc = is_store ? 0 : 1;
+    int scale = size_log2;
+    if (TB_IS_VECTOR_TYPE(dt) && dt.type != TB_TAG_V64) {
+        // V128/V256/V512：a64 只有 128-bit 向量寄存器，一次一条 Q
+        size_log2 = 0;
+        opc = is_store ? 2 : 3;
+        scale = 4;
+    }
     if (off == 0) {
         ldst_mem_imm(e, fp, size_log2, opc, rt, rn, 0);
     } else if (off >= -256 && off <= 255) {
         ldst_mem_unscaled(e, fp, size_log2, opc, rt, rn, (int16_t) off);
-    } else if (off > 0 && (off & ((1ll << size_log2) - 1)) == 0 && (off >> size_log2) <= 0xFFF) {
-        ldst_mem_imm(e, fp, size_log2, opc, rt, rn, (uint32_t)(off >> size_log2));
+    } else if (off > 0 && (off & ((1ll << scale) - 1)) == 0 && (off >> scale) <= 0xFFF) {
+        ldst_mem_imm(e, fp, size_log2, opc, rt, rn, (uint32_t)(off >> scale));
     } else {
         // 兜底：movz/movk 进 scratch，ADD 基址后零偏移访存。
         // PATCH(odin-tilde): 必须走 extended 形式——rn 可能是 SP(31)，
