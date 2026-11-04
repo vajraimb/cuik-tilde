@@ -1786,9 +1786,37 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             // size 在 extra 的 imm_count。
             int dst = op_reg_at(ctx, n->inputs[2], REG_CLASS_GPR);
             int src = op_reg_at(ctx, n->inputs[3], REG_CLASS_GPR);
-            int size;
             TB_NodeMemAccessImm* a = n->input_count < 5 ? TB_NODE_GET_EXTRA(n) : NULL;
             bool size_in_reg = (n->input_count == 5);
+
+            // PATCH(odin-tilde): 小常数尺寸（Odin slice/字符串头 16B、小结构
+            // 按值拷贝等）展开为直线 ldr/str 对，chunk 宽度受节点 align 约束
+            // （align=1 时退化为字节对，语义与 memcpy 完全一致）。x64 同款
+            // 快路径见 x64_target.c TB_MEMCPY（RAX 直传对）。不改写 dst/src，
+            // 立即数偏移寻址，无需 kills/保存恢复。odin-tank forward_cached
+            // 内层循环实测：每次 MAC 伴随一次 16B slice 头拷贝，字节循环
+            // 动态指令 ~40 条 vs 展开后 4 条。
+            if (!size_in_reg && a->has_count && a->imm_count > 0 && a->imm_count <= 64) {
+                uint64_t count = a->imm_count;
+                // align 是 2 的幂字节数；0/未知按 1 处理
+                uint64_t max_chunk = a->align >= 8 ? 8 : (a->align >= 4 ? 4 : (a->align >= 2 ? 2 : 1));
+                int64_t off = 0;
+                while (count > 0) {
+                    TB_DataType dt;
+                    uint64_t chunk;
+                    if (count >= 8 && max_chunk >= 8)      { dt = TB_TYPE_I64; chunk = 8; }
+                    else if (count >= 4 && max_chunk >= 4) { dt = TB_TYPE_I32; chunk = 4; }
+                    else if (count >= 2 && max_chunk >= 2) { dt = TB_TYPE_I16; chunk = 2; }
+                    else                                   { dt = TB_TYPE_I8;  chunk = 1; }
+                    a64_ldst_ex(e, false, dt, A64_SCRATCH2, src, off, A64_SCRATCH);
+                    a64_ldst_ex(e, true,  dt, A64_SCRATCH2, dst, off, A64_SCRATCH);
+                    off += (int64_t) chunk;
+                    count -= chunk;
+                }
+                break;
+            }
+
+            int size;
             if (size_in_reg) {
                 size = op_reg_at(ctx, n->inputs[4], REG_CLASS_GPR);
             } else {
