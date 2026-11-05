@@ -1801,17 +1801,16 @@ static void mark_active(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
     // we need to move that node to future active
     int old = ra->active[vreg->class][vreg->assigned];
     if (old != 0 && old != gvn) {
-        if (ctx->vreg_map[old] != ctx->vreg_map[gvn]) {
-            // PATCH(odin-tilde): stale occupant from before the wave (its
-            // node was re-split onto another vreg, see the remap/pin fixes).
-            // Stock asserts here, but with re-split nodes keeping their old
-            // vregs the slot can legitimately hold a different vreg — evict
-            // it so it can be re-colored; stock's own remedy (commented
-            // below) is exactly put_to_sleep.
+        // PATCH(odin-tilde): a different vreg here is a stale occupant from
+        // before the wave (its node was re-split onto another vreg, see the
+        // remap/pin fixes); stock asserts, but evicting it to the sleepers
+        // lets it be re-colored. A same-vreg occupant must go to sleep too:
+        // dropping it on the floor forgets a still-live member, so its slot
+        // looks free to the next interfering vreg (minesweeper3d main@main:
+        // a phi got STACK33 while the coalesced const copy %281 was live in it).
+        if (ctx->vreg_map[old] != ctx->vreg_map[gvn] || ra->gvn2node[old] != NULL) {
             put_to_sleep(ra, vreg->class, old);
         }
-        // printf("WARNING!!! %%%u %%%u\n", old, gvn);
-        // put_to_sleep(ra, vreg->class, old);
     }
 
     ra->active[vreg->class][vreg->assigned] = gvn;

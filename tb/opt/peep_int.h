@@ -387,34 +387,24 @@ static TB_Node* ideal_shift(TB_Function* f, TB_Node* n) {
     TB_Node* a = n->inputs[1];
     TB_Node* b = n->inputs[2];
 
-    // (a << amt1) >> amt2 = (a << (amt1 - amt2)) & (ALL << |amt1 - amt2|)
-    // (a >> amt1) << amt2 = (a >> (amt1 - amt2)) & (ALL << amt2)   [amt1 >= amt2]
-    //                     =  a << (amt2 - amt1)                    [amt1 <  amt2, exact]
+    // (a << amt1) >> amt2 = (a <</>> |amt1 - amt2|) & (ALL >> amt2)
+    // (a >> amt1) << amt2 = (a >>/<< |amt1 - amt2|) & (ALL << amt2)
     uint64_t amt1, amt2;
+    int bits = tb_data_type_bit_size(f->super.module, n->dt.type);
     if ((n->inputs[1]->type == TB_SHL || n->inputs[1]->type == TB_SHR) &&
-        get_int_const(n->inputs[2], &amt2) && get_int_const(n->inputs[1]->inputs[2], &amt1)) {
+        get_int_const(n->inputs[2], &amt2) && get_int_const(n->inputs[1]->inputs[2], &amt1) &&
+        bits > 0 && bits <= 64 && amt1 < bits && amt2 < bits) {
         TB_NodeTypeEnum inner_shift = n->inputs[1]->type;
 
-        // track how far we're shifting (and whether a mask is needed to
-        // clear the bits the exact result leaves at zero)
+        // track how far we're shifting
         int amt = inner_shift == TB_SHL ? amt1 : -amt1;
         amt += type == TB_SHL ? amt2 : -amt2;
 
-        uint64_t mask = 0;
-        if (inner_shift != type) {
-            if (inner_shift == TB_SHR && amt1 >= amt2) {
-                // (a >> amt1) << amt2: low amt2 bits are zero in the exact
-                // result — keep them clear.
-                if (amt2 < 64) { mask = UINT64_MAX << amt2; }
-            } else if (inner_shift == TB_SHL) {
-                // (a << amt1) >> amt2: low |amt1 - amt2| bits are zero in
-                // the exact result — keep them clear.
-                uint64_t d = amt1 > amt2 ? amt1 - amt2 : amt2 - amt1;
-                if (d < 64) { mask = UINT64_MAX << d; }
-            }
-            // inner SHR with amt1 < amt2 is an exact net left shift (the
-            // vacated low bits are filled with zeros by the SHL itself).
-        }
+        // the outer shift clears its amt2 bits on the far side (high bits for
+        // SHR, low bits for SHL), the net shift doesn't (rand@int63's
+        // `x << 1 >> 1` used to fold to plain x)
+        uint64_t all  = bits == 64 ? UINT64_MAX : (1ull << bits) - 1;
+        uint64_t mask = type == TB_SHR ? all >> amt2 : (all << amt2) & all;
 
         TB_Node* shift = n->inputs[1]->inputs[1];
         if (amt) {
