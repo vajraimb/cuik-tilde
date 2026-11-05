@@ -2147,13 +2147,26 @@ static int stk_new_slot(Rogers* ra, int width) {
     return slot;
 }
 
-// PATCH(odin-tilde): pre-colored stack slots skip every interference check
-// (the wake-time conflict fix only covers register classes), but the splits
-// between rounds stretch intervals, so two live vregs can come back sharing a
-// slot (fmt@_arg_number: an i8 phi copy spilled over the live i64 `i`).
-static bool stk_precolor_conflicts(Ctx* ctx, Rogers* ra, int vreg_id, size_t cnt, TB_Node** set, VReg** out_other) {
+static bool sets_interfere(Ctx* ctx, Rogers* ra, size_t cnt, TB_Node** set, TB_Node* other) {
+    FOR_N(k, 0, cnt) {
+        if (set[k]->type != TB_NULL && interfere(ctx, ra, set[k], other)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// PATCH(odin-tilde): pre-colored vregs skip every interference check (the
+// wake-time conflict fix runs later and only for register classes), but the
+// splits between rounds stretch intervals, so a carried-over color can land on
+// a live vreg's slot (fmt@_arg_number: an i8 phi copy spilled over the live
+// i64 `i`) or on a register some fixed-mask vreg needs (tank@observe: a split
+// copy kept R0 across the x0 param; priority coloring evicts it, the next
+// round's copy inherits R0 again, and the split loop never converges).
+static bool precolor_conflicts(Ctx* ctx, Rogers* ra, int vreg_id, size_t cnt, TB_Node** set, VReg** out_other) {
     VReg* vreg = &ctx->vregs[vreg_id];
-    SparseSet* future = &ra->future_active[REG_CLASS_STK];
+    int class = vreg->class;
+    SparseSet* future = &ra->future_active[class];
     FOR_N(i, 0, aarray_length(future->stack)) {
         uint32_t og = future->stack[i];
         TB_Node* other = ra->gvn2node[og];
@@ -2161,15 +2174,33 @@ static bool stk_precolor_conflicts(Ctx* ctx, Rogers* ra, int vreg_id, size_t cnt
         if (other == NULL || ov <= 0 || ov == vreg_id) { continue; }
 
         VReg* o = &ctx->vregs[ov];
-        if (o->class != REG_CLASS_STK || o->assigned < 0 ||
+        if (o->class != class || o->assigned < 0 ||
             o->assigned + o->reg_width <= vreg->assigned || vreg->assigned + vreg->reg_width <= o->assigned) {
             continue;
         }
 
-        FOR_N(k, 0, cnt) {
-            if (set[k]->type != TB_NULL && interfere(ctx, ra, set[k], other)) {
-                *out_other = o;
-                return true;
+        if (sets_interfere(ctx, ra, cnt, set, other)) {
+            *out_other = o;
+            return true;
+        }
+    }
+
+    if (class != REG_CLASS_STK) {
+        FOR_N(i, 1, aarray_length(ctx->vregs)) {
+            VReg* o = &ctx->vregs[i];
+            if (i == vreg_id || o->n == NULL || o->n->type == TB_NULL || o->mask == NULL ||
+                o->mask->class != class || fixed_reg_mask(o->mask) != vreg->assigned) {
+                continue;
+            }
+
+            size_t ocnt;
+            TB_Node* on = o->n;
+            TB_Node** oset = coalesce_set_array(ctx, ra, &on, &ocnt);
+            FOR_N(k, 0, ocnt) {
+                if (oset[k]->type != TB_NULL && sets_interfere(ctx, ra, cnt, set, oset[k])) {
+                    *out_other = o;
+                    return true;
+                }
             }
         }
     }
@@ -2672,10 +2703,20 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
                     size_t cnt;
                     TB_Node** set = coalesce_set_array(ctx, ra, &n, &cnt);
                     VReg* other = NULL;
-                    if (class == REG_CLASS_STK && !sparse_set_test(&ra->future_active[class], n->gvn) &&
-                        stk_precolor_conflicts(ctx, ra, vreg_id, cnt, set, &other)) {
+                    VReg* vreg = &ctx->vregs[vreg_id];
+                    bool pinned = class == REG_CLASS_STK || fixed_reg_mask(vreg->mask) == vreg->assigned;
+                    if (!sparse_set_test(&ra->future_active[class], n->gvn) &&
+                        (class == REG_CLASS_STK || !pinned) &&
+                        precolor_conflicts(ctx, ra, vreg_id, cnt, set, &other)) {
+                        if (class != REG_CLASS_STK) {
+                            // let the normal coloring find it a register
+                            TB_OPTDEBUG(REGALLOC)(printf("#   V%d drops its old color (conflicts with V%td)\n", vreg_id, other - ctx->vregs));
+                            vreg->assigned = -1;
+                            continue;
+                        }
+
                         // incoming stack params can't move, the other side does
-                        VReg* mover = ctx->vregs[vreg_id].assigned < ctx->num_regs[REG_CLASS_STK] ? other : &ctx->vregs[vreg_id];
+                        VReg* mover = vreg->assigned < ctx->num_regs[REG_CLASS_STK] ? other : vreg;
                         if (mover->assigned >= ctx->num_regs[REG_CLASS_STK]) {
                             TB_OPTDEBUG(REGALLOC)(printf("#   STACK%d conflict, V%td moves", mover->assigned, mover - ctx->vregs));
                             mover->assigned = stk_new_slot(ra, mover->reg_width);
