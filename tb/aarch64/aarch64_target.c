@@ -2143,6 +2143,11 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 // i16 用 REV16（低半字内交换）
                 int bits = tb_data_type_bit_size(ctx->module, n->dt.type);
                 op = bits == 64 ? (DPR1op) 0b000011 : bits == 16 ? REV16 : REV;
+            } else if (n->type == TB_CTZ) {
+                // scalar CTZ needs FEAT_CSSC; rbit+clz works on every ARMv8
+                dpreg_dp_1src(e, wide, RBIT, dst, src);
+                src = dst;
+                op  = CLZ;
             }
             dpreg_dp_1src(e, wide, op, dst, src);
             break;
