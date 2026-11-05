@@ -252,33 +252,29 @@ static TB_Node* mach_dfa_accept_6(Ctx* ctx, TB_Function* f, TB_Node* n) {
     uint64_t hash = 0;
     hash = hash*31 + n->type;
 
-    TB_Node* $ctrl = n->inputs[0];
-    TB_Node* $x = n->inputs[1];
+    TB_Node* $lhs = n->inputs[1];
+    TB_Node* $rhs = n->inputs[2];
     TB_DataType $dt = n->dt;
 
-    return a64_multi_way_branch(ctx, f, n);
-}
-static TB_Node* mach_dfa_accept_7(Ctx* ctx, TB_Function* f, TB_Node* n) {
-    uint64_t hash = 0;
-    hash = hash*31 + n->type;
-
-    TB_Node* $ctrl = n->inputs[0];
-    TB_Node* $x = n->inputs[1];
-    float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
-    TB_DataType $dt = n->dt;
-
+    int k0_type = 0;
+    TB_DataType k0_dt = TB_TYPE_VOID;
+    switch (hash) {
+        case 73: k0_type = TB_a64_lsl_imm, k0_dt = $dt; break;
+        case 74: k0_type = TB_a64_lsr_imm, k0_dt = $dt; break;
+        case 75: k0_type = TB_a64_asr_imm, k0_dt = $dt; break;
+        default: abort(); return NULL;
+    }
     size_t k0_i = 0;
-    TB_Node* k0 = tb_alloc_node(f, TB_a64_jcc_imm, TB_TYPE_TUPLE, 2, sizeof(A64Cond));
-    set_input(f, k0, $ctrl, k0_i++);
-    set_input(f, k0, $x, k0_i++);
-    A64Cond* k0_extra = TB_NODE_GET_EXTRA(k0);
-    k0_extra->cond = A64_NE, k0_extra->extra_dt = n->inputs[1]->dt, k0_extra->imm = 0, k0_extra->prob = $prob;
+    TB_Node* k0 = tb_alloc_node(f, k0_type, k0_dt, 2, sizeof(A64Imm12));
+    k0_i++;
+    set_input(f, k0, $lhs, k0_i++);
+    A64Imm12* k0_extra = TB_NODE_GET_EXTRA(k0);
+    k0_extra->imm = (uint32_t)a64_as_int64($rhs);
     k0 = tb_opt_gvn_node(f, k0);
     
     return k0;
 }
-
-static TB_Node* mach_dfa_accept_8(Ctx* ctx, TB_Function* f, TB_Node* n) {
+static TB_Node* mach_dfa_accept_7(Ctx* ctx, TB_Function* f, TB_Node* n) {
     uint64_t hash = 0;
     hash = hash*31 + n->type;
 
@@ -304,7 +300,37 @@ static TB_Node* mach_dfa_accept_8(Ctx* ctx, TB_Function* f, TB_Node* n) {
     return k0;
 }
 
+static TB_Node* mach_dfa_accept_8(Ctx* ctx, TB_Function* f, TB_Node* n) {
+    uint64_t hash = 0;
+    hash = hash*31 + n->type;
+
+    TB_Node* $ctrl = n->inputs[0];
+    TB_Node* $x = n->inputs[1];
+    TB_DataType $dt = n->dt;
+
+    return a64_multi_way_branch(ctx, f, n);
+}
 static TB_Node* mach_dfa_accept_9(Ctx* ctx, TB_Function* f, TB_Node* n) {
+    uint64_t hash = 0;
+    hash = hash*31 + n->type;
+
+    TB_Node* $ctrl = n->inputs[0];
+    TB_Node* $x = n->inputs[1];
+    float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+    TB_DataType $dt = n->dt;
+
+    size_t k0_i = 0;
+    TB_Node* k0 = tb_alloc_node(f, TB_a64_jcc_imm, TB_TYPE_TUPLE, 2, sizeof(A64Cond));
+    set_input(f, k0, $ctrl, k0_i++);
+    set_input(f, k0, $x, k0_i++);
+    A64Cond* k0_extra = TB_NODE_GET_EXTRA(k0);
+    k0_extra->cond = A64_NE, k0_extra->extra_dt = n->inputs[1]->dt, k0_extra->imm = 0, k0_extra->prob = $prob;
+    k0 = tb_opt_gvn_node(f, k0);
+    
+    return k0;
+}
+
+static TB_Node* mach_dfa_accept_10(Ctx* ctx, TB_Function* f, TB_Node* n) {
     uint64_t hash = 0;
     hash = hash*31 + n->type;
 
@@ -312,7 +338,7 @@ static TB_Node* mach_dfa_accept_9(Ctx* ctx, TB_Function* f, TB_Node* n) {
     return a64_isel_if_branch(ctx, f, n);
 }
 
-static TB_Node* mach_dfa_accept_10(Ctx* ctx, TB_Function* f, TB_Node* n) {
+static TB_Node* mach_dfa_accept_11(Ctx* ctx, TB_Function* f, TB_Node* n) {
     uint64_t hash = 0;
 
     TB_Node* $pred = n->inputs[1];
@@ -384,6 +410,31 @@ static MatchRuleID mach_dfa_rule_2(Ctx* ctx, TB_Function* f, TB_Node* n, int dep
 }
 
 static MatchRuleID mach_dfa_rule_3(Ctx* ctx, TB_Function* f, TB_Node* n, int depth) {
+    TB_Node* $lhs = n->inputs[1];
+    TB_Node* $rhs = n->inputs[2];
+    uint64_t hash = 0;
+    hash = hash*31 + n->type;
+
+    // { 73, 74, 75, 88, 89, 92, 93, 90, 91 }
+    switch (hash) {
+        default:
+        return 0;
+        // (ANY_OP ___ $lhs)
+        case 73: case 74: case 75: case 88: case 89: case 92: case 93: case 90: case 91: {
+            {
+                TB_DataType $dt = n->dt;
+                if (a64_shift_imm_ok(f, $dt, $rhs)) { return 6; }
+            }
+            {
+                TB_DataType $dt = TB_NODE_GET_EXTRA_T(n, TB_NodeCompare)->cmp_dt;
+                if (TB_IS_BOOL_INT_PTR($dt) && a64_fits_addsub_imm(a64_as_int64($rhs))) { return 7; }
+            }
+            return 0;
+        }
+    }
+}
+
+static MatchRuleID mach_dfa_rule_4(Ctx* ctx, TB_Function* f, TB_Node* n, int depth) {
     TB_Node* $ctrl = n->inputs[0];
     TB_Node* $x = n->inputs[1];
     uint64_t hash = 0;
@@ -397,7 +448,7 @@ static MatchRuleID mach_dfa_rule_3(Ctx* ctx, TB_Function* f, TB_Node* n, int dep
         case 17: {
             {
                 TB_DataType $dt = n->dt;
-                return 6;
+                return 8;
             }
         }
         // (ANY_OP $ctrl $x)
@@ -405,29 +456,8 @@ static MatchRuleID mach_dfa_rule_3(Ctx* ctx, TB_Function* f, TB_Node* n, int dep
             {
                 float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
                 TB_DataType $dt = n->dt;
-                return 7;
+                return 9;
             }
-        }
-    }
-}
-
-static MatchRuleID mach_dfa_rule_4(Ctx* ctx, TB_Function* f, TB_Node* n, int depth) {
-    TB_Node* $lhs = n->inputs[1];
-    TB_Node* $rhs = n->inputs[2];
-    uint64_t hash = 0;
-    hash = hash*31 + n->type;
-
-    // { 88, 89, 92, 93, 90, 91 }
-    switch (hash) {
-        default:
-        return 0;
-        // (ANY_OP ___ $lhs)
-        case 88: case 89: case 92: case 93: case 90: case 91: {
-            {
-                TB_DataType $dt = TB_NODE_GET_EXTRA_T(n, TB_NodeCompare)->cmp_dt;
-                if (TB_IS_BOOL_INT_PTR($dt) && a64_fits_addsub_imm(a64_as_int64($rhs))) { return 8; }
-            }
-            return 0;
         }
     }
 }
@@ -443,7 +473,7 @@ static MatchRuleID mach_dfa_rule_5(Ctx* ctx, TB_Function* f, TB_Node* n, int dep
         // a64_isel_if_branch(ctx, f, n)
         case 18: case 19: {
             {
-                return 9;
+                return 10;
             }
         }
     }
@@ -458,7 +488,7 @@ static MatchRuleID mach_dfa_rule_6(Ctx* ctx, TB_Function* f, TB_Node* n, int dep
     // { 0 }
     {
         TB_DataType $dt = n->dt;
-        return 10;
+        return 11;
     }
 }
 
@@ -530,13 +560,31 @@ static MatchRuleID node_isel_raw(Ctx* ctx, TB_Function* f, Set* shared, TB_Node*
 
             break;
         }
+        case TB_SHL:
+        case TB_SHR:
+        case TB_SAR:
+        {
+            DFA_LOG(depth+1, n->inputs[0], "Step");
+            if (n->inputs[0] != NULL) { break; }
+            DFA_LOG(depth+1, n->inputs[1], "Step");
+            // MATCH ANY n->inputs[1]
+            DFA_LOG(depth+1, n->inputs[2], "Step");
+            TB_Node* n__1 = n->inputs[2];
+            DFA_LOG2(depth+2, "TRY 'ICONST'");
+            do { if (n__1 && n__1->type == TB_ICONST && !set_get(shared, n__1->gvn)) {
+                k = (n->input_count == 3 ? RULE(3) : 0);
+                if (k) { return k; }
+            } } while (0);
+
+            break;
+        }
         case TB_BRANCH:
         {
             DFA_LOG(depth+1, n->inputs[0], "Step");
             // MATCH ANY n->inputs[0]
             DFA_LOG(depth+1, n->inputs[1], "Step");
             // MATCH ANY n->inputs[1]
-            return (n->input_count == 2 ? RULE(3) : 0);
+            return (n->input_count == 2 ? RULE(4) : 0);
         }
         case TB_CMP_EQ:
         case TB_CMP_NE:
@@ -550,10 +598,10 @@ static MatchRuleID node_isel_raw(Ctx* ctx, TB_Function* f, Set* shared, TB_Node*
             DFA_LOG(depth+1, n->inputs[1], "Step");
             // MATCH ANY n->inputs[1]
             DFA_LOG(depth+1, n->inputs[2], "Step");
-            TB_Node* n__1 = n->inputs[2];
+            TB_Node* n__2 = n->inputs[2];
             DFA_LOG2(depth+2, "TRY 'ICONST'");
-            do { if (n__1 && n__1->type == TB_ICONST && !set_get(shared, n__1->gvn)) {
-                k = (n->input_count == 3 ? RULE(4) : 0);
+            do { if (n__2 && n__2->type == TB_ICONST && !set_get(shared, n__2->gvn)) {
+                k = (n->input_count == 3 ? RULE(3) : 0);
                 if (k) { return k; }
             } } while (0);
 
@@ -565,7 +613,7 @@ static MatchRuleID node_isel_raw(Ctx* ctx, TB_Function* f, Set* shared, TB_Node*
             // MATCH ANY n->inputs[0]
             DFA_LOG(depth+1, n->inputs[1], "Step");
             // MATCH ANY n->inputs[1]
-            return (n->input_count == 2 ? RULE(3) : RULE(5));
+            return (n->input_count == 2 ? RULE(4) : RULE(5));
         }
         case TB_AFFINE_LATCH:
         {
@@ -599,5 +647,6 @@ static MatchRule match_rules[] = {
     mach_dfa_accept_8,
     mach_dfa_accept_9,
     mach_dfa_accept_10,
+    mach_dfa_accept_11,
 };
 #undef ACCEPT

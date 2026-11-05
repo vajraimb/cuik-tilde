@@ -24,8 +24,8 @@ static bool tb_node_is_terminator(TB_Node* n) { return tb_node_flags[n->type] & 
 static bool tb_node_is_end(TB_Node* n) { return tb_node_flags[n->type] & NODE_END; }
 static bool tb_node_is_ctrl(TB_Node* n) { return tb_node_flags[n->type] & NODE_CTRL; }
 static bool tb_node_is_fork_ctrl(TB_Node* n) { return tb_node_flags[n->type] & NODE_FORK_CTRL; }
-static bool tb_node_is_effect(TB_Node* n) { return tb_node_flags[n->type] & NODE_EFFECT; }
 static bool tb_node_is_memory_in(TB_Node* n) { return tb_node_flags[n->type] & NODE_MEMORY_IN; }
+static bool tb_node_is_effect(TB_Node* n) { return tb_node_flags[n->type] & NODE_EFFECT; }
 static bool tb_node_is_memory_out(TB_Node* n) { return tb_node_flags[n->type] & NODE_MEMORY_OUT; }
 static bool tb_node_is_safepoint(TB_Node* n) { return tb_node_flags[n->type] & NODE_SAFEPOINT; }
 static bool tb_node_is_no_gvn(TB_Node* n) { return tb_node_flags[n->type] & NODE_NO_GVN; }
@@ -33,7 +33,7 @@ static bool tb_node_is_compare(TB_Node* n) { return tb_node_flags[n->type] & NOD
 
 #define NODE_ISA(s, t) tb_node_isa((s)->type, TB_ ## t)
 static bool tb_node_is_x86(TB_Node* n) { return n->type >= 110 && n->type < 154; }
-static bool tb_node_is_a64(TB_Node* n) { return n->type >= 154 && n->type < 161; }
+static bool tb_node_is_a64(TB_Node* n) { return n->type >= 154 && n->type < 164; }
 
 #if 1 // namespace: x86
 typedef enum Cond {
@@ -155,8 +155,8 @@ const uint16_t* tb_node_subtypes[TB_NODE_TYPE_MAX] = {
     [TB_TAILCALL]            = (uint16_t[]){ 2, 27, 29 },
     [TB_x86_jcc]             = (uint16_t[]){ 2, 18, 115 },
     [TB_x86_call]            = (uint16_t[]){ 2, 27, 121 },
-    [TB_a64_jcc]             = (uint16_t[]){ 2, 18, 157 },
-    [TB_a64_jcc_imm]         = (uint16_t[]){ 2, 18, 158 },
+    [TB_a64_jcc]             = (uint16_t[]){ 2, 18, 160 },
+    [TB_a64_jcc_imm]         = (uint16_t[]){ 2, 18, 161 },
 };
 
 const uint64_t tb_node_flags[TB_NODE_TYPE_MAX] = {
@@ -383,6 +383,9 @@ const char* tb_node_get_name(TB_NodeTypeEnum n_type) {
         case TB_x86_movsx32: return "x86_movsx32";
         case TB_x86_vxor: return "x86_vxor";
         case TB_a64_add_imm12: return "a64_add_imm12";
+        case TB_a64_lsl_imm: return "a64_lsl_imm";
+        case TB_a64_lsr_imm: return "a64_lsr_imm";
+        case TB_a64_asr_imm: return "a64_asr_imm";
         case TB_a64_COND: return "a64_cond";
         case TB_a64_COND_IMM: return "a64_cond_imm";
         case TB_a64_jcc: return "a64_jcc";
@@ -550,6 +553,9 @@ size_t tb_node_extra_bytes(TB_NodeTypeEnum n_type) {
         case TB_x86_movsx32: return sizeof(X86MemOp);
         case TB_x86_vxor: return sizeof(X86MemOp);
         case TB_a64_add_imm12: return sizeof(A64Imm12);
+        case TB_a64_lsl_imm: return sizeof(A64Imm12);
+        case TB_a64_lsr_imm: return sizeof(A64Imm12);
+        case TB_a64_asr_imm: return sizeof(A64Imm12);
         case TB_a64_COND: return sizeof(A64Cond);
         case TB_a64_COND_IMM: return sizeof(A64Cond);
         case TB_a64_jcc: return sizeof(A64Cond);

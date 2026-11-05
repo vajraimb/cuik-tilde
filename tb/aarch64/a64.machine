@@ -52,6 +52,14 @@ pat (SMOD dt=$dt ___ $lhs $rhs) =>
 
 pat (PTR_OFFSET ___ $base ($off: ICONST ...)) where "a64_fits_addsub_imm(a64_as_int64($off))" => (a64_add_imm12 dt=TB_TYPE_PTR ___ $base imm="(uint32_t)a64_as_int64($off)")
 
+// 常数移位 → UBFM/SBFM 立即数形式（否则常数占一个寄存器，热循环里还会被 spill）
+(node lsl_imm extra=A64Imm12)
+(node lsr_imm extra=A64Imm12)
+(node asr_imm extra=A64Imm12)
+pat (SHL dt=$dt ___ $lhs ($rhs: ICONST ...)) where "a64_shift_imm_ok(f, $dt, $rhs)" => (a64_lsl_imm dt=$dt ___ $lhs imm="(uint32_t)a64_as_int64($rhs)")
+pat (SHR dt=$dt ___ $lhs ($rhs: ICONST ...)) where "a64_shift_imm_ok(f, $dt, $rhs)" => (a64_lsr_imm dt=$dt ___ $lhs imm="(uint32_t)a64_as_int64($rhs)")
+pat (SAR dt=$dt ___ $lhs ($rhs: ICONST ...)) where "a64_shift_imm_ok(f, $dt, $rhs)" => (a64_asr_imm dt=$dt ___ $lhs imm="(uint32_t)a64_as_int64($rhs)")
+
 ////////////////////////////////
 // 阶段2：比较/分支/选择机器节点
 ////////////////////////////////
