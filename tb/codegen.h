@@ -174,9 +174,14 @@ typedef struct {
     uint8_t param_count[8];
     uint8_t* params[8];
 
-    // return vals
+    // return vals (AAPCS64 HFAs come back in up to 4 FPRs)
     uint8_t ret_count[8];
-    uint8_t rets[8][2];
+    uint8_t rets[8][4];
+
+    // GPR that carries the hidden aggregate-return pointer (proto->sret)
+    // instead of the first param register
+    bool has_sret_reg;
+    uint8_t sret_reg;
 } CallingConv;
 
 // Relevant to the DSL

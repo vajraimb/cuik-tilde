@@ -125,9 +125,12 @@ static CallingConv CC_A64PCS = {
     .params[REG_CLASS_GPR] = (uint8_t[]){ 0, 1, 2, 3, 4, 5, 6, 7 },
     .params[REG_CLASS_FPR] = (uint8_t[]){ 0, 1, 2, 3, 4, 5, 6, 7 },
 
-    .ret_count = { [REG_CLASS_GPR] = 2, [REG_CLASS_FPR] = 2 },
+    .ret_count = { [REG_CLASS_GPR] = 2, [REG_CLASS_FPR] = 4 },
     .rets[REG_CLASS_GPR] = { 0, 1 },
-    .rets[REG_CLASS_FPR] = { 0, 1 },
+    .rets[REG_CLASS_FPR] = { 0, 1, 2, 3 },
+
+    .has_sret_reg = true,
+    .sret_reg = 8,
 };
 
 static void init_ctx(Ctx* restrict ctx, TB_ABI abi) {
@@ -877,14 +880,16 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
                 ins[2] = intern_regmask(ctx, REG_CLASS_GPR, false, 1u << LR);
 
                 TB_FunctionPrototype* proto = ctx->f->prototype;
-                TB_ASSERT(proto->return_count <= 2 && "At most 2 return values :(");
+                TB_ASSERT(proto->return_count <= 4 && "At most 4 return values (HFA) :(");
 
+                // 每类各自从 0 号寄存器数起（HFA 走 s0-s3，≤16B 复合走 x0/x1）
+                int next[8] = { 0 };
                 FOR_N(i, 0, proto->return_count) {
-                    int mask = 1u << i;
                     int type = TB_IS_FLOAT_TYPE(n->inputs[3 + i]->dt)
                         ? REG_CLASS_FPR
                         : REG_CLASS_GPR;
-                    ins[3 + i] = intern_regmask(ctx, type, false, mask);
+                    TB_ASSERT(next[type] < cc->ret_count[type]);
+                    ins[3 + i] = intern_regmask(ctx, type, false, 1u << cc->rets[type][next[type]++]);
                 }
 
                 size_t k = 3 + proto->return_count;
@@ -937,7 +942,14 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
                 //?? stage B - pre-padding and extension of arguments
                 //!! TODO: composite types
                 // stage C - assignment of args to registers and stack
-                FOR_N(i, 3, n->input_count) {
+                size_t first_arg = 3;
+                TB_FunctionPrototype* call_proto = TB_NODE_GET_EXTRA_T(n, TB_NodeCall)->proto;
+                if (call_proto && call_proto->sret && n->input_count > 3) {
+                    // B.5：聚合返回的结果地址走 x8，不占 x0
+                    ins[3] = intern_regmask2(ctx, REG_CLASS_GPR, false, 8);
+                    first_arg = 4;
+                }
+                FOR_N(i, first_arg, n->input_count) {
                     int type = n->inputs[i]->dt.type;
                     bool is_single = type == TB_TAG_F32;
                     bool is_double = type == TB_TAG_F64;

@@ -436,6 +436,7 @@ TB_FunctionPrototype* tb_prototype_create(TB_Module* m, TB_CallingConv cc, size_
     p->call_conv = cc;
     p->param_count = param_count;
     p->has_varargs = has_varargs;
+    p->sret = false;
     if (param_count > 0) {
         memcpy(p->params, params, param_count * sizeof(TB_PrototypeParam));
     }

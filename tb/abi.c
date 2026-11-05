@@ -202,6 +202,7 @@ TB_API TB_FunctionPrototype* tb_prototype_from_dbg(TB_Module* m, TB_DebugType* d
     TB_FunctionPrototype* p = tb_arena_alloc(get_permanent_arena(m), size);
     p->call_conv = dbg->func.cc;
     p->has_varargs = dbg->func.has_varargs;
+    p->sret = has_aggregate_return;
     p->return_count = return_count;
     p->param_count = has_aggregate_return + param_count;
 
