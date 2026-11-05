@@ -157,6 +157,13 @@ float tb_edge_prob(TB_Node* n) {
     TB_Node* tup = n->inputs[0];
     int index = TB_NODE_GET_EXTRA_T(n, TB_NodeProj)->index;
 
+    #ifdef TB_HAS_AARCH64
+    // a64 jcc nodes are parent=IF but carry A64Cond, not TB_NodeIf
+    if (tb_node_is_a64(tup) && tb_codegen_families[TB_ARCH_AARCH64].edge_prob) {
+        return tb_codegen_families[TB_ARCH_AARCH64].edge_prob(n);
+    }
+    #endif
+
     if (NODE_ISA(tup, IF)) {
         TB_NodeIf* br = TB_NODE_GET_EXTRA(tup);
         return index ? 1.0 - br->prob : br->prob;

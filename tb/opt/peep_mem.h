@@ -169,6 +169,60 @@ static bool no_alias_with(TB_Module* m, KnownPointer us, int us_bytes, TB_Node* 
     return false;
 }
 
+static TB_Node* memcpy_chunk_addr(TB_Function* f, TB_Node* base, int64_t off) {
+    if (off == 0) {
+        return base;
+    }
+    if (base->type == TB_PTR_OFFSET && base->inputs[2]->type == TB_ICONST) {
+        off += TB_NODE_GET_EXTRA_T(base->inputs[2], TB_NodeInt)->value;
+        base = base->inputs[1];
+    }
+    // no tb_opt_gvn_node here: it frees duplicates arena-style, which would
+    // also roll back user arrays grown by set_input; the worklist dedups it
+    TB_Node* k = make_int_node(f, TB_TYPE_I64, off);
+    TB_Node* p = tb_alloc_node(f, TB_PTR_OFFSET, TB_TYPE_PTR, 3, 0);
+    set_input(f, p, base, 1);
+    set_input(f, p, k, 2);
+    mark_node(f, p);
+    return p;
+}
+
+static bool memcpy_chunk_dt_at(TB_Function* f, TB_Node* addr, TB_DataType* out) {
+    FOR_USERS(u, addr) {
+        TB_Node* m = USERN(u);
+        if (USERI(u) != 2 || (m->type != TB_LOAD && m->type != TB_STORE)) { continue; }
+        TB_DataType dt = m->type == TB_LOAD ? m->dt : m->inputs[3]->dt;
+        if (!TB_IS_VECTOR_TYPE(dt) && tb_data_type_byte_size(f->super.module, dt.type) == 8) {
+            *out = dt;
+            return true;
+        }
+    }
+    return false;
+}
+
+// SROA only splits a local when every access at an offset agrees on the dt,
+// so pick the chunk dt from the existing scalar accesses on the local.
+static bool memcpy_chunk_dt(TB_Function* f, TB_Node* base, int64_t off, TB_DataType* out) {
+    if (base->type == TB_PTR_OFFSET && base->inputs[2]->type == TB_ICONST) {
+        off += TB_NODE_GET_EXTRA_T(base->inputs[2], TB_NodeInt)->value;
+        base = base->inputs[1];
+    }
+    if (base->type != TB_LOCAL) {
+        return false;
+    }
+    if (off == 0 && memcpy_chunk_dt_at(f, base, out)) {
+        return true;
+    }
+    FOR_USERS(u, base) {
+        TB_Node* p = USERN(u);
+        if (USERI(u) == 1 && p->type == TB_PTR_OFFSET && p->inputs[2]->type == TB_ICONST &&
+            TB_NODE_GET_EXTRA_T(p->inputs[2], TB_NodeInt)->value == off && memcpy_chunk_dt_at(f, p, out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static TB_Node* ideal_memcpy(TB_Function* f, TB_Node* n) {
     TB_Node* ctrl = n->inputs[0];
     TB_Node* mem = n->inputs[1];
@@ -187,6 +241,63 @@ static TB_Node* ideal_memcpy(TB_Function* f, TB_Node* n) {
             case 2: dt = TB_TYPE_I16; break;
             case 4: dt = TB_TYPE_I32; break;
             case 8: dt = TB_TYPE_I64; break;
+            case 16: case 24: case 32: {
+                // slices/strings/any: split into 8-byte chunks when a local is
+                // involved so SROA + mem2reg can promote it.
+                TB_Node* dst_root = dst->type == TB_PTR_OFFSET ? dst->inputs[1] : dst;
+                TB_Node* src_root = src->type == TB_PTR_OFFSET ? src->inputs[1] : src;
+                if (dst_root->type != TB_LOCAL && src_root->type != TB_LOCAL) {
+                    return NULL;
+                }
+                // same object may overlap, chunked copies aren't memmove-safe
+                if (dst_root == src_root) {
+                    return NULL;
+                }
+                // x64: the longer param live ranges this creates trip a rogers_ra
+                // stack slot sharing bug (fmt_map_probe: an i8 spill lands on a
+                // live ptr's slot), keep the memcpy there until that's fixed
+                if (f->super.module->target_arch == TB_ARCH_X86_64) {
+                    return NULL;
+                }
+
+                // both sides must agree on each chunk's dt, otherwise store->load
+                // forwarding would pun between classes (i64 vs f64)
+                TB_DataType cdts[4];
+                for (int64_t off = 0; off < size; off += 8) {
+                    TB_DataType d_dt, s_dt;
+                    bool has_d = memcpy_chunk_dt(f, dst, off, &d_dt);
+                    bool has_s = memcpy_chunk_dt(f, src, off, &s_dt);
+                    if (has_d && has_s && d_dt.raw != s_dt.raw) {
+                        return NULL;
+                    }
+                    cdts[off / 8] = has_d ? d_dt : has_s ? s_dt : TB_TYPE_I64;
+                }
+
+                TB_Node* chain = mem;
+                for (int64_t off = 0; off < size; off += 8) {
+                    TB_DataType cdt = cdts[off / 8];
+                    int calign = off == 0 || align < 8 ? align : 8;
+
+                    TB_Node* ld = tb_alloc_node(f, TB_LOAD, cdt, 3, sizeof(TB_NodeMemAccess));
+                    set_input(f, ld, ctrl, 0);
+                    set_input(f, ld, chain, 1);
+                    set_input(f, ld, memcpy_chunk_addr(f, src, off), 2);
+                    TB_NODE_SET_EXTRA(ld, TB_NodeMemAccess, .align = calign);
+                    mark_node(f, ld);
+
+                    TB_Node* st = tb_alloc_node(f, TB_STORE, TB_TYPE_MEMORY, 4, sizeof(TB_NodeMemAccess));
+                    set_input(f, st, ctrl,  0);
+                    set_input(f, st, chain, 1);
+                    set_input(f, st, memcpy_chunk_addr(f, dst, off), 2);
+                    set_input(f, st, ld,    3);
+                    TB_NODE_SET_EXTRA(st, TB_NodeMemAccess, .align = calign);
+                    if (off + 8 < size) {
+                        mark_node(f, st);
+                    }
+                    chain = st;
+                }
+                return chain;
+            }
             default: return NULL;
         }
 

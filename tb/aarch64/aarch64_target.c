@@ -339,12 +339,50 @@ static uint32_t a64_phash_fn64(uint32_t h, uint64_t k, uint32_t mod) {
 
 // AFFINE_LATCH 归一化：重打成 TB_IF 交给后面的 IF 模式（与 x64
 // isel_if_branch 相同；TB_IF 本身返回 NULL = 不匹配本回调）
+static TB_Node* a64_fuse_if_cmp(Ctx* ctx, TB_Function* f, TB_Node* n);
 static TB_Node* a64_isel_if_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
     if (n->type != TB_IF) {
         n->type = TB_IF;
-        return n;
+        TB_Node* jcc = a64_fuse_if_cmp(ctx, f, n);
+        return jcc ? jcc : n;
     }
-    return NULL;
+    return a64_fuse_if_cmp(ctx, f, n);
+}
+
+static TB_Node* a64_fuse_if_cmp(Ctx* ctx, TB_Function* f, TB_Node* n) {
+    // 整数比较直接融进分叉（cmp + b.cond），省掉 cset/uxtb/cmp #0/b.ne；
+    // 浮点比较仍走 COND + jcc_imm（jcc 只发整数 cmp）
+    TB_Node* c = n->inputs[1];
+    float prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+    TB_Node* jcc = NULL;
+    if (c->type == TB_a64_COND || c->type == TB_a64_COND_IMM) {
+        A64Cond* op = TB_NODE_GET_EXTRA(c);
+        if (TB_IS_FLOAT_TYPE(op->extra_dt)) { return NULL; }
+        jcc = c->type == TB_a64_COND
+            ? a64_mach_jcc(ctx, f, n->inputs[0], c->inputs[1], c->inputs[2], 0, op->cond, op->extra_dt)
+            : a64_mach_jcc(ctx, f, n->inputs[0], c->inputs[1], NULL, op->imm, op->cond, op->extra_dt);
+    } else if (c->type >= TB_CMP_EQ && c->type <= TB_CMP_SLE) {
+        TB_DataType cmp_dt = TB_NODE_GET_EXTRA_T(c, TB_NodeCompare)->cmp_dt;
+        if (!TB_IS_BOOL_INT_PTR(cmp_dt)) { return NULL; }
+        int cond;
+        switch (c->type) {
+            case TB_CMP_EQ:  cond = A64_EQ; break;
+            case TB_CMP_NE:  cond = A64_NE; break;
+            case TB_CMP_SLT: cond = A64_LT; break;
+            case TB_CMP_SLE: cond = A64_LE; break;
+            case TB_CMP_ULT: cond = A64_CC; break;
+            case TB_CMP_ULE: cond = A64_LS; break;
+            default: return NULL;
+        }
+        TB_Node* rhs = c->inputs[2];
+        jcc = rhs->type == TB_ICONST && a64_fits_addsub_imm(a64_as_int64(rhs))
+            ? a64_mach_jcc(ctx, f, n->inputs[0], c->inputs[1], NULL, a64_as_int64(rhs), cond, cmp_dt)
+            : a64_mach_jcc(ctx, f, n->inputs[0], c->inputs[1], rhs, 0, cond, cmp_dt);
+    } else {
+        return NULL;
+    }
+    TB_NODE_GET_EXTRA_T(jcc, A64Cond)->prob = prob;
+    return jcc;
 }
 
 static TB_Node* a64_multi_way_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {

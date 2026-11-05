@@ -1867,7 +1867,8 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
 
                     int cont_loop_i = TB_NODE_GET_EXTRA_T(header->inputs[1], TB_NodeProj)->index;
                     TB_NodeIf* br = TB_NODE_GET_EXTRA(header->inputs[1]->inputs[0]);
-                    br->prob = cont_loop_i ? taken : 1.0f - taken;
+                    // prob is for the true (index 0) edge
+                    br->prob = cont_loop_i ? 1.0f - taken : taken;
                 } else if (latch == NULL && NODE_ISA(header_end, IF)) {
                     exit_proj = get_simple_loop_exit(ctx, loop, header, header_end);
                     if (exit_proj) {

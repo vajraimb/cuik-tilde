@@ -53,7 +53,15 @@ static TB_Node* ideal_select(TB_Function* f, TB_Node* n) {
             set_input(f, cmp_node, src, 1);
             set_input(f, cmp_node, false_node, 2);
             TB_NODE_SET_EXTRA(cmp_node, TB_NodeCompare, .cmp_dt = src->dt);
-            return cmp_node;
+            if (n->dt.type == TB_TAG_BOOL) {
+                return cmp_node;
+            }
+
+            // the select produced n->dt, a bare bool would be read as all-ones
+            mark_node(f, cmp_node);
+            TB_Node* ext_node = tb_alloc_node(f, TB_ZERO_EXT, n->dt, 2, 0);
+            set_input(f, ext_node, cmp_node, 1);
+            return ext_node;
         }
     }
 
