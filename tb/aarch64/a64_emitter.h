@@ -725,6 +725,27 @@ static void ldst_mem_imm(TB_CGEmitter* restrict e, bool fp, int size_log2, int o
     EMIT4(e, inst);
 }
 
+/* load/store register (register offset, optional LSL by the access size)
+    1x 111 V 00 opc 1 mmmmm 011 S 10 nnnnn ttttt
+    size/opc/V 与 ldst_mem_imm 相同；S=1 时移位量由访问宽度隐含（Q 寄存器为 4）。
+    LDR X0,[X1,X2] = 0xF8626820, LDR S0,[X1,X2,LSL #2] = 0xBC627820。
+*/
+static void ldst_mem_reg(TB_CGEmitter* restrict e, bool fp, int size_log2, int opc, GPR Rt, GPR Rn, GPR Rm, bool shift) {
+    uint32_t inst = 0;
+    inst |= PUT_BITS(30,  2, size_log2);
+    inst |= PUT_BITS(26,  1, fp);
+    inst |= PUT_BITS(22,  2, opc);
+    inst |= PUT_BITS(21,  1, 1);
+    inst |= PUT_BITS(16,  5, Rm);
+    inst |= PUT_BITS(13,  3, 0b011); // LSL / UXTX：按 64 位下标
+    inst |= PUT_BITS(12,  1, shift);
+    inst |= PUT_BITS(10,  2, 0b10);
+    inst |= PUT_BITS( 5,  5, Rn);
+    inst |= PUT_BITS( 0,  5, Rt);
+    inst |= 0x38000000; // bits 29-27 = 111
+    EMIT4(e, inst);
+}
+
 /* load/store register (unscaled 9-bit signed offset, LDUR/STUR 家族)
     1x 111 0 00 0 iiiiiiiiii 00 nnnnn ttttt
     与 ldst_mem_imm 相同的 size/opc 语义，但 offset 为 -256..255 的原始字节数。

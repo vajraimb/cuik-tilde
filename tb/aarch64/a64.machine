@@ -68,6 +68,15 @@ pat (SHL dt=$dt ___ $lhs ($rhs: ICONST ...)) where "a64_shift_imm_ok(f, $dt, $rh
 pat (SHR dt=$dt ___ $lhs ($rhs: ICONST ...)) where "a64_shift_imm_ok(f, $dt, $rhs)" => (a64_lsr_imm dt=$dt ___ $lhs imm="(uint32_t)a64_as_int64($rhs)")
 pat (SAR dt=$dt ___ $lhs ($rhs: ICONST ...)) where "a64_shift_imm_ok(f, $dt, $rhs)" => (a64_asr_imm dt=$dt ___ $lhs imm="(uint32_t)a64_as_int64($rhs)")
 
+// base[i]：把 (i << log2(宽度)) 折进 ldr/str 的寄存器偏移，省掉移位和加法
+(struct A64Idx
+    (scale uint8_t)
+)
+(node ld_idx MEMORY_IN extra=A64Idx)
+(node st_idx MEMORY_IN MEMORY_OUT extra=A64Idx)
+pat (LOAD dt=$dt $ctrl $mem (PTR_OFFSET ___ $base ($shift: SHL ___ $idx ($amt: ICONST ...)))) where "a64_idx_scale_ok(f, $dt, $shift, $amt)" => (a64_ld_idx dt=$dt $ctrl $mem $base $idx scale="(uint8_t)a64_as_int64($amt)")
+pat (STORE $ctrl $mem (PTR_OFFSET ___ $base ($shift: SHL ___ $idx ($amt: ICONST ...))) $val) where "a64_idx_scale_ok(f, $val->dt, $shift, $amt)" => (a64_st_idx $ctrl $mem $base $idx $val scale="(uint8_t)a64_as_int64($amt)")
+
 ////////////////////////////////
 // 阶段2：比较/分支/选择机器节点
 ////////////////////////////////
