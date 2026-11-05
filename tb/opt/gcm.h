@@ -21,7 +21,13 @@ static TB_BasicBlock* sched_into_good_block(TB_Function* f, TB_GetLatency get_la
     if (IS_PROJ(late->start) && late->start == late->end) {
         TB_Node* next = cfg_next_control(late->end);
         if (NODE_ISA(next, NATURAL_LOOP)) {
-            return early != late ? late->dom : late;
+            // if the dominator heads a different (inner) loop, this latch is
+            // that loop's exit and hoisting would run n on every inner iteration
+            TB_BasicBlock* up = late->dom;
+            if (!getenv("GCM_NOLATCH") && NODE_ISA(up->start, NATURAL_LOOP) && up->start != next) {
+                return late;
+            }
+            return up;
         }
     }
 
@@ -115,6 +121,11 @@ static bool node_true_dep_reaches(TB_Function* f, TB_Node* from, TB_Node* to) {
         TB_Node* n = aarray_pop(stack);
         if (set_get(&visited, n->gvn)) { continue; }
         set_put(&visited, n->gvn);
+        // phi/region inputs come from earlier iterations or predecessor blocks,
+        // walking them makes everything in a loop "reach" everything else
+        static __thread int old_mode = -1;
+        if (n == from) { const char* e = getenv("ANTI_OLD"); old_mode = e && (e[0] == '*' || strstr(f->super.name, e)); }
+        if (!old_mode && (n->type == TB_PHI || NODE_ISA(n, REGION))) { continue; }
         FOR_N(i, 0, n->input_count) {
             TB_Node* in = n->inputs[i];
             if (in == NULL) { continue; }
@@ -125,7 +136,9 @@ static bool node_true_dep_reaches(TB_Function* f, TB_Node* from, TB_Node* to) {
     return found;
 }
 
-static void add_anti_deps(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* mem, TB_BasicBlock* early) {
+static void anti_dep_walk_mem_out(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* un, int depth);
+
+static void add_anti_deps_rec(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* mem, int depth) {
     if (mem->type == TB_SPLITMEM) {
         return;
     }
@@ -140,11 +153,65 @@ static void add_anti_deps(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* mem
                 // 实撞：store → load(过 mem 链) → 用 load 值算地址 → 再
                 // load(挂在 store 之前的 mem 上)）。mem SSA 走到这一步
                 // 已默认二者无别名，排序边既多余又有害。
-                if (node_true_dep_reaches(f, ld, un)) { continue; }
+                // ld is stuck after un, but it still has to beat whoever
+                // writes memory after un (sha3 rho-pi: ld's ctrl is past a
+                // call, the aliasing store hangs off the call's mem out)
+                if (node_true_dep_reaches(f, ld, un)) {
+                    anti_dep_walk_mem_out(f, cfg, ld, un, depth);
+                    continue;
+                }
                 tb_node_add_extra(f, un, ld);
             }
         }
     }
+}
+
+static void anti_dep_walk_mem_out(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* un, int depth) {
+    if (depth >= 8) { return; }
+    if (un->dt.type == TB_TAG_MEMORY) {
+        add_anti_deps_rec(f, cfg, ld, un, depth + 1);
+        return;
+    }
+    FOR_USERS(u, un) {
+        TB_Node* p = USERN(u);
+        if (IS_PROJ(p) && p->dt.type == TB_TAG_MEMORY) {
+            add_anti_deps_rec(f, cfg, ld, p, depth + 1);
+        }
+    }
+}
+
+static void add_anti_deps(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* mem, TB_BasicBlock* early) {
+    add_anti_deps_rec(f, cfg, ld, mem, 0);
+}
+
+// the anti-dep edges only order things within a block, a load also can't sink
+// into a block past the memory writers of its mem state (the LCA may then land
+// above the early block, the caller keeps the early block in that case)
+static TB_BasicBlock* anti_dep_lca(TB_Function* f, TB_BasicBlock* lca, TB_Node* ld, TB_Node* mem, int depth) {
+    if (mem->type == TB_SPLITMEM || depth >= 8) {
+        return lca;
+    }
+
+    FOR_USERS(u, mem) {
+        TB_Node* un = USERN(u);
+        if (un != ld && USERI(u) <= un->input_count && un->type != TB_PHI && tb_node_is_memory_out(un)) {
+            TB_BasicBlock* bb = f->scheduled[un->gvn];
+            if (bb == NULL) { continue; }
+            if (!node_true_dep_reaches(f, ld, un)) {
+                lca = find_lca(lca, bb);
+            } else if (un->dt.type == TB_TAG_MEMORY) {
+                lca = anti_dep_lca(f, lca, ld, un, depth + 1);
+            } else {
+                FOR_USERS(u2, un) {
+                    TB_Node* p = USERN(u2);
+                    if (IS_PROJ(p) && p->dt.type == TB_TAG_MEMORY) {
+                        lca = anti_dep_lca(f, lca, ld, p, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+    return lca;
 }
 
 TB_BasicBlock* tb_late_sched(TB_Function* f, TB_CFG* cfg, TB_BasicBlock* lca, TB_Node* n) {
@@ -393,14 +460,18 @@ void tb_global_schedule(TB_Function* f, TB_Worklist* ws, TB_CFG cfg, bool early_
                         TB_OPTDEBUG(GCM)(printf("%s: TRY LATE %%%u (BB%zu)\n", f->super.name, n->gvn, curr - cfg.blocks));
 
                         // insert anti-deps
+                        TB_Node* anti_mem = NULL;
                         if (!tb_node_is_memory_out(n)) {
-                            TB_Node* mem = tb_node_mem_in(n);
-                            if (mem != NULL) {
-                                add_anti_deps(f, &cfg, n, mem, curr);
+                            anti_mem = tb_node_mem_in(n);
+                            if (anti_mem != NULL) {
+                                add_anti_deps(f, &cfg, n, anti_mem, curr);
                             }
                         }
 
                         lca = tb_late_sched(f, &cfg, lca, n);
+                        if (lca != NULL && anti_mem != NULL) {
+                            lca = anti_dep_lca(f, lca, n, anti_mem, 0);
+                        }
 
                         if (lca != NULL) {
                             TB_ASSERT_MSG(curr, "we made it to late sched without an early sched?");
