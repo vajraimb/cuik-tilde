@@ -6,8 +6,8 @@ extern const uint16_t* tb_node_subtypes[];
 typedef enum TB_NodeFlagsEnum {
     NODE_CONSTANT             = 1ull << 0,
     NODE_PINNED               = 1ull << 1,
-    NODE_TERMINATOR           = 1ull << 2,
-    NODE_END                  = 1ull << 3,
+    NODE_END                  = 1ull << 2,
+    NODE_TERMINATOR           = 1ull << 3,
     NODE_CTRL                 = 1ull << 4,
     NODE_FORK_CTRL            = 1ull << 5,
     NODE_EFFECT               = 1ull << 6,
@@ -20,20 +20,64 @@ typedef enum TB_NodeFlagsEnum {
 
 static bool tb_node_is_constant(TB_Node* n) { return tb_node_flags[n->type] & NODE_CONSTANT; }
 static bool tb_node_is_pinned(TB_Node* n) { return tb_node_flags[n->type] & NODE_PINNED; }
-static bool tb_node_is_terminator(TB_Node* n) { return tb_node_flags[n->type] & NODE_TERMINATOR; }
 static bool tb_node_is_end(TB_Node* n) { return tb_node_flags[n->type] & NODE_END; }
+static bool tb_node_is_terminator(TB_Node* n) { return tb_node_flags[n->type] & NODE_TERMINATOR; }
 static bool tb_node_is_ctrl(TB_Node* n) { return tb_node_flags[n->type] & NODE_CTRL; }
 static bool tb_node_is_fork_ctrl(TB_Node* n) { return tb_node_flags[n->type] & NODE_FORK_CTRL; }
-static bool tb_node_is_memory_in(TB_Node* n) { return tb_node_flags[n->type] & NODE_MEMORY_IN; }
 static bool tb_node_is_effect(TB_Node* n) { return tb_node_flags[n->type] & NODE_EFFECT; }
+static bool tb_node_is_memory_in(TB_Node* n) { return tb_node_flags[n->type] & NODE_MEMORY_IN; }
 static bool tb_node_is_memory_out(TB_Node* n) { return tb_node_flags[n->type] & NODE_MEMORY_OUT; }
 static bool tb_node_is_safepoint(TB_Node* n) { return tb_node_flags[n->type] & NODE_SAFEPOINT; }
 static bool tb_node_is_no_gvn(TB_Node* n) { return tb_node_flags[n->type] & NODE_NO_GVN; }
 static bool tb_node_is_compare(TB_Node* n) { return tb_node_flags[n->type] & NODE_COMPARE; }
 
 #define NODE_ISA(s, t) tb_node_isa((s)->type, TB_ ## t)
+static bool tb_node_is_a64(TB_Node* n) { return n->type >= 154 && n->type < 165; }
 static bool tb_node_is_x86(TB_Node* n) { return n->type >= 110 && n->type < 154; }
-static bool tb_node_is_a64(TB_Node* n) { return n->type >= 154 && n->type < 164; }
+
+#if 1 // namespace: a64
+typedef struct A64Imm12 {
+    uint32_t imm;
+} A64Imm12;
+
+typedef struct A64Imm64 {
+    int64_t imm;
+} A64Imm64;
+
+typedef enum Condition {
+    A64_EQ = 0,
+    A64_NE = 1,
+    A64_CS = 2,
+    A64_CC = 3,
+    A64_MI = 4,
+    A64_PL = 5,
+    A64_VS = 6,
+    A64_VC = 7,
+    A64_HI = 8,
+    A64_LS = 9,
+    A64_GE = 10,
+    A64_LT = 11,
+    A64_GT = 12,
+    A64_LE = 13,
+    A64_AL = 14,
+    A64_NV = 15,
+} Condition;
+
+typedef struct A64Cond {
+    uint8_t cond;
+    TB_DataType extra_dt;
+    int64_t imm;
+    float prob;
+} A64Cond;
+
+typedef struct A64JmpMulti {
+    int succ_count;
+    TB_Global* table;
+    size_t entry_count;
+    int* entries;
+} A64JmpMulti;
+
+#endif
 
 #if 1 // namespace: x86
 typedef enum Cond {
@@ -90,46 +134,6 @@ enum {
 
 #endif
 
-#if 1 // namespace: a64
-typedef struct A64Imm12 {
-    uint32_t imm;
-} A64Imm12;
-
-typedef enum Condition {
-    A64_EQ = 0,
-    A64_NE = 1,
-    A64_CS = 2,
-    A64_CC = 3,
-    A64_MI = 4,
-    A64_PL = 5,
-    A64_VS = 6,
-    A64_VC = 7,
-    A64_HI = 8,
-    A64_LS = 9,
-    A64_GE = 10,
-    A64_LT = 11,
-    A64_GT = 12,
-    A64_LE = 13,
-    A64_AL = 14,
-    A64_NV = 15,
-} Condition;
-
-typedef struct A64Cond {
-    uint8_t cond;
-    TB_DataType extra_dt;
-    int64_t imm;
-    float prob;
-} A64Cond;
-
-typedef struct A64JmpMulti {
-    int succ_count;
-    TB_Global* table;
-    size_t entry_count;
-    int* entries;
-} A64JmpMulti;
-
-#endif
-
 #ifndef TB_GEN_IMPL
 TB_NodeFlagsEnum tb_node_get_flags(TB_Node* n);
 const char* tb_node_get_name(TB_NodeTypeEnum n_type);
@@ -155,8 +159,8 @@ const uint16_t* tb_node_subtypes[TB_NODE_TYPE_MAX] = {
     [TB_TAILCALL]            = (uint16_t[]){ 2, 27, 29 },
     [TB_x86_jcc]             = (uint16_t[]){ 2, 18, 115 },
     [TB_x86_call]            = (uint16_t[]){ 2, 27, 121 },
-    [TB_a64_jcc]             = (uint16_t[]){ 2, 18, 160 },
-    [TB_a64_jcc_imm]         = (uint16_t[]){ 2, 18, 161 },
+    [TB_a64_jcc]             = (uint16_t[]){ 2, 18, 161 },
+    [TB_a64_jcc_imm]         = (uint16_t[]){ 2, 18, 162 },
 };
 
 const uint64_t tb_node_flags[TB_NODE_TYPE_MAX] = {
@@ -383,6 +387,7 @@ const char* tb_node_get_name(TB_NodeTypeEnum n_type) {
         case TB_x86_movsx32: return "x86_movsx32";
         case TB_x86_vxor: return "x86_vxor";
         case TB_a64_add_imm12: return "a64_add_imm12";
+        case TB_a64_add_imm: return "a64_add_imm";
         case TB_a64_lsl_imm: return "a64_lsl_imm";
         case TB_a64_lsr_imm: return "a64_lsr_imm";
         case TB_a64_asr_imm: return "a64_asr_imm";
@@ -553,6 +558,7 @@ size_t tb_node_extra_bytes(TB_NodeTypeEnum n_type) {
         case TB_x86_movsx32: return sizeof(X86MemOp);
         case TB_x86_vxor: return sizeof(X86MemOp);
         case TB_a64_add_imm12: return sizeof(A64Imm12);
+        case TB_a64_add_imm: return sizeof(A64Imm64);
         case TB_a64_lsl_imm: return sizeof(A64Imm12);
         case TB_a64_lsr_imm: return sizeof(A64Imm12);
         case TB_a64_asr_imm: return sizeof(A64Imm12);

@@ -566,7 +566,9 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
             // certain nodes can be duplicated safely
             if (n->type == TB_PHI) {
                 FOR_N(j, 1, n->input_count) {
-                    if (n->inputs[j]) {
+                    // PATCH(odin-tilde): folding an ICONST into an immediate only reads
+                    // its value, the node itself stays for the phi
+                    if (n->inputs[j] && n->inputs[j]->type != TB_ICONST) {
                         set_put(&shared, n->inputs[j]->gvn);
                     }
                 }

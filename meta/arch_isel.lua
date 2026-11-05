@@ -1074,6 +1074,26 @@ do
             for where,list in packs:iter() do
                 local is_subpat = set[list[1]][3]
                 local where_expr = where
+
+                -- PATCH(odin-tilde): packs sharing a shape group are tried in order,
+                -- so a predicate must not fire for another pack's root op
+                -- (ADD's TB_IS_INTEGER_TYPE used to swallow SHL here)
+                if where_expr ~= "true" and #hashes > 1 then
+                    local mine = OrderedSet()
+                    for _,i in ipairs(list) do mine:put(hashes[i]) end
+                    local guard = {}
+                    local covers_all = true
+                    for k in keys:iter() do
+                        local found = false
+                        for m in mine:iter() do if m == k then found = true end end
+                        if not found then covers_all = false end
+                    end
+                    if not covers_all then
+                        for m in mine:iter() do guard[#guard + 1] = string.format("hash == %d", m) end
+                        where_expr = "("..table.concat(guard, " || ")..") && ("..where_expr..")"
+                    end
+                end
+
                 if is_subpat then
                     if where_expr == "true" then
                         where_expr = "depth == 0"

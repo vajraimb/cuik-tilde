@@ -24,6 +24,10 @@ typedef struct {
     // depth[n->gvn]
     //   helps narrow node independence checks
     int* depth;
+
+    // scratch for independence checks; must not be f->worklist (that one holds
+    // pending peephole work, clearing it dropped work and leaked our nodes into peeps)
+    TB_Worklist dep_ws;
 } PairSet;
 
 typedef struct {
@@ -69,7 +73,7 @@ static bool independent(TB_Function* f, PairSet* pairs, TB_Node* a, TB_Node* b) 
         SWAP(TB_Node*, shallow, deep);
     }
 
-    TB_Worklist* ws = f->worklist;
+    TB_Worklist* ws = &pairs->dep_ws;
     worklist_clear(ws);
     worklist_push(ws, deep);
     int mark = pairs->depth[shallow->gvn];
@@ -942,6 +946,8 @@ bool slp_transform(TB_Function* f, LoopOpt* ctx, TB_Worklist* ws, TB_LoopTree* l
         }
     }
 
+    worklist_alloc(&pairs.dep_ws, f->node_count);
+
     bool progress = false;
     if (generate_pack(f, &pairs, ws, ctx, loop)) {
         cuikperf_region_start("SLP xform", NULL);
@@ -949,6 +955,7 @@ bool slp_transform(TB_Function* f, LoopOpt* ctx, TB_Worklist* ws, TB_LoopTree* l
         cuikperf_region_end();
     }
 
+    worklist_free(&pairs.dep_ws);
     tb_arena_restore(&f->tmp_arena, sp);
     return progress;
 }

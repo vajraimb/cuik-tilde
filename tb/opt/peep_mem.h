@@ -72,7 +72,7 @@ static MemRef compute_mem_ref(TB_Function* f, TB_Node* mem) {
         r.base = r.base->inputs[1];
 
         if (curr->type == TB_ICONST) {
-            r.offset = TB_NODE_GET_EXTRA_T(curr, TB_NodeInt)->value;
+            r.offset += TB_NODE_GET_EXTRA_T(curr, TB_NodeInt)->value;
         } else {
             TB_Node* index = NULL;
             uint64_t stride = 1;
@@ -626,22 +626,14 @@ static TB_Node* ideal_ptr_offset(TB_Function* f, TB_Node* n) {
     }
 
     // reassociate:
-    //   off(off(a, b), c) => off(a, b + c)
+    //   off(off(a, CON1), CON2) => off(a, CON1 + CON2)
+    //
+    // PATCH(odin-tilde): off(off(a, b), c) => off(a, b + c) for non-constant c is
+    // gone: frontends nest offsets invariant-first (slice base, then index), and
+    // merging glued the loop-invariant row base onto the induction term, so
+    // GCM couldn't hoist it out of inner loops.
     if (base->type == TB_PTR_OFFSET) {
-        if (offset->type != TB_ICONST) {
-            TB_Node* rhs = tb_alloc_node(f, TB_ADD, offset->dt, 3, sizeof(TB_NodeBinopInt));
-            set_input(f, rhs, base->inputs[2], 1);
-            set_input(f, rhs, offset,          2);
-            mark_node(f, rhs);
-
-            // give it a good type to avoid monotonicity problems
-            Lattice* rhs_type = value_of(f, rhs);
-            latuni_set(f, rhs, rhs_type);
-
-            set_input(f, n, base->inputs[1], 1);
-            set_input(f, n, rhs,             2);
-            return n;
-        } else if (base->inputs[2]->type == TB_ICONST) {
+        if (offset->type == TB_ICONST && base->inputs[2]->type == TB_ICONST) {
             Lattice* a = latuni_get(f, offset);
             Lattice* b = latuni_get(f, base->inputs[2]);
             TB_ASSERT(lattice_is_iconst(a) && lattice_is_iconst(b));

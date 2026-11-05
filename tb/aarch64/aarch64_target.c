@@ -186,6 +186,8 @@ static void print_extra(OutStream* s, TB_Node* n) {
     if (n->type == TB_a64_add_imm12 || n->type == TB_a64_lsl_imm || n->type == TB_a64_lsr_imm || n->type == TB_a64_asr_imm) {
         A64Imm12* op = TB_NODE_GET_EXTRA(n);
         s_writef(s, "imm=%d", op->imm);
+    } else if (n->type == TB_a64_add_imm) {
+        s_writef(s, "imm=%lld", (long long) TB_NODE_GET_EXTRA_T(n, A64Imm64)->imm);
     } else if (n->type >= TB_a64_COND && n->type <= TB_a64_csel) {
         A64Cond* op = TB_NODE_GET_EXTRA(n);
         s_writef(s, "cond=%d imm=%d", op->cond, op->imm);
@@ -1288,7 +1290,8 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
         case TB_a64_lsl_imm:
         case TB_a64_lsr_imm:
         case TB_a64_asr_imm:
-        case TB_a64_add_imm12: {
+        case TB_a64_add_imm12:
+        case TB_a64_add_imm: {
             if (ins) {
                 ins[1] = ctx->normie_mask[REG_CLASS_GPR];
             }
@@ -2490,6 +2493,35 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
 
             bool wide = n->dt.type == TB_TAG_I64 || TB_IS_POINTER_TYPE(n->dt);
             dpimm_addsub_imm(e, wide, ADD, dst, lhs, imm, shift, false);
+            break;
+        }
+        case TB_a64_add_imm: {
+            int dst = op_reg_at(ctx, n,            REG_CLASS_GPR);
+            int lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
+            bool wide = n->dt.type == TB_TAG_I64 || TB_IS_POINTER_TYPE(n->dt);
+            uint64_t mask = wide ? UINT64_MAX : UINT32_MAX;
+            uint64_t pos = (uint64_t) TB_NODE_GET_EXTRA_T(n, A64Imm64)->imm & mask;
+            uint64_t neg = (0 - pos) & mask;
+            if (pos == (pos & 0xFFF)) {
+                if (pos == 0 && dst == lhs) { break; }
+                dpimm_addsub_imm(e, wide, ADD, dst, lhs, pos, false, false);
+            } else if (pos == (pos & 0xFFF000)) {
+                dpimm_addsub_imm(e, wide, ADD, dst, lhs, pos >> 12, true, false);
+            } else if (neg == (neg & 0xFFF)) {
+                dpimm_addsub_imm(e, wide, SUB, dst, lhs, neg, false, false);
+            } else if (neg == (neg & 0xFFF000)) {
+                dpimm_addsub_imm(e, wide, SUB, dst, lhs, neg >> 12, true, false);
+            } else {
+                // 编码不下：借 A64_SCRATCH 物化（dst 可能与 lhs 同寄存器，lhs 不受影响）
+                MoveOp op = MOVZ;
+                bool started = false;
+                for (int shift = 0; pos; pos >>= 16, shift++) {
+                    uint16_t v = pos & 0xFFFF;
+                    if (v) { dpimm_movewide(e, wide, op, A64_SCRATCH, v, shift); op = MOVK; started = true; }
+                }
+                if (!started) { dpimm_movewide(e, wide, MOVZ, A64_SCRATCH, 0, 0); }
+                dpreg_addsub_shift(e, wide, ADD, dst, lhs, A64_SCRATCH, 0, 0, false);
+            }
             break;
         }
 

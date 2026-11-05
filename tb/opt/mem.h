@@ -89,8 +89,20 @@ static bool good_mem_op(TB_Function* f, TB_Node* n) { // ld, st, memcpy, memset
     }
 }
 
+static void kill_offset_stores(TB_Worklist* ws, TB_Node* ptr) {
+    FOR_USERS(u, ptr) {
+        if (USERN(u)->type == TB_PTR_OFFSET && USERI(u) == 1) {
+            kill_offset_stores(ws, USERN(u));
+        } else if (USERN(u)->type == TB_STORE && USERI(u) == 2) {
+            worklist_push(ws, USERN(u));
+        }
+    }
+}
+
 static int find_local_idx(LocalSplitter* restrict ctx, TB_Node* n) {
-    if (n->type == TB_PTR_OFFSET) {
+    // PATCH(odin-tilde): offsets nest (off(off(local, i), CON)); a missed level puts
+    // the access on the wrong memory chain once the local got its own alias class
+    while (n->type == TB_PTR_OFFSET) {
         n = n->inputs[1];
     }
 
@@ -1188,11 +1200,7 @@ int tb_opt_locals(TB_Function* f) {
 
                 FOR_USERS(u, ctx.renames[i].addr) {
                     if (USERN(u)->type == TB_PTR_OFFSET) {
-                        FOR_USERS(u2, USERN(u)) {
-                            if (USERN(u2)->type == TB_STORE) {
-                                worklist_push(&sese_worklist, USERN(u2));
-                            }
-                        }
+                        kill_offset_stores(&sese_worklist, USERN(u));
                     } else if (USERN(u)->type == TB_STORE || USERN(u)->type == TB_DEAD_STORE) {
                         worklist_push(&sese_worklist, USERN(u));
                     }
