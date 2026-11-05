@@ -31,7 +31,11 @@ static TB_BasicBlock* sched_into_good_block(TB_Function* f, TB_GetLatency get_la
         }
     }
 
-    if (get_lat(f, n, 0) <= 3) {
+    // cheap ops used to always go late, which on a64 (latency table is all 1s)
+    // sank loop-invariant address math into the inner loop (odin-tank
+    // forward_cached: `p + j*1024 + off` recomputed per MAC). Only constants
+    // stay late, hoisting those just trades a mov for register pressure.
+    if (get_lat(f, n, 0) <= 3 && (n->type == TB_ICONST || n->type == TB_F32CONST || n->type == TB_F64CONST)) {
         return late;
     }
 
