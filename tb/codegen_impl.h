@@ -257,7 +257,7 @@ static void construct_prologue_epilogue(Ctx* restrict ctx, TB_Function* f) {
         RegMask* rm = NULL;
         if (i == 0 && f->prototype->sret && cc->has_sret_reg) {
             rm = intern_regmask2(ctx, REG_CLASS_GPR, false, cc->sret_reg);
-        } else if (reg_num >= cc->param_count[reg_class]) {
+        } else if (f->prototype->params[i].on_stack || reg_num >= cc->param_count[reg_class]) {
             rm = intern_regmask2(ctx, REG_CLASS_STK, false, used[REG_CLASS_STK]);
             used[REG_CLASS_STK] += 1;
         } else {

@@ -1010,9 +1010,9 @@ static CallingConv CC_SYSV = {
         [XMM0 ... XMM15] = 'C',
     },
 
-    .param_count = { [REG_CLASS_GPR] = 6, [REG_CLASS_XMM] = 4 },
+    .param_count = { [REG_CLASS_GPR] = 6, [REG_CLASS_XMM] = 8 },
     .params[REG_CLASS_GPR] = (uint8_t[]){ RDI,  RSI,  RDX,  RCX, R8, R9 },
-    .params[REG_CLASS_XMM] = (uint8_t[]){ XMM0, XMM1, XMM2, XMM3 },
+    .params[REG_CLASS_XMM] = (uint8_t[]){ XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7 },
 
     .ret_count = { [REG_CLASS_GPR] = 2, [REG_CLASS_XMM] = 2 },
     .rets[REG_CLASS_GPR] = { RAX,  RDX  },
@@ -1975,7 +1975,8 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
                     }
 
                     int reg_num = used[reg_class];
-                    if (reg_num >= cc->param_count[reg_class]) {
+                    bool on_stack = j < proto->param_count && proto->params[j].on_stack;
+                    if (on_stack || reg_num >= cc->param_count[reg_class]) {
                         ins[i] = intern_regmask2(ctx, REG_CLASS_STK, false, used[REG_CLASS_STK]);
                         used[REG_CLASS_STK] += 1;
                     } else {

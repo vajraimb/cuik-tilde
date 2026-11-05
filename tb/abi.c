@@ -211,10 +211,16 @@ TB_API TB_FunctionPrototype* tb_prototype_from_dbg(TB_Module* m, TB_DebugType* d
             TB_DebugType* type = param_list[i]->field.type;
             RegClass rg = classify_reg(abi, type);
 
+            // PATCH(odin-tilde): Odin splits SysV MEMORY-class arguments into
+            // eightbytes tagged with this alias; they must ride the stack.
+            bool on_stack = type->tag == TB_DEBUG_TYPE_ALIAS && type->alias.len == 11 &&
+                memcmp(type->alias.name, "$sysv_stack", 11) == 0;
+
             TB_PrototypeParam param = {
                 .name = param_list[i]->field.name,
                 .debug_type = type,
                 .dt = reg_class_to_tb(abi, rg, type),
+                .on_stack = on_stack,
             };
 
             p->params[has_aggregate_return + i] = param;
