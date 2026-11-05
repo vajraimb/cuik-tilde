@@ -2110,6 +2110,72 @@ static int evict_vreg(Ctx* ctx, Rogers* ra, int evicted_class, int target) {
     return evicted_reg;
 }
 
+// hands out a fresh stack slot, growing the stack class' active set (it's the
+// only resizable class) and the scratch mask alongside
+static int stk_new_slot(Rogers* ra, int width) {
+    if (ra->num_spills + width > ra->stack_reg_count) {
+        size_t new_size = ra->stack_reg_count * 2;
+        while (ra->num_spills + width > new_size) { new_size *= 2; }
+
+        ra->active[0] = tb_arena_realloc(ra->arena, ra->active[0], ra->stack_reg_count * sizeof(int), new_size * sizeof(int));
+        FOR_N(i, ra->stack_reg_count, new_size) {
+            ra->active[0][i] = 0;
+        }
+        ra->stack_reg_count = new_size;
+
+        // PATCH(odin-tilde): grow the occupied-bit mirror alongside
+        size_t new_words = (new_size + 63) / 64;
+        if (new_words > (size_t)ra->active_mask_words) {
+            ra->active_mask[0] = tb_arena_realloc(ra->arena, ra->active_mask[0],
+                ra->active_mask_words * sizeof(uint64_t), new_words * sizeof(uint64_t));
+            FOR_N(i, ra->active_mask_words, new_words) {
+                ra->active_mask[0][i] = 0;
+            }
+            ra->active_mask_words = new_words;
+        }
+    }
+
+    int slot = ra->num_spills;
+    ra->num_spills += width;
+
+    // resize the mask array if necessary
+    size_t new_cap = ra->max_regs_in_class > ra->num_spills ? ra->max_regs_in_class : ra->num_spills;
+    if (((ra->mask_cap+63)/64) < (new_cap+63)/64) {
+        ra->mask_cap = new_cap + 64;
+        ra->mask = tb_arena_alloc(ra->arena, ((ra->mask_cap+63)/64) * sizeof(uint64_t));
+    }
+    return slot;
+}
+
+// PATCH(odin-tilde): pre-colored stack slots skip every interference check
+// (the wake-time conflict fix only covers register classes), but the splits
+// between rounds stretch intervals, so two live vregs can come back sharing a
+// slot (fmt@_arg_number: an i8 phi copy spilled over the live i64 `i`).
+static bool stk_precolor_conflicts(Ctx* ctx, Rogers* ra, int vreg_id, size_t cnt, TB_Node** set, VReg** out_other) {
+    VReg* vreg = &ctx->vregs[vreg_id];
+    SparseSet* future = &ra->future_active[REG_CLASS_STK];
+    FOR_N(i, 0, aarray_length(future->stack)) {
+        uint32_t og = future->stack[i];
+        TB_Node* other = ra->gvn2node[og];
+        int ov = og < aarray_length(ctx->vreg_map) ? ctx->vreg_map[og] : 0;
+        if (other == NULL || ov <= 0 || ov == vreg_id) { continue; }
+
+        VReg* o = &ctx->vregs[ov];
+        if (o->class != REG_CLASS_STK || o->assigned < 0 ||
+            o->assigned + o->reg_width <= vreg->assigned || vreg->assigned + vreg->reg_width <= o->assigned) {
+            continue;
+        }
+
+        FOR_N(k, 0, cnt) {
+            if (set[k]->type != TB_NULL && interfere(ctx, ra, set[k], other)) {
+                *out_other = o;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
     int vreg_id = ctx->vreg_map[n->gvn];
     VReg* vreg = &ctx->vregs[vreg_id];
@@ -2283,7 +2349,6 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
                 } else if (lhs_block != other_block) {
                     query = interfere_in_block(ctx->cfg.blocks, order, scheduled, ra, other, arr[j], other_gvn, lhs_gvn, other_block);
                 }
-
                 if (query) {
                     TB_ASSERT(other_vreg->assigned >= 0);
                     // TB_OPTDEBUG(REGALLOC5)(printf("%%%u -- ", other->gvn), print_reg_name(def_class, other_assigned), printf("; "));
@@ -2320,41 +2385,10 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
         // if a stack slot failed to color then it means we
         // need more stack slots (there's an indefinite amount :p)
         if (def_class == REG_CLASS_STK) {
-            // stack's active set is resizable
-            if (ra->num_spills + vreg->reg_width > ra->stack_reg_count) {
-                size_t new_size = ra->stack_reg_count * 2;
-                TB_ASSERT(ra->num_spills + vreg->reg_width - 1 <= new_size);
-
-                ra->active[0] = tb_arena_realloc(ra->arena, ra->active[0], ra->stack_reg_count * sizeof(int), new_size * sizeof(int));
-                FOR_N(i, ra->stack_reg_count, new_size) {
-                    ra->active[0][i] = 0;
-                }
-                ra->stack_reg_count = new_size;
-
-                // PATCH(odin-tilde): grow the occupied-bit mirror alongside
-                size_t new_words = (new_size + 63) / 64;
-                if (new_words > (size_t)ra->active_mask_words) {
-                    ra->active_mask[0] = tb_arena_realloc(ra->arena, ra->active_mask[0],
-                        ra->active_mask_words * sizeof(uint64_t), new_words * sizeof(uint64_t));
-                    FOR_N(i, ra->active_mask_words, new_words) {
-                        ra->active_mask[0][i] = 0;
-                    }
-                    ra->active_mask_words = new_words;
-                }
-            }
-
             vreg->class = REG_CLASS_STK;
-            vreg->assigned = ra->num_spills;
+            vreg->assigned = stk_new_slot(ra, vreg->reg_width);
             mark_active(ctx, ra, n->gvn);
             put_to_sleep_vreg(ctx, ra, def_class, cnt, arr, n, vreg_id);
-            ra->num_spills += vreg->reg_width;
-
-            // resize the mask array if necessary
-            size_t new_cap = ra->max_regs_in_class > ra->num_spills ? ra->max_regs_in_class : ra->num_spills;
-            if (((ra->mask_cap+63)/64) < (new_cap+63)/64) {
-                ra->mask_cap = new_cap + 64;
-                ra->mask = tb_arena_alloc(ra->arena, ((ra->mask_cap+63)/64) * sizeof(uint64_t));
-            }
 
             IF_OPT(REGALLOC) {
                 printf("#   \x1b[32massign\x1b[0m %%%-5u V%-5u => STACK%d (new stack slot)\n", n->gvn, vreg_id, vreg->assigned);
@@ -2635,6 +2669,20 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
 
                     int class = ctx->vregs[vreg_id].class;
 
+                    size_t cnt;
+                    TB_Node** set = coalesce_set_array(ctx, ra, &n, &cnt);
+                    VReg* other = NULL;
+                    if (class == REG_CLASS_STK && !sparse_set_test(&ra->future_active[class], n->gvn) &&
+                        stk_precolor_conflicts(ctx, ra, vreg_id, cnt, set, &other)) {
+                        // incoming stack params can't move, the other side does
+                        VReg* mover = ctx->vregs[vreg_id].assigned < ctx->num_regs[REG_CLASS_STK] ? other : &ctx->vregs[vreg_id];
+                        if (mover->assigned >= ctx->num_regs[REG_CLASS_STK]) {
+                            TB_OPTDEBUG(REGALLOC)(printf("#   STACK%d conflict, V%td moves", mover->assigned, mover - ctx->vregs));
+                            mover->assigned = stk_new_slot(ra, mover->reg_width);
+                            TB_OPTDEBUG(REGALLOC)(printf(" to STACK%d\n", mover->assigned));
+                        }
+                    }
+
                     IF_OPT(REGALLOC) {
                         VReg* vreg = &ctx->vregs[vreg_id];
                         printf("#   \x1b[32massign\x1b[0m %%%-5u V%-5u => ", n->gvn, vreg_id);
@@ -2645,8 +2693,6 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
                     }
 
                     // put the pre-colored regs to rest
-                    size_t cnt;
-                    TB_Node** set = coalesce_set_array(ctx, ra, &n, &cnt);
                     FOR_N(k, 0, cnt) {
                         TB_ASSERT(set[k]->gvn < ctx->f->node_count);
                         put_to_sleep(ra, class, set[k]->gvn);

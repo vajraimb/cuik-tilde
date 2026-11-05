@@ -24,7 +24,7 @@ static TB_BasicBlock* sched_into_good_block(TB_Function* f, TB_GetLatency get_la
             // if the dominator heads a different (inner) loop, this latch is
             // that loop's exit and hoisting would run n on every inner iteration
             TB_BasicBlock* up = late->dom;
-            if (!getenv("GCM_NOLATCH") && NODE_ISA(up->start, NATURAL_LOOP) && up->start != next) {
+            if (NODE_ISA(up->start, NATURAL_LOOP) && up->start != next) {
                 return late;
             }
             return up;
@@ -123,9 +123,7 @@ static bool node_true_dep_reaches(TB_Function* f, TB_Node* from, TB_Node* to) {
         set_put(&visited, n->gvn);
         // phi/region inputs come from earlier iterations or predecessor blocks,
         // walking them makes everything in a loop "reach" everything else
-        static __thread int old_mode = -1;
-        if (n == from) { const char* e = getenv("ANTI_OLD"); old_mode = e && (e[0] == '*' || strstr(f->super.name, e)); }
-        if (!old_mode && (n->type == TB_PHI || NODE_ISA(n, REGION))) { continue; }
+        if (n->type == TB_PHI || NODE_ISA(n, REGION)) { continue; }
         FOR_N(i, 0, n->input_count) {
             TB_Node* in = n->inputs[i];
             if (in == NULL) { continue; }

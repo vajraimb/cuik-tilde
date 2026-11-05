@@ -253,13 +253,6 @@ static TB_Node* ideal_memcpy(TB_Function* f, TB_Node* n) {
                 if (dst_root == src_root) {
                     return NULL;
                 }
-                // x64: the longer param live ranges this creates trip a rogers_ra
-                // stack slot sharing bug (fmt_map_probe: an i8 spill lands on a
-                // live ptr's slot), keep the memcpy there until that's fixed
-                if (f->super.module->target_arch == TB_ARCH_X86_64) {
-                    return NULL;
-                }
-
                 // both sides must agree on each chunk's dt, otherwise store->load
                 // forwarding would pun between classes (i64 vs f64)
                 TB_DataType cdts[4];
