@@ -659,6 +659,16 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             TB_ASSERT(ctx->num_regs[clobber->class] < 64);
 
             uint64_t total_mask = UINT64_MAX >> (64 - ctx->num_regs[clobber->class]);
+            // PATCH(odin-tilde): num_regs covers the whole architectural file,
+            // including registers the emitter borrows as scratch (a64 R16/R17
+            // for stack-to-stack copies, R18 and SP). A clobber-split reload
+            // colored into one of those is silently overwritten by the next
+            // scratch copy (tank@backward: the params pointer came back as
+            // the local buffer address). Stay inside the allocatable set.
+            if (ctx->normie_mask[clobber->class] != NULL &&
+                ctx->normie_mask[clobber->class]->count > 0) {
+                total_mask &= ctx->normie_mask[clobber->class]->mask[0];
+            }
             // avoid only THIS split's clobber registers (see above).
             splitter.avoid_mask[i] |= clobber->mask[0];
             uint64_t avoid = splitter.avoid_mask[i] & total_mask;

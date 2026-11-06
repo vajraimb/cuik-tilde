@@ -1572,7 +1572,15 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
             // (seen in tank@backward-2: wrong gradients). Rotation is only an optimization,
             // so leaving them un-rotated preserves correctness.
             bool backedge_is_merged_region = !cfg_is_cproj(header->inputs[1]);
-            if (exit_proj && exit_block_ok && !backedge_is_merged_region && (!cfg_is_cproj(exit_proj) || header->inputs[1]->user_count != 1)) {
+            // Do not treat "exit branch != backedge branch" as a reason to
+            // rotate. That is the top-tested shape, and stock's rotation body
+            // fails the compiler build of core_stress and sort_probe (45/47).
+            // The tank inner loop does not match it anyway: the taken proj of
+            // the header IF is the backedge, and the exit block is the parent
+            // header, so exit_block_ok is already false. Padding that edge
+            // makes tb_global_schedule walk a cyclic list.
+            if (exit_proj && exit_block_ok && !backedge_is_merged_region &&
+                (!cfg_is_cproj(exit_proj) || header->inputs[1]->user_count != 1)) {
                 #if 1
                 TB_OPTDEBUG(PASSES)(printf("      * Rotating loop %%%u %p\n", header->gvn, exit_proj));
 

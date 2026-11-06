@@ -223,6 +223,131 @@ static bool memcpy_chunk_dt(TB_Function* f, TB_Node* base, int64_t off, TB_DataT
     return false;
 }
 
+typedef struct {
+    int64_t off;
+    int size;
+    TB_DataType dt;
+} MemcpyField;
+
+static bool memcpy_note_field(MemcpyField* fields, int* n, int cap, int64_t off, int sz, TB_DataType dt, int64_t limit) {
+    if (off < 0 || sz <= 0 || off + sz > limit) {
+        return false;
+    }
+    if (sz != 1 && sz != 2 && sz != 4 && sz != 8) {
+        return false;
+    }
+    if (TB_IS_VECTOR_TYPE(dt)) {
+        return false;
+    }
+    FOR_N(i, 0, *n) {
+        int64_t a0 = fields[i].off, a1 = a0 + fields[i].size;
+        int64_t b1 = off + sz;
+        if (!(a0 < b1 && off < a1)) {
+            continue;
+        }
+        return a0 == off && fields[i].size == sz && fields[i].dt.raw == dt.raw;
+    }
+    if (*n >= cap) {
+        return false;
+    }
+    fields[(*n)++] = (MemcpyField){ off, sz, dt };
+    return true;
+}
+
+// Scalar loads/stores already on this local. -1-style failure is a false
+// return so the caller keeps the 8-byte split.
+static bool memcpy_collect_fields(TB_Function* f, TB_Node* self, TB_Node* addr, int64_t base, int64_t limit, MemcpyField* fields, int* n, int cap, int depth) {
+    if (depth > 6) {
+        return false;
+    }
+    FOR_USERS(u, addr) {
+        TB_Node* m = USERN(u);
+        if (m == self) {
+            continue;
+        }
+        if (m->type == TB_PTR_OFFSET && USERI(u) == 1 && m->inputs[2] && m->inputs[2]->type == TB_ICONST) {
+            int64_t off = base + TB_NODE_GET_EXTRA_T(m->inputs[2], TB_NodeInt)->value;
+            if (!memcpy_collect_fields(f, self, m, off, limit, fields, n, cap, depth + 1)) {
+                return false;
+            }
+            continue;
+        }
+        if (USERI(u) != 2 || (m->type != TB_LOAD && m->type != TB_STORE)) {
+            return false;
+        }
+        TB_DataType dt = m->type == TB_LOAD ? m->dt : m->inputs[3]->dt;
+        int sz = tb_data_type_byte_size(f->super.module, dt.type);
+        if (!memcpy_note_field(fields, n, cap, base, sz, dt, limit)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static TB_Node* memcpy_reuse_off(TB_Function* f, TB_Node* base, int64_t off) {
+    if (off == 0) {
+        return base;
+    }
+    FOR_USERS(u, base) {
+        TB_Node* p = USERN(u);
+        if (USERI(u) == 1 && p->type == TB_PTR_OFFSET && p->inputs[2] && p->inputs[2]->type == TB_ICONST &&
+            TB_NODE_GET_EXTRA_T(p->inputs[2], TB_NodeInt)->value == off) {
+            return p;
+        }
+    }
+    return memcpy_chunk_addr(f, base, off);
+}
+
+// PATCH(odin-tilde): a by-value aggregate is copied in 8-byte chunks, then
+// its fields are loaded at narrower offsets. Those overlap, so SROA gives
+// up and every field reloads the stack copy. Split the copy along the
+// accesses that already exist so each field is its own local.
+static TB_Node* memcpy_by_fields(TB_Function* f, TB_Node* self, TB_Node* ctrl, TB_Node* mem, TB_Node* dst, TB_Node* src, int align, int64_t size) {
+    if (dst->type != TB_LOCAL) {
+        return NULL;
+    }
+    MemcpyField fields[12];
+    int n = 0;
+    if (!memcpy_collect_fields(f, self, dst, 0, size, fields, &n, 12, 0) || n == 0) {
+        return NULL;
+    }
+    FOR_N(i, 1, n) {
+        MemcpyField key = fields[i];
+        int j = i;
+        while (j > 0 && fields[j - 1].off > key.off) {
+            fields[j] = fields[j - 1];
+            j--;
+        }
+        fields[j] = key;
+    }
+
+    TB_Node* chain = mem;
+    FOR_N(i, 0, n) {
+        int a = fields[i].size;
+        while (a > 1 && (((fields[i].off % a) != 0) || a > align)) {
+            a >>= 1;
+        }
+        TB_Node* ld = tb_alloc_node(f, TB_LOAD, fields[i].dt, 3, sizeof(TB_NodeMemAccess));
+        set_input(f, ld, ctrl, 0);
+        set_input(f, ld, chain, 1);
+        set_input(f, ld, memcpy_reuse_off(f, src, fields[i].off), 2);
+        TB_NODE_SET_EXTRA(ld, TB_NodeMemAccess, .align = a);
+        mark_node(f, ld);
+
+        TB_Node* st = tb_alloc_node(f, TB_STORE, TB_TYPE_MEMORY, 4, sizeof(TB_NodeMemAccess));
+        set_input(f, st, ctrl, 0);
+        set_input(f, st, chain, 1);
+        set_input(f, st, memcpy_reuse_off(f, dst, fields[i].off), 2);
+        set_input(f, st, ld, 3);
+        TB_NODE_SET_EXTRA(st, TB_NodeMemAccess, .align = a);
+        if (i + 1 < n) {
+            mark_node(f, st);
+        }
+        chain = st;
+    }
+    return chain;
+}
+
 static TB_Node* ideal_memcpy(TB_Function* f, TB_Node* n) {
     TB_Node* ctrl = n->inputs[0];
     TB_Node* mem = n->inputs[1];
@@ -242,6 +367,10 @@ static TB_Node* ideal_memcpy(TB_Function* f, TB_Node* n) {
             case 4: dt = TB_TYPE_I32; break;
             case 8: dt = TB_TYPE_I64; break;
             case 16: case 24: case 32: {
+                TB_Node* by_fields = memcpy_by_fields(f, n, ctrl, mem, dst, src, align, size);
+                if (by_fields) {
+                    return by_fields;
+                }
                 // slices/strings/any: split into 8-byte chunks when a local is
                 // involved so SROA + mem2reg can promote it.
                 TB_Node* dst_root = dst->type == TB_PTR_OFFSET ? dst->inputs[1] : dst;

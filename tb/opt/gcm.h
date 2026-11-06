@@ -27,7 +27,25 @@ static TB_BasicBlock* sched_into_good_block(TB_Function* f, TB_GetLatency get_la
             if (NODE_ISA(up->start, NATURAL_LOOP) && up->start != next) {
                 return late;
             }
-            return up;
+            // The value that feeds the loop phi (i = i + 1, and the same
+            // shape for the accumulator) has to stay in the latch. Hoisting
+            // it into the header keeps the old value live across the body,
+            // so the add cannot reuse that register and the backedge is a
+            // copy (a64: orr Rd, Rn, xzr).
+            if (n->type != TB_PHI && n->dt.type != TB_TAG_MEMORY &&
+                n->dt.type != TB_TAG_CONTROL && n->dt.type != TB_TAG_TUPLE) {
+                FOR_N(i, 1, n->input_count) {
+                    TB_Node* in = n->inputs[i];
+                    if (in && in->type == TB_PHI && in->inputs[0] == next &&
+                        in->input_count == 3 && in->inputs[2] == n) {
+                        return late;
+                    }
+                }
+            }
+            // The latch runs every iteration. Keep walking so an invariant
+            // (row base p + j*stride) can land in a colder dominator instead
+            // of the inner header.
+            late = up;
         }
     }
 

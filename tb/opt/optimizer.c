@@ -1924,6 +1924,7 @@ bool tb_opt(TB_Function* f, TB_Worklist* ws, bool preserve_types) {
             #endif
         }
     } while (dirty);
+    tb_opt_kill_dead_ivs(f);
     TB_ASSERT(worklist_count(ws) == 0);
     TB_ASSERT(tb_arena_is_empty(&f->tmp_arena));
     // if we're doing IPO then it's helpful to keep these

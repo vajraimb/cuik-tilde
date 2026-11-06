@@ -260,6 +260,88 @@ static TB_Node* ideal_region(TB_Function* f, TB_Node* n) {
     return NULL;
 }
 
+// A closed IV cycle (phi <-> pure stepper, nothing else reads either) is
+// dead. Deleting it inside ideal_phi is wrong: loop opts still run after
+// that peephole. This runs once the pipeline has finished. Clobber-split
+// reloads must stay out of the emitter's scratch registers, or dropping
+// the spare header phi miscompiles the loop-carried pointers
+// (tank@backward).
+static void tb_opt_kill_dead_ivs(TB_Function* f) {
+    TB_Worklist* ws = f->worklist;
+    if (ws == NULL || f->root_node == NULL) {
+        return;
+    }
+
+    worklist_push(ws, f->root_node);
+    for (size_t i = 0; i < dyn_array_length(ws->items); i++) {
+        TB_Node* n = ws->items[i];
+        FOR_USERS(u, n) { worklist_push(ws, USERN(u)); }
+    }
+
+    size_t nitems = dyn_array_length(ws->items);
+    FOR_N(i, 0, nitems) {
+        TB_Node* n = ws->items[i];
+        if (n->type != TB_PHI || n->dt.type == TB_TAG_MEMORY || n->user_count == 0 || n->user_count > 8) {
+            continue;
+        }
+        if (n->input_count < 2 || n->inputs[1] == NULL || n->inputs[1] == n) {
+            continue;
+        }
+
+        TB_Node* steps[8];
+        int step_slot[8];
+        int step_back[8];
+        int nsteps = 0;
+        bool dead = true;
+        FOR_USERS(u, n) {
+            TB_Node* s = USERN(u);
+            int slot = USERI(u);
+            if (s->user_count != 1 || s->input_count == 0 || s->inputs[0] != NULL ||
+                tb_node_is_memory_in(s) || tb_node_is_memory_out(s)) {
+                dead = false;
+                break;
+            }
+            int back_i = USERI(s->users);
+            if (USERN(s->users) != n || back_i <= 0 || n->inputs[back_i] != s) {
+                dead = false;
+                break;
+            }
+            if (nsteps == 8) { dead = false; break; }
+            steps[nsteps] = s;
+            step_slot[nsteps] = slot;
+            step_back[nsteps] = back_i;
+            nsteps++;
+        }
+        if (!dead || nsteps == 0) {
+            continue;
+        }
+        bool init_is_step = false;
+        FOR_N(s, 0, nsteps) {
+            if (steps[s] == n->inputs[1]) { init_is_step = true; }
+        }
+        if (init_is_step) {
+            continue;
+        }
+
+        FOR_N(s, 0, nsteps) {
+            set_input(f, steps[s], NULL, step_slot[s]);
+        }
+        FOR_N(s, 0, nsteps) {
+            bool seen = false;
+            FOR_N(j, 0, s) { if (step_back[j] == step_back[s]) { seen = true; } }
+            if (!seen) { set_input(f, n, NULL, step_back[s]); }
+        }
+        FOR_N(s, 0, nsteps) {
+            if (steps[s]->type != TB_NULL) { tb_kill_node(f, steps[s]); }
+        }
+        if (n->type != TB_NULL && n->user_count == 0) {
+            tb_kill_node(f, n);
+        }
+    }
+
+    worklist_clear(ws);
+}
+
 static TB_Node* ideal_phi(TB_Function* f, TB_Node* n) {
     // degenerate PHI, poison it
     if (n->input_count == 1) {

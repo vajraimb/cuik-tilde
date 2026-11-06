@@ -715,7 +715,10 @@ static void stub_emit(Ctx* restrict ctx, TB_CGEmitter* e, TB_CodeStub* stub) {
 // RA constraints
 ////////////////////////////////
 static bool node_remat(TB_Node* n) {
-    return false;
+    // 本地地址是 sp+固定槽。溢出后再 ldur 回来比在使用点重算一条 add 贵。
+    // 符号地址不要放进来：克隆会落在同一冲突点上，RA 每轮都当第一次分裂
+    // 再克隆，bytes@_buffer_grow 到轮次上限也不收敛。
+    return n->type == TB_LOCAL;
 }
 
 static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
@@ -1401,6 +1404,10 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
             return &TB_REG_EMPTY;
         }
 
+        case TB_NEVER_BRANCH:
+        // 退不出的循环（测试运行器里空转等线程被取消）只有控制输入，不占寄存器。
+        return &TB_REG_EMPTY;
+
         default:
         tb_todo();
         return &TB_REG_EMPTY;
@@ -1577,8 +1584,1699 @@ static void pre_emit(Ctx* restrict ctx, TB_CGEmitter* e, TB_Node* n) {
     ctx->prologue_length = e->count;
 }
 
+// 循环头 16 字节对齐会在头前面留下 nop（on_basic_block）。回边打到头上，
+// 不经过这些 nop。把循环里不变的 `ldur Xt, [sp, #imm]` 和头前最后一个 nop
+// 对调：进入时加载一次，回边不再重载。指令条数不变，已回填的分支位移不用改。
+static int a64_gpr_def(uint32_t insn, bool* known) {
+    *known = true;
+    if (insn == 0xD503201Fu || insn == 0xD65F03C0u) return -1; // nop, ret
+    if ((insn & 0xFC000000u) == 0x14000000u) return -1; // B
+    if ((insn & 0xFF000010u) == 0x54000000u) return -1; // B.cond
+    if ((insn >> 24) == 0x1Eu) return -1;               // scalar FP
+    if ((insn & 0x3FE00C00u) == 0x3C600800u) return -1; // ldr S/D, [Xn, Xm]
+    if ((insn & 0x3FE00C00u) == 0x3C200800u) return -1; // str S/D, [Xn, Xm]
+    if ((insn & 0x3F000000u) == 0x1C000000u || (insn & 0x3F000000u) == 0x5C000000u) return -1; // ldr S/D literal
+    if ((insn & 0xFFC00000u) == 0xBD400000u || (insn & 0xFFC00000u) == 0xFD400000u) return -1; // ldr S/D [Xn,#imm]
+    if ((insn & 0x1F000000u) == 0x11000000u) {          // add/sub imm, cmp
+        int rd = (int)(insn & 31u);
+        return rd == 31 ? -1 : rd;
+    }
+    if ((insn & 0x1F200000u) == 0x0B000000u) {          // add/sub shifted or extended
+        int rd = (int)(insn & 31u);
+        return rd == 31 ? -1 : rd;
+    }
+    if ((insn & 0x7F800000u) == 0x1A800000u) return (int)(insn & 31u); // csel/cset
+    if ((insn & 0x7F800000u) == 0x53000000u) return (int)(insn & 31u); // ubfm/uxtb
+    if ((insn & 0x7F800000u) == 0x52800000u || (insn & 0x7F800000u) == 0x12800000u ||
+        (insn & 0x7F800000u) == 0x72800000u) {          // movz/movn/movk
+        int rd = (int)(insn & 31u);
+        return rd == 31 ? -1 : rd;
+    }
+    if ((insn & 0x7FE08000u) == 0x1B000000u) {          // madd（mul 是 Ra=xzr）
+        int rd = (int)(insn & 31u);
+        return rd == 31 ? -1 : rd;
+    }
+    if ((insn & 0xFFE00C00u) == 0xF8400000u) return (int)(insn & 31u); // ldur Xt
+    if ((insn & 0xFFC00000u) == 0xF9400000u) return (int)(insn & 31u); // ldr Xt
+    if ((insn & 0x7F200000u) == 0x2A000000u) {          // orr/mov shifted
+        int rd = (int)(insn & 31u);
+        return rd == 31 ? -1 : rd;
+    }
+    *known = false;
+    return -1;
+}
+
+static bool a64_gpr_read(uint32_t insn, int reg, bool* known) {
+    *known = true;
+    if (insn == 0xD503201Fu || insn == 0xD65F03C0u) return false; // nop, ret
+    if ((insn & 0xFC000000u) == 0x14000000u) return false;
+    if ((insn & 0xFF000010u) == 0x54000000u) return false;
+    if ((insn >> 24) == 0x1Eu) return false;
+    if ((insn & 0x3F000000u) == 0x1C000000u || (insn & 0x3F000000u) == 0x5C000000u) return false;
+    if ((insn & 0x7F800000u) == 0x52800000u || (insn & 0x7F800000u) == 0x12800000u) return false; // movz/movn
+    if ((insn & 0x7F800000u) == 0x72800000u) return ((int)(insn & 31u)) == reg; // movk 读 Rd
+    if ((insn & 0x3FE00C00u) == 0x3C600800u || (insn & 0x3FE00C00u) == 0x3C200800u ||
+        (insn & 0x7F800000u) == 0x1A800000u || (insn & 0x7F200000u) == 0x2A000000u ||
+        (insn & 0x1F200000u) == 0x0B000000u) {
+        int rn = (int)((insn >> 5) & 31u);
+        int rm = (int)((insn >> 16) & 31u);
+        return rn == reg || rm == reg;
+    }
+    if ((insn & 0xFFC00000u) == 0xBD400000u || (insn & 0xFFC00000u) == 0xFD400000u) {
+        return ((int)((insn >> 5) & 31u)) == reg;
+    }
+    if ((insn & 0x7FE08000u) == 0x1B000000u) {
+        int rn = (int)((insn >> 5) & 31u);
+        int rm = (int)((insn >> 16) & 31u);
+        int ra = (int)((insn >> 10) & 31u);
+        return rn == reg || rm == reg || (ra != 31 && ra == reg);
+    }
+    if ((insn & 0x1F000000u) == 0x11000000u || (insn & 0x7F800000u) == 0x53000000u ||
+        (insn & 0xFFE00C00u) == 0xF8400000u || (insn & 0xFFC00000u) == 0xF9400000u) {
+        return ((int)((insn >> 5) & 31u)) == reg;
+    }
+    *known = false;
+    return true;
+}
+
+static int a64_b_target(int at, uint32_t insn, bool cond) {
+    int32_t imm;
+    if (!cond) {
+        imm = (int32_t)(insn & 0x3FFFFFFu);
+        if (imm & 0x2000000) imm |= ~0x3FFFFFF;
+    } else {
+        imm = (int32_t)((insn >> 5) & 0x7FFFFu);
+        if (imm & 0x40000) imm |= ~0x7FFFF;
+    }
+    return at + imm;
+}
+
+// ldur 的无符号字节偏移。栈槽在循环里被写过就不能外提。
+static int a64_ldur_off(uint32_t insn) {
+    int imm9 = (int)((insn >> 12) & 0x1FFu);
+    if (imm9 & 0x100) imm9 |= ~0x1FF;
+    return imm9;
+}
+
+// 出口上 reg 必须已死。零次循环不会执行体内的 ldur，外提却会在进头之前
+// 写掉它；出口还要读旧值就不许搬。
+static bool a64_reg_dead_from_ex(uint32_t* w, int nins, int pos, int reg, bool call_kills_ip) {
+    if (pos < 0 || pos >= nins) return false;
+    uint8_t* seen = calloc((size_t)nins, 1);
+    int* queue = calloc((size_t)nins, sizeof(int));
+    if (!seen || !queue) { free(seen); free(queue); return false; }
+    int qn = 0;
+    queue[qn++] = pos;
+    seen[pos] = 1;
+    bool ok = true;
+    for (int qh = 0; qh < qn; qh++) {
+        int i = queue[qh];
+        uint32_t insn = w[i];
+        bool known = false;
+        if (a64_gpr_read(insn, reg, &known) || !known) { ok = false; break; }
+        int def = a64_gpr_def(insn, &known);
+        if (!known) { ok = false; break; }
+        if (def == reg || insn == 0xD65F03C0u) continue;
+        if ((insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) {
+            if (call_kills_ip && (reg == 16 || reg == 17)) continue;
+            ok = false; break;
+        }
+        int nexts[2];
+        int nn = 0;
+        if ((insn & 0xFC000000u) == 0x14000000u) {
+            nexts[nn++] = a64_b_target(i, insn, false);
+        } else if ((insn & 0xFF000010u) == 0x54000000u) {
+            nexts[nn++] = i + 1;
+            nexts[nn++] = a64_b_target(i, insn, true);
+        } else {
+            nexts[nn++] = i + 1;
+        }
+        for (int t = 0; t < nn; t++) {
+            int n = nexts[t];
+            if (n < 0 || n >= nins || seen[n]) continue;
+            seen[n] = 1;
+            queue[qn++] = n;
+        }
+    }
+    free(queue);
+    free(seen);
+    return ok;
+}
+
+static bool a64_reg_dead_from(uint32_t* w, int nins, int pos, int reg) {
+    return a64_reg_dead_from_ex(w, nins, pos, reg, false);
+}
+
+// 源地址往前挪了一格，PC 相对位移要加 1。
+static uint32_t a64_branch_pc_dec(uint32_t insn) {
+    if ((insn & 0xFC000000u) == 0x14000000u) {
+        return 0x14000000u | ((insn + 1u) & 0x03FFFFFFu);
+    }
+    if ((insn & 0xFF000010u) == 0x54000000u) {
+        uint32_t imm = ((insn >> 5) & 0x7FFFFu) + 1u;
+        return (insn & 0xFF00001Fu) | ((imm & 0x7FFFFu) << 5);
+    }
+    return insn;
+}
+
+static bool a64_is_branch_target(uint32_t* w, int nins, int idx) {
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0xFC000000u) == 0x14000000u) {
+            if (a64_b_target(i, insn, false) == idx) return true;
+        } else if ((insn & 0xFF000010u) == 0x54000000u) {
+            if (a64_b_target(i, insn, true) == idx) return true;
+        }
+    }
+    return false;
+}
+
+// 外提留下的 nop 还在循环体里。把它和后面的指令对调，直到回边之后。
+// 回边是无条件跳，b.ge 打到回边的下一条，所以这格 nop 两边都跳过，不再执行。
+// 只和对调对象里的分支改位移，别的指令地址不动。
+static void a64_sink_nop(uint32_t* w, int nins, int j, int end) {
+    while (j < end) {
+        if (a64_is_branch_target(w, nins, j + 1)) break;
+        uint32_t nxt = w[j + 1];
+        if ((nxt & 0x3F000000u) == 0x1C000000u || (nxt & 0x3F000000u) == 0x5C000000u) break;
+        if ((nxt & 0x9F000000u) == 0x90000000u) break; // adrp
+        if ((nxt & 0xFC000000u) == 0x94000000u || (nxt & 0xFFFFFC1Fu) == 0xD63F0000u) break;
+        if ((nxt & 0xFC000000u) == 0x14000000u || (nxt & 0xFF000010u) == 0x54000000u) {
+            w[j] = a64_branch_pc_dec(nxt);
+        } else {
+            w[j] = nxt;
+        }
+        w[j + 1] = 0xD503201Fu;
+        j++;
+    }
+}
+
+static bool a64_stores_sp_slot(uint32_t insn, int off) {
+    if ((insn & 0xFFE00C00u) == 0xF8000000u && ((insn >> 5) & 31u) == 31u) {
+        return a64_ldur_off(insn) == off; // stur
+    }
+    if ((insn & 0xFFC00000u) == 0xF9000000u && ((insn >> 5) & 31u) == 31u) {
+        return (int)(((insn >> 10) & 0xFFFu) * 8u) == off; // str Xt, [sp, #imm]
+    }
+    return false;
+}
+
+static void a64_hoist_sp_reloads(TB_CGEmitter* e) {
+    if (e->count < 16 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    uint32_t* w = (uint32_t*)e->data;
+    for (int i = 0; i < nins; i++) {
+        uint32_t b = w[i];
+        if ((b & 0xFC000000u) != 0x14000000u) continue;
+        int start = a64_b_target(i, b, false);
+        if (start < 0 || start >= i || i - start > 48) continue;
+        if (start == 0 || w[start - 1] != 0xD503201Fu) continue;
+        int slot = start - 1;
+        for (int j = start; j < i; j++) {
+            uint32_t insn = w[j];
+            if ((insn & 0xFFE00C00u) != 0xF8400000u) continue;
+            if (((insn >> 5) & 31u) != 31u) continue; // [sp]
+            int rt = (int)(insn & 31u);
+            if (rt == 31) continue;
+            int off = a64_ldur_off(insn);
+            bool body_ok = true;
+            for (int k = start; k < i; k++) {
+                if (k == j) continue;
+                bool known = false;
+                int def = a64_gpr_def(w[k], &known);
+                if (!known || def == rt || a64_stores_sp_slot(w[k], off)) { body_ok = false; break; }
+                // add/sub 写 SP（Rd=31 且不是 cmp/subs）会挪动槽地址。
+                // 寄存器形式的 Rd=31 分不清是 XZR 还是 SP，两种都放弃。
+                if (((w[k] & 0x1F000000u) == 0x11000000u || (w[k] & 0x1F200000u) == 0x0B000000u) &&
+                    (w[k] & 31u) == 31u && (w[k] & 0x20000000u) == 0) {
+                    body_ok = false; break;
+                }
+                if ((w[k] & 0xFC000000u) == 0x94000000u || (w[k] & 0xFFFFFC1Fu) == 0xD63F0000u) {
+                    body_ok = false; break;
+                }
+            }
+            if (!body_ok) continue;
+            // 从头到这条 ldur，没经过它的路径不能读 rt：那些读看到的是
+            // 循环外带进来的旧值，外提会改掉。
+            uint8_t seen[48];
+            for (int s = 0; s < i - start; s++) seen[s] = 0;
+            int queue[48];
+            int qn = 0;
+            queue[qn++] = start;
+            bool read_before = false;
+            for (int qh = 0; qh < qn; qh++) {
+                int k = queue[qh];
+                if (k < start || k >= i || seen[k - start] || k == j) continue;
+                seen[k - start] = 1;
+                bool known = false;
+                if (a64_gpr_read(w[k], rt, &known) || !known) { read_before = true; break; }
+                int nexts[2];
+                int nn = 0;
+                if ((w[k] & 0xFC000000u) == 0x14000000u) {
+                    nexts[nn++] = a64_b_target(k, w[k], false);
+                } else if ((w[k] & 0xFF000010u) == 0x54000000u) {
+                    nexts[nn++] = k + 1;
+                    nexts[nn++] = a64_b_target(k, w[k], true);
+                } else {
+                    nexts[nn++] = k + 1;
+                }
+                for (int t = 0; t < nn; t++) {
+                    if (nexts[t] < start || nexts[t] >= i) continue;
+                    if (qn >= 48) { read_before = true; break; }
+                    queue[qn++] = nexts[t];
+                }
+            }
+            if (read_before) continue;
+            bool exits_ok = true;
+            for (int k = start; k < i; k++) {
+                uint32_t br = w[k];
+                if ((br & 0xFF000010u) != 0x54000000u) continue;
+                int tgt = a64_b_target(k, br, true);
+                if (tgt >= start && tgt <= i) continue;
+                if (!a64_reg_dead_from(w, nins, tgt, rt)) { exits_ok = false; break; }
+            }
+            if (!exits_ok) continue;
+            w[slot] = insn;
+            w[j] = 0xD503201Fu;
+            a64_sink_nop(w, nins, j, i);
+            break;
+        }
+    }
+}
+
+// 标量归约
+//   cmp xI, #N / b.ge / ldr sA,[xP,xI,lsl#2] / ldr sB,[xQ,xI,lsl#2]
+//   fmul sA,sA,sB / fadd sAcc,sAcc,sA / add xI,xI,#1 / b cmp
+// 改成 4 路 fmul.4s，再按 lane0..3 的顺序加回 sAcc。乘加顺序和标量一致。
+// 原循环体留着做入口判断，第一条 ldr 换成跳到函数末尾的新循环。
+static bool a64_fp_read(uint32_t insn, int reg, bool* known) {
+    *known = true;
+    uint32_t bare = insn & ~0x001F03FFu;
+    if (insn == 0xD503201Fu || insn == 0xD65F03C0u) return false;
+    if ((insn & 0xFC000000u) == 0x14000000u || (insn & 0xFF000010u) == 0x54000000u) return false;
+    if ((insn & 0x1F000000u) == 0x11000000u || (insn & 0x1F200000u) == 0x0B000000u) return false;
+    if ((insn & 0x7F800000u) == 0x52800000u || (insn & 0x7F800000u) == 0x12800000u ||
+        (insn & 0x7F800000u) == 0x72800000u || (insn & 0x7F800000u) == 0x53000000u ||
+        (insn & 0x7F800000u) == 0x1A800000u || (insn & 0x7F200000u) == 0x2A000000u ||
+        (insn & 0x7FE08000u) == 0x1B000000u) return false;
+    if ((insn & 0xFFE00C00u) == 0xF8400000u || (insn & 0xFFC00000u) == 0xF9400000u ||
+        (insn & 0xFFC00000u) == 0xF9000000u || (insn & 0xFFE00C00u) == 0xF8000000u) return false;
+    if ((insn & 0x9F000000u) == 0x90000000u) return false; // adrp
+    {
+        uint32_t us = insn & ~(0x1Fu | (0x1Fu << 5) | (0x1FFu << 12));
+        if (us == 0xBC400000u) return false;                       // ldur S
+        if (us == 0xBC000000u) return ((int)(insn & 31u)) == reg;  // stur S
+    }
+    if ((insn & 0xFFC00000u) == 0xBD400000u || (insn & 0x3F000000u) == 0x1C000000u) return false;
+    if (bare == 0xBC607800u) return false;                         // ldr S
+    if (bare == 0xBC207800u) return ((int)(insn & 31u)) == reg;    // str S
+    if (bare == 0x1E200800u || bare == 0x1E202800u || bare == 0x1E202000u) {
+        return ((int)((insn >> 5) & 31u)) == reg || ((int)((insn >> 16) & 31u)) == reg;
+    }
+    if ((insn & ~0x001FF3FFu) == 0x1E200C00u) {                    // fcsel
+        return ((int)((insn >> 5) & 31u)) == reg || ((int)((insn >> 16) & 31u)) == reg;
+    }
+    *known = false;
+    return true;
+}
+
+static int a64_fp_def(uint32_t insn, bool* known) {
+    *known = true;
+    uint32_t bare = insn & ~0x001F03FFu;
+    if (insn == 0xD503201Fu || insn == 0xD65F03C0u) return -1;
+    if ((insn & 0xFC000000u) == 0x14000000u || (insn & 0xFF000010u) == 0x54000000u) return -1;
+    if ((insn & 0x1F000000u) == 0x11000000u || (insn & 0x1F200000u) == 0x0B000000u) return -1;
+    if ((insn & 0x7F800000u) == 0x52800000u || (insn & 0x7F800000u) == 0x12800000u ||
+        (insn & 0x7F800000u) == 0x72800000u || (insn & 0x7F800000u) == 0x53000000u ||
+        (insn & 0x7F800000u) == 0x1A800000u || (insn & 0x7F200000u) == 0x2A000000u ||
+        (insn & 0x7FE08000u) == 0x1B000000u) return -1;
+    if ((insn & 0xFFE00C00u) == 0xF8400000u || (insn & 0xFFC00000u) == 0xF9400000u ||
+        (insn & 0xFFC00000u) == 0xF9000000u || (insn & 0xFFE00C00u) == 0xF8000000u) return -1;
+    if ((insn & 0x9F000000u) == 0x90000000u) return -1; // adrp
+    {
+        uint32_t us = insn & ~(0x1Fu | (0x1Fu << 5) | (0x1FFu << 12));
+        if (us == 0xBC400000u) return (int)(insn & 31u); // ldur S
+        if (us == 0xBC000000u) return -1;                // stur S
+    }
+    if ((insn & 0xFFC00000u) == 0xBD400000u || (insn & 0x3F000000u) == 0x1C000000u ||
+        bare == 0xBC607800u) return (int)(insn & 31u);
+    if (bare == 0xBC207800u || bare == 0x1E202000u) return -1;
+    if (bare == 0x1E200800u || bare == 0x1E202800u || (insn & ~0x001FF3FFu) == 0x1E200C00u) {
+        return (int)(insn & 31u);
+    }
+    *known = false;
+    return -1;
+}
+
+static bool a64_fp_dead_from(uint32_t* w, int nins, int pos, int reg) {
+    if (pos < 0 || pos >= nins) return false;
+    uint8_t* seen = calloc((size_t)nins, 1);
+    int* queue = calloc((size_t)nins, sizeof(int));
+    if (!seen || !queue) { free(seen); free(queue); return false; }
+    int qn = 0;
+    queue[qn++] = pos;
+    seen[pos] = 1;
+    bool ok = true;
+    for (int qh = 0; qh < qn; qh++) {
+        int i = queue[qh];
+        uint32_t insn = w[i];
+        bool known = false;
+        if (a64_fp_read(insn, reg, &known) || !known) { ok = false; break; }
+        int def = a64_fp_def(insn, &known);
+        if (!known) { ok = false; break; }
+        if (def == reg || insn == 0xD65F03C0u) continue;
+        if ((insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) {
+            ok = false; break;
+        }
+        int nexts[2];
+        int nn = 0;
+        if ((insn & 0xFC000000u) == 0x14000000u) nexts[nn++] = a64_b_target(i, insn, false);
+        else if ((insn & 0xFF000010u) == 0x54000000u) {
+            nexts[nn++] = i + 1;
+            nexts[nn++] = a64_b_target(i, insn, true);
+        } else nexts[nn++] = i + 1;
+        for (int t = 0; t < nn; t++) {
+            int n = nexts[t];
+            if (n < 0 || n >= nins || seen[n]) continue;
+            seen[n] = 1;
+            queue[qn++] = n;
+        }
+    }
+    free(queue);
+    free(seen);
+    return ok;
+}
+
+// 1 = 读或写了这些寄存器，0 = 没有，-1 = 认不出。
+static int a64_mentions(uint32_t insn, int fp0, int fp1, int gpr) {
+    if ((insn & 0xFC000000u) == 0x94000000u) return 0; // bl
+    if ((insn & 0xFFFFFC1Fu) == 0xD63F0000u) return ((int)((insn >> 5) & 31u) == gpr) ? 1 : 0;
+    if ((insn & 0xFFE00C00u) == 0x3C800000u || (insn & 0xFFE00C00u) == 0x3CC00000u) {
+        int rt = (int)(insn & 31u);
+        return (rt == fp0 || rt == fp1) ? 1 : 0;
+    }
+    if ((insn & 0xFFE00C00u) == 0xF8000000u || (insn & 0xFFE00C00u) == 0xF8400000u) {
+        return ((int)(insn & 31u) == gpr) ? 1 : 0;
+    }
+    if ((insn & 0xFFE00C00u) == 0xBC000000u || (insn & 0xFFE00C00u) == 0xBC400000u ||
+        (insn & 0xFFE00C00u) == 0xFC000000u || (insn & 0xFFE00C00u) == 0xFC400000u) {
+        int rt = (int)(insn & 31u);
+        int rn = (int)((insn >> 5) & 31u);
+        return (rt == fp0 || rt == fp1 || rn == gpr) ? 1 : 0;
+    }
+    if ((insn & ~0x001F03FFu) == 0x1E203800u || (insn & ~0x001F03FFu) == 0x4EA01C00u) {
+        int rd = (int)(insn & 31u), rn = (int)((insn >> 5) & 31u), rm = (int)((insn >> 16) & 31u);
+        return (rd == fp0 || rd == fp1 || rn == fp0 || rn == fp1 || rm == fp0 || rm == fp1) ? 1 : 0;
+    }
+    if ((insn & 0x9F000000u) == 0x90000000u) return ((int)(insn & 31u) == gpr) ? 1 : 0;
+    bool known = true;
+    if (a64_fp_read(insn, fp0, &known)) return 1;
+    if (!known) return -1;
+    if (a64_fp_read(insn, fp1, &known)) return 1;
+    int def = a64_fp_def(insn, &known);
+    if (!known) return -1;
+    if (def == fp0 || def == fp1) return 1;
+    if (a64_gpr_read(insn, gpr, &known)) return 1;
+    if (!known) return -1;
+    if ((int)(insn & 31u) == gpr) {
+        if ((insn & 0x1F000000u) == 0x11000000u) return 1;
+        if ((insn & 0x7F800000u) == 0x52800000u || (insn & 0x7F800000u) == 0x12800000u ||
+            (insn & 0x7F800000u) == 0x72800000u || (insn & 0x7F800000u) == 0x53000000u ||
+            (insn & 0x7F800000u) == 0x1A800000u || (insn & 0x7F200000u) == 0x2A000000u ||
+            (insn & 0x7FE08000u) == 0x1B000000u || (insn & 0xFFE00C00u) == 0xF8400000u ||
+            (insn & 0xFFC00000u) == 0xF9400000u) return 1;
+    }
+    return 0;
+}
+
+static int a64_map_old(int old, int sub_i, int add_i) {
+    if (old <= sub_i) return old;
+    if (old < add_i) return old + 4;
+    return old + 8;
+}
+
+// 删掉或插入指令后，基本块标签仍是发射时的字节偏移。跳转表在 post_emit
+// 之后才按标签填，不跟着移就会落进基本块中间（bytes 测试的 switch 因此
+// 跳过保存下标的那几条，拿栈地址当 lsl #3 的下标）。
+static void a64_shift_labels(TB_CGEmitter* e, int byte_at, int byte_delta) {
+    if (!e->labels) return;
+    for (size_t i = 0; i < e->label_count; i++) {
+        uint32_t lab = e->labels[i];
+        if ((lab & 0x80000000u) == 0) continue;
+        int off = (int)(lab & 0x7fffffffu);
+        if (off >= byte_at) {
+            e->labels[i] = 0x80000000u | (uint32_t)(off + byte_delta);
+        }
+    }
+}
+
+// 帧加 48 字节，原有 [sp,#off] 上移。入口保存 hi0/hi1/x17，ret 前恢复。
+// 成功后旧指令下标要经过 a64_map_old。
+static bool a64_hoist_vec_frame(TB_CGEmitter* e, int nins, int fp0, int fp1, int* sub_i, int* add_i) {
+    uint32_t* w = (uint32_t*)e->data;
+    int nsub = 0, nadd = 0, s = -1, a = -1, frame = 0, nret = 0;
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        int m = a64_mentions(insn, fp0, fp1, 17);
+        if (m != 0) return false;
+        if (insn == 0xD65F03C0u) nret++;
+        bool rnsp = ((insn >> 5) & 31u) == 31u;
+        bool unscaled = (insn & 0xFFE00C00u) == 0xF8000000u || (insn & 0xFFE00C00u) == 0xF8400000u ||
+                        (insn & 0xFFE00C00u) == 0x3C800000u || (insn & 0xFFE00C00u) == 0x3CC00000u ||
+                        (insn & 0xFFE00C00u) == 0xBC000000u || (insn & 0xFFE00C00u) == 0xBC400000u ||
+                        (insn & 0xFFE00C00u) == 0xFC000000u || (insn & 0xFFE00C00u) == 0xFC400000u;
+        bool ls_group = rnsp && ((insn >> 27) & 7u) == 7u;
+        uint32_t op67 = insn & 0x7E000000u;
+        bool pair = rnsp && (op67 == 0x28000000u || op67 == 0x2C000000u || op67 == 0x6C000000u);
+        // add/sub 立即数的 Rn=31 是 SP。Rd 不是 SP，或这是 cmp/cmn，帧加长后都不能只改 unscaled 槽。
+        bool sp_arith = rnsp && (insn & 0x1F000000u) == 0x11000000u &&
+                        ((insn & 31u) != 31u || (insn & 0x20000000u) != 0);
+        if ((ls_group && !unscaled) || pair || sp_arith) return false;
+        if (unscaled && ((insn >> 5) & 31u) == 31u) {
+            int imm = (int)((insn >> 12) & 0x1FFu);
+            if (imm & 0x100) imm |= ~0x1FF;
+            if (imm + 48 < -256 || imm + 48 > 255) return false;
+        }
+        if ((insn & 0xFFC003FFu) == 0xD10003FFu) {
+            nsub++; s = i; frame = (int)((insn >> 10) & 0xFFFu);
+        } else if ((insn & 0xFFC003FFu) == 0x910003FFu) {
+            nadd++; a = i;
+            if ((int)((insn >> 10) & 0xFFFu) != frame) return false;
+        }
+    }
+    if (nsub != 1 || nadd != 1 || nret != 1 || s < 0 || a <= s + 1 || frame + 48 > 4095) return false;
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0xFFC003FFu) == 0xD10003FFu || (insn & 0xFFC003FFu) == 0x910003FFu) {
+            int imm = (int)((insn >> 10) & 0xFFFu) + 48;
+            w[i] = (insn & ~(0xFFFu << 10)) | ((uint32_t)imm << 10);
+        } else if (((insn >> 5) & 31u) == 31u &&
+                   ((insn & 0xFFE00C00u) == 0xF8000000u || (insn & 0xFFE00C00u) == 0xF8400000u ||
+                    (insn & 0xFFE00C00u) == 0x3C800000u || (insn & 0xFFE00C00u) == 0x3CC00000u ||
+                    (insn & 0xFFE00C00u) == 0xBC000000u || (insn & 0xFFE00C00u) == 0xBC400000u ||
+                    (insn & 0xFFE00C00u) == 0xFC000000u || (insn & 0xFFE00C00u) == 0xFC400000u)) {
+            int imm = (int)((insn >> 12) & 0x1FFu);
+            if (imm & 0x100) imm |= ~0x1FF;
+            imm += 48;
+            w[i] = (insn & ~(0x1FFu << 12)) | ((uint32_t)(imm & 0x1FF) << 12);
+        }
+    }
+    tb_cgemit_reserve(e, 32);
+    w = (uint32_t*)e->data;
+    memmove(w + a + 8, w + a, (size_t)(nins - a) * 4);
+    memmove(w + s + 5, w + s + 1, (size_t)(a - s - 1) * 4);
+    w[s + 1] = 0x3C800000u | ((uint32_t)31 << 5) | (uint32_t)fp0;
+    w[s + 2] = 0x3C800000u | (16u << 12) | ((uint32_t)31 << 5) | (uint32_t)fp1;
+    w[s + 3] = 0xF8000000u | (32u << 12) | ((uint32_t)31 << 5) | 17u;
+    w[s + 4] = 0xD503201Fu;
+    int ra = a + 4;
+    w[ra] = 0xF8400000u | (32u << 12) | ((uint32_t)31 << 5) | 17u;
+    w[ra + 1] = 0x3CC00000u | ((uint32_t)31 << 5) | (uint32_t)fp0;
+    w[ra + 2] = 0x3CC00000u | (16u << 12) | ((uint32_t)31 << 5) | (uint32_t)fp1;
+    w[ra + 3] = 0xD503201Fu;
+    e->count += 32;
+    int total = nins + 8;
+    for (int p = 0; p < total; p++) {
+        bool gap = (p > s && p <= s + 4) || (p > a + 3 && p <= a + 7);
+        if (gap) continue;
+        int old = (p <= s) ? p : (p <= a + 3) ? p - 4 : p - 8;
+        uint32_t br = w[p];
+        int imm = 0;
+        bool cond = false;
+        if ((br & 0xFC000000u) == 0x14000000u) {
+            imm = (int)(br & 0x3FFFFFFu);
+            if (imm & 0x2000000) imm |= ~0x3FFFFFF;
+        } else if ((br & 0xFF000010u) == 0x54000000u) {
+            cond = true;
+            imm = (int)((br >> 5) & 0x7FFFFu);
+            if (imm & 0x40000) imm |= ~0x7FFFF;
+        } else continue;
+        int tgt = a64_map_old(old + imm, s, a);
+        int delta = tgt - p;
+        if (cond) w[p] = (br & 0xFF00001Fu) | ((uint32_t)(delta & 0x7FFFF) << 5);
+        else w[p] = 0x14000000u | ((uint32_t)delta & 0x03FFFFFFu);
+    }
+    for (size_t i = 0; i < a64_lit_fixup_count; i++) {
+        int old = (int)(a64_lit_fixups[i].pos / 4);
+        a64_lit_fixups[i].pos = (uint32_t)a64_map_old(old, s, a) * 4;
+    }
+    if (e->output) {
+        for (TB_SymbolPatch* p = e->output->first_patch; p; p = p->next) {
+            int old = (int)(p->pos / 4);
+            p->pos = (uint32_t)a64_map_old(old, s, a) * 4;
+        }
+    }
+    if (e->labels) {
+        for (size_t i = 0; i < e->label_count; i++) {
+            uint32_t lab = e->labels[i];
+            if ((lab & 0x80000000u) == 0) continue;
+            int old = (int)((lab & 0x7fffffffu) / 4);
+            e->labels[i] = 0x80000000u | ((uint32_t)a64_map_old(old, s, a) * 4);
+        }
+    }
+    *sub_i = s;
+    *add_i = a;
+    return true;
+}
+
+static void a64_widen_mac_loops(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    uint32_t* w = (uint32_t*)e->data;
+    enum { MAX_MAC = 4 };
+    struct {
+        int body, exit, idx, base, other, acc, fd, fe, limit, scratch;
+    } hit[MAX_MAC];
+    int nh = 0;
+    for (int h = 0; h + 7 < nins && nh < MAX_MAC; h++) {
+        int idx = 0, limit = 0;
+        if ((w[h] & 0xFF00001Fu) != 0xF100001Fu || (w[h] & 0x00400000u)) continue;
+        idx = (int)((w[h] >> 5) & 31u);
+        limit = (int)((w[h] >> 10) & 0xFFFu);
+        if (limit < 8 || idx == 31) continue;
+        if ((w[h + 1] & 0xFF00001Fu) != 0x5400000Au) continue;
+        int exit = a64_b_target(h + 1, w[h + 1], true);
+        if (exit < 0 || exit >= nins || (exit >= h && exit <= h + 7)) continue;
+        int rt0, rn0, rm0, rt1, rn1, rm1;
+        uint32_t bare0 = w[h + 2] & ~0x001F03FFu;
+        uint32_t bare1 = w[h + 3] & ~0x001F03FFu;
+        if (bare0 != 0xBC607800u || bare1 != 0xBC607800u) continue;
+        rt0 = (int)(w[h + 2] & 31u); rn0 = (int)((w[h + 2] >> 5) & 31u); rm0 = (int)((w[h + 2] >> 16) & 31u);
+        rt1 = (int)(w[h + 3] & 31u); rn1 = (int)((w[h + 3] >> 5) & 31u); rm1 = (int)((w[h + 3] >> 16) & 31u);
+        if (rm0 != idx || rm1 != idx || rt0 == rt1 || rn0 == idx || rn1 == idx) continue;
+        if ((w[h + 4] & ~0x001F03FFu) != 0x1E200800u) continue;
+        int fd = (int)(w[h + 4] & 31u);
+        int fsn = (int)((w[h + 4] >> 5) & 31u);
+        int fsm = (int)((w[h + 4] >> 16) & 31u);
+        if (!((fsn == rt0 && fsm == rt1) || (fsn == rt1 && fsm == rt0))) continue;
+        if (fd != rt0 && fd != rt1) continue;
+        if ((w[h + 5] & ~0x001F03FFu) != 0x1E202800u) continue;
+        int acc = (int)(w[h + 5] & 31u);
+        int an = (int)((w[h + 5] >> 5) & 31u);
+        int am = (int)((w[h + 5] >> 16) & 31u);
+        if (!((an == acc && am == fd) || (am == acc && an == fd))) continue;
+        if (acc == fd || acc == rt0 || acc == rt1) continue;
+        if ((w[h + 6] & 0xFF000000u) != 0x91000000u || (w[h + 6] & 0x00400000u)) continue;
+        if (((w[h + 6] >> 10) & 0xFFFu) != 1u) continue;
+        if (((w[h + 6] >> 5) & 31u) != (uint32_t)idx || (w[h + 6] & 31u) != (uint32_t)idx) continue;
+        if ((w[h + 7] & 0xFC000000u) != 0x14000000u) continue;
+        if (a64_b_target(h + 7, w[h + 7], false) != h) continue;
+        int prev = h;
+        while (prev > 0 && w[prev - 1] == 0xD503201Fu) prev--;
+        if (prev == 0) continue;
+        uint32_t pre = w[prev - 1];
+        bool zero = (pre & ~0x1Fu) == 0xAA1F03E0u || (pre & ~0x1Fu) == 0xD2800000u;
+        if (!zero || (int)(pre & 31u) != idx) continue;
+        int ntgt = 0;
+        for (int i = 0; i < nins; i++) {
+            uint32_t br = w[i];
+            if ((br & 0xFC000000u) == 0x14000000u && a64_b_target(i, br, false) == h) ntgt++;
+            else if ((br & 0xFF000010u) == 0x54000000u && a64_b_target(i, br, true) == h) ntgt++;
+        }
+        if (ntgt != 1) continue;
+        int base = fd == rt0 ? rn0 : rn1;
+        int other = fd == rt0 ? rn1 : rn0;
+        // 原来的 load 目的寄存器在出口上不一定死。另找两个已死的标量浮点寄存器当向量暂存。
+        int t0 = -1, t1 = -1;
+        for (int r = 0; r < 32 && t1 < 0; r++) {
+            if (r == acc) continue;
+            if (!a64_fp_dead_from(w, nins, exit, r)) continue;
+            if (t0 < 0) t0 = r;
+            else t1 = r;
+        }
+        int scratch = -1;
+        if (t0 >= 0 && t1 >= 0) {
+            for (int s = 16; s <= 17; s++) {
+                if (s == idx || s == base || s == other) continue;
+                if (a64_reg_dead_from(w, nins, exit, s)) { scratch = s; break; }
+            }
+        }
+        if (scratch < 0) continue;
+        hit[nh].body = h + 2;
+        hit[nh].exit = exit;
+        hit[nh].idx = idx;
+        hit[nh].base = base;
+        hit[nh].other = other;
+        hit[nh].acc = acc;
+        hit[nh].fd = t0;
+        hit[nh].fe = t1;
+        hit[nh].limit = limit;
+        hit[nh].scratch = scratch;
+        nh++;
+    }
+    int frame_sub = -1, frame_add = -1;
+    bool hoisted = false;
+    if (nh > 0) {
+        int h0 = -1, h1 = -1;
+        bool same = true;
+        for (int n = 0; n < nh && same; n++) {
+            int hi0 = -1, hi1 = -1;
+            for (int r = 8; r <= 14 && hi1 < 0; r++) {
+                if (r == hit[n].acc || r == hit[n].fd || r == hit[n].fe) continue;
+                if (hi0 < 0) hi0 = r;
+                else hi1 = r;
+            }
+            int aligned = hit[n].limit & ~7;
+            bool bump = hit[n].scratch == 16 && hit[n].idx != 17 && hit[n].base != 31 &&
+                        hit[n].other != 31 && aligned >= 8 && aligned < 65536;
+            if (hi1 < 0 || !bump || (h0 >= 0 && (hi0 != h0 || hi1 != h1))) same = false;
+            else { h0 = hi0; h1 = hi1; }
+        }
+        if (same && h1 >= 0) hoisted = a64_hoist_vec_frame(e, nins, h0, h1, &frame_sub, &frame_add);
+    }
+    for (int n = 0; n < nh; n++) {
+        int idx = hit[n].idx, sc = hit[n].scratch, acc = hit[n].acc;
+        int fd = hit[n].fd, fe = hit[n].fe;
+        int base = hit[n].base, other = hit[n].other;
+        // 后一半 4 个浮点要另外两个 Q。出口上它们不一定死，进桩时整存，离开前整取。
+        int hi0 = -1, hi1 = -1;
+        for (int r = 8; r <= 14 && hi1 < 0; r++) {
+            if (r == acc || r == fd || r == fe) continue;
+            if (hi0 < 0) hi0 = r;
+            else hi1 = r;
+        }
+        if (hi1 < 0) continue;
+        int vec = (int)(e->count / 4);
+        int aligned = hit[n].limit & ~7;
+        int trips = aligned >> 3;
+        // x16 是地址暂存。再拿 x17 做第二根指针，进桩时保存，离开前恢复。
+        // 下标在向量段里当趟数，段末写回 aligned，标量收尾才对。
+        bool bump = sc == 16 && idx != 17 && base != 31 && other != 31 && trips > 0 && aligned < 65536;
+        bool once = bump && hoisted;
+        if (bump && !once) {
+            EMIT4(e, 0xD100C3FFu); // sub sp, sp, #48
+            EMIT4(e, 0x3C800000u | ((uint32_t)31 << 5) | (uint32_t)hi0);
+            EMIT4(e, 0x3C800000u | (16u << 12) | ((uint32_t)31 << 5) | (uint32_t)hi1);
+            EMIT4(e, 0xF8000000u | (32u << 12) | ((uint32_t)31 << 5) | 17u); // stur x17, [sp, #32]
+        }
+        if (bump) {
+            EMIT4(e, 0xAA0003E0u | ((uint32_t)base << 16) | 16u);             // mov x16, base
+            EMIT4(e, 0xAA0003E0u | ((uint32_t)other << 16) | 17u);
+            EMIT4(e, 0xD2800000u | ((uint32_t)trips << 5) | (uint32_t)idx);
+        } else {
+            EMIT4(e, 0xD10083FFu); // sub sp, sp, #32
+            EMIT4(e, 0x3C800000u | ((uint32_t)31 << 5) | (uint32_t)hi0);
+            EMIT4(e, 0x3C800000u | (16u << 12) | ((uint32_t)31 << 5) | (uint32_t)hi1);
+        }
+        int loop = (int)(e->count / 4);
+        int bge_vec = -1;
+        if (!bump) {
+            EMIT4(e, 0xF100001Fu | ((uint32_t)aligned << 10) | ((uint32_t)idx << 5));
+            bge_vec = (int)(e->count / 4);
+            EMIT4(e, 0);
+            EMIT4(e, 0x8B000000u | ((uint32_t)idx << 16) | (2u << 10) | ((uint32_t)base << 5) | (uint32_t)sc);
+            EMIT4(e, 0xAD400000u | ((uint32_t)hi0 << 10) | ((uint32_t)sc << 5) | (uint32_t)fd);
+            EMIT4(e, 0x8B000000u | ((uint32_t)idx << 16) | (2u << 10) | ((uint32_t)other << 5) | (uint32_t)sc);
+            EMIT4(e, 0xAD400000u | ((uint32_t)hi1 << 10) | ((uint32_t)sc << 5) | (uint32_t)fe);
+        } else {
+            // ldp Qt, Qt2, [Xn], #32。两次乘在加之前发出，后一半的乘藏在前四次 fadd 后面。
+            EMIT4(e, 0xACC10000u | ((uint32_t)hi0 << 10) | (16u << 5) | (uint32_t)fd);
+            EMIT4(e, 0xACC10000u | ((uint32_t)hi1 << 10) | (17u << 5) | (uint32_t)fe);
+        }
+        EMIT4(e, 0x6E20DC00u | ((uint32_t)fe << 16) | ((uint32_t)fd << 5) | (uint32_t)fd);
+        if (bump) {
+            EMIT4(e, 0x6E20DC00u | ((uint32_t)hi1 << 16) | ((uint32_t)hi0 << 5) | (uint32_t)hi0);
+        }
+        EMIT4(e, 0x1E202800u | ((uint32_t)fd << 16) | ((uint32_t)acc << 5) | (uint32_t)acc);
+        for (int lane = 1; lane <= 3; lane++) {
+            EMIT4(e, 0x5E040400u | (((4u | ((uint32_t)lane << 3)) << 16)) | ((uint32_t)fd << 5) | (uint32_t)fe);
+            EMIT4(e, 0x1E202800u | ((uint32_t)fe << 16) | ((uint32_t)acc << 5) | (uint32_t)acc);
+        }
+        if (!bump) {
+            EMIT4(e, 0x6E20DC00u | ((uint32_t)hi1 << 16) | ((uint32_t)hi0 << 5) | (uint32_t)hi0);
+        }
+        EMIT4(e, 0x1E202800u | ((uint32_t)hi0 << 16) | ((uint32_t)acc << 5) | (uint32_t)acc);
+        for (int lane = 1; lane <= 3; lane++) {
+            EMIT4(e, 0x5E040400u | (((4u | ((uint32_t)lane << 3)) << 16)) | ((uint32_t)hi0 << 5) | (uint32_t)fe);
+            EMIT4(e, 0x1E202800u | ((uint32_t)fe << 16) | ((uint32_t)acc << 5) | (uint32_t)acc);
+        }
+        int b_back = 0;
+        if (bump) {
+            EMIT4(e, 0xF1000400u | ((uint32_t)idx << 5) | (uint32_t)idx); // subs idx, idx, #1
+            b_back = (int)(e->count / 4);
+            EMIT4(e, 0); // b.ne loop
+            EMIT4(e, 0xD2800000u | ((uint32_t)aligned << 5) | (uint32_t)idx);
+        } else {
+            EMIT4(e, 0x91000000u | (8u << 10) | ((uint32_t)idx << 5) | (uint32_t)idx);
+            b_back = (int)(e->count / 4);
+            EMIT4(e, 0);
+        }
+        int tail = (int)(e->count / 4);
+        EMIT4(e, 0xF100001Fu | ((uint32_t)hit[n].limit << 10) | ((uint32_t)idx << 5));
+        int bge_tail = (int)(e->count / 4);
+        EMIT4(e, 0);
+        EMIT4(e, 0x8B000000u | ((uint32_t)idx << 16) | (2u << 10) | ((uint32_t)base << 5) | (uint32_t)sc);
+        EMIT4(e, 0xBD400000u | ((uint32_t)sc << 5) | (uint32_t)fd);
+        EMIT4(e, 0x8B000000u | ((uint32_t)idx << 16) | (2u << 10) | ((uint32_t)other << 5) | (uint32_t)sc);
+        EMIT4(e, 0xBD400000u | ((uint32_t)sc << 5) | (uint32_t)fe);
+        EMIT4(e, 0x1E200800u | ((uint32_t)fe << 16) | ((uint32_t)fd << 5) | (uint32_t)fd);
+        EMIT4(e, 0x1E202800u | ((uint32_t)fd << 16) | ((uint32_t)acc << 5) | (uint32_t)acc);
+        EMIT4(e, 0x91000000u | (1u << 10) | ((uint32_t)idx << 5) | (uint32_t)idx);
+        int b_tail = (int)(e->count / 4);
+        EMIT4(e, 0);
+        int restore = (int)(e->count / 4);
+        int body_at = hit[n].body;
+        int exit_at = hit[n].exit;
+        if (hoisted) {
+            body_at = a64_map_old(body_at, frame_sub, frame_add);
+            exit_at = a64_map_old(exit_at, frame_sub, frame_add);
+        }
+        if (!once) {
+            if (bump) {
+                EMIT4(e, 0xF8400000u | (32u << 12) | ((uint32_t)31 << 5) | 17u); // ldur x17, [sp, #32]
+            }
+            EMIT4(e, 0x3CC00000u | ((uint32_t)31 << 5) | (uint32_t)hi0);
+            EMIT4(e, 0x3CC00000u | (16u << 12) | ((uint32_t)31 << 5) | (uint32_t)hi1);
+            EMIT4(e, bump ? 0x9100C3FFu : 0x910083FFu);
+        }
+        int b_exit = (int)(e->count / 4);
+        if (!once) EMIT4(e, 0);
+        w = (uint32_t*)e->data;
+        if (bge_vec >= 0) {
+            w[bge_vec] = 0x5400000Au | ((uint32_t)((tail - bge_vec) & 0x7FFFF) << 5);
+        }
+        if (bump) {
+            w[b_back] = 0x54000001u | ((uint32_t)((loop - b_back) & 0x7FFFF) << 5);
+        } else {
+            w[b_back] = 0x14000000u | ((uint32_t)((loop - b_back) & 0x03FFFFFFu));
+        }
+        int leave = once ? exit_at : restore;
+        w[bge_tail] = 0x5400000Au | ((uint32_t)((leave - bge_tail) & 0x7FFFF) << 5);
+        w[b_tail] = 0x14000000u | ((uint32_t)((tail - b_tail) & 0x03FFFFFFu));
+        if (!once) w[b_exit] = 0x14000000u | ((uint32_t)((exit_at - b_exit) & 0x03FFFFFFu));
+        w[body_at] = 0x14000000u | ((uint32_t)((vec - body_at) & 0x03FFFFFFu));
+    }
+}
+
+static bool a64_reads_nzcv(uint32_t insn) {
+    if ((insn & 0xFF000010u) == 0x54000000u) return true;          // b.cond
+    if ((insn & 0x7F800000u) == 0x1A800000u) return true;          // csel/cset
+    if ((insn & 0xFFE00C00u) == 0x1E200C00u) return true;          // fcsel S
+    if ((insn & 0x7FE0FC00u) == 0x1A000000u || (insn & 0x7FE0FC00u) == 0x5A000000u) return true; // adc/sbc
+    if ((insn & 0x7FE00C10u) == 0x3A400000u) return true;          // ccmn/ccmp
+    return false;
+}
+
+// fcmp / cset mi / uxtb / cmp #0 / fcsel ne 是 max 或 min。换成 fmaxnm / fminnm，
+// 多出来的 nop 沉到回边后面，外层循环不再执行。
+static void a64_fold_fmaxnm(TB_CGEmitter* e) {
+    if (e->count < 20 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    uint32_t* w = (uint32_t*)e->data;
+    for (int i = 0; i + 5 < nins; i++) {
+        uint32_t fc = w[i];
+        if ((fc & ~0x001F03E0u) != 0x1E202000u || (fc & 31u) != 0) continue;
+        int A = (int)((fc >> 5) & 31u);
+        int B = (int)((fc >> 16) & 31u);
+        uint32_t cs = w[i + 1];
+        if ((cs & ~0x1Fu) != 0x1A9F57E0u) continue;
+        int td = (int)(cs & 31u);
+        uint32_t ux = w[i + 2];
+        if ((ux & ~0x3FFu) != 0x53001C00u) continue;
+        if ((int)((ux >> 5) & 31u) != td) continue;
+        int ts = (int)(ux & 31u);
+        uint32_t cm = w[i + 3];
+        if ((cm & 0xFFC0001Fu) != 0x7100001Fu || ((cm >> 10) & 0xFFFu) != 0) continue;
+        if ((int)((cm >> 5) & 31u) != ts) continue;
+        uint32_t fs = w[i + 4];
+        if ((fs & ~0x001F03FFu) != 0x1E201C00u) continue;
+        int D = (int)(fs & 31u);
+        int X = (int)((fs >> 5) & 31u);
+        int Y = (int)((fs >> 16) & 31u);
+        uint32_t op;
+        if (X == B && Y == A) op = 0x1E206800u;       // fmaxnm
+        else if (X == A && Y == B) op = 0x1E207800u;  // fminnm
+        else continue;
+        bool mid = false;
+        for (int k = i + 1; k <= i + 4; k++) {
+            if (a64_is_branch_target(w, nins, k)) mid = true;
+        }
+        if (mid) continue;
+        if (!a64_reg_dead_from(w, nins, i + 5, td)) continue;
+        if (ts != td && !a64_reg_dead_from(w, nins, i + 5, ts)) continue;
+        int bpos = -1;
+        bool gap_ok = true;
+        for (int k = i + 5; k < nins && k < i + 14; k++) {
+            if ((w[k] & 0xFC000000u) == 0x14000000u) {
+                bpos = k;
+                break;
+            }
+            bool known = false;
+            a64_gpr_def(w[k], &known);
+            if (!known || a64_reads_nzcv(w[k])) { gap_ok = false; break; }
+        }
+        if (!gap_ok || bpos < 0) continue;
+        w[i] = op | ((uint32_t)B << 16) | ((uint32_t)A << 5) | (uint32_t)D;
+        for (int k = 1; k <= 4; k++) w[i + k] = 0xD503201Fu;
+        int guard = 0;
+        while (guard++ < 4 && w[i + 1] == 0xD503201Fu) {
+            int end = -1;
+            for (int k = i + 2; k < nins && k < i + 16; k++) {
+                if (a64_is_branch_target(w, nins, k)) break;
+                if ((w[k] & 0xFC000000u) == 0x14000000u) { end = k; break; }
+                if (a64_reads_nzcv(w[k])) break;
+            }
+            if (end < 0) break;
+            a64_sink_nop(w, nins, i + 1, end);
+            int moved = -1;
+            for (int k = i + 1; k <= end; k++) {
+                if ((w[k] & 0xFC000000u) == 0x14000000u) { moved = k; break; }
+            }
+            if (moved < 0 || moved == end) break;
+        }
+        i += 4;
+    }
+}
+
+// cmp/fcmp、cset、uxtb、cmp #0，再 b.eq 或 fcsel。布尔拆出来又比回去。
+// cset 编码里的条件是助记符的反面。收成原来的比较直接带条件。
+static void a64_fold_loop_test(TB_CGEmitter* e) {
+    if (e->count < 20 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    uint32_t* w = (uint32_t*)e->data;
+    enum { MAX_TEST = 128 };
+    int site[MAX_TEST];
+    int cond_field[MAX_TEST];
+    uint8_t use_fcsel[MAX_TEST];
+    int nt = 0;
+    for (int i = 0; i + 5 < nins && nt < MAX_TEST; i++) {
+        uint32_t cm = w[i];
+        bool cmp64 = (cm & 0xFF00001Fu) == 0xF100001Fu && (cm & 0x00400000u) == 0;
+        bool cmp32 = (cm & 0xFF00001Fu) == 0x7100001Fu && (cm & 0x00400000u) == 0;
+        bool fcmp = (cm & 0xFF20FC1Fu) == 0x1E202000u || (cm & 0xFFFFFC1Fu) == 0x1E202008u;
+        bool cmpr = (cm & 0x7F20001Fu) == 0x6B00001Fu;
+        if (!cmp64 && !cmp32 && !fcmp && !cmpr) continue;
+        uint32_t cs = w[i + 1];
+        if ((cs & ~(0x1Fu | (0xFu << 12))) != 0x1A9F07E0u) continue;
+        int td = (int)(cs & 31u);
+        uint32_t ux = w[i + 2];
+        if ((ux & ~0x3FFu) != 0x53001C00u || (int)((ux >> 5) & 31u) != td) continue;
+        int ts = (int)(ux & 31u);
+        uint32_t z = w[i + 3];
+        if ((z & 0xFFC0001Fu) != 0x7100001Fu || ((z >> 10) & 0xFFFu) != 0) continue;
+        if ((int)((z >> 5) & 31u) != ts) continue;
+        uint32_t br = w[i + 4];
+        int field = (int)((cs >> 12) & 0xFu);
+        bool fcsel = false;
+        if ((br & 0xFF000010u) == 0x54000000u) {
+            int bc = (int)(br & 0xFu);
+            if (bc != 0 && bc != 1) continue;
+            if (bc == 1) field ^= 1;
+            int tgt = a64_b_target(i + 4, br, true);
+            if (tgt < 0 || tgt >= nins || (tgt > i && tgt <= i + 4)) continue;
+            if (a64_reads_nzcv(w[tgt])) continue;
+        } else if ((br & 0xFFE00C00u) == 0x1E200C00u) {
+            int fc = (int)((br >> 12) & 0xFu);
+            if (fc != 0 && fc != 1) continue;
+            field ^= fc;
+            fcsel = true;
+        } else continue;
+        if (i + 5 < nins && a64_reads_nzcv(w[i + 5])) continue;
+        bool mid = false;
+        for (int k = i + 1; k <= i + 4; k++) {
+            if (a64_is_branch_target(w, nins, k)) mid = true;
+        }
+        if (mid) continue;
+        if (!a64_reg_dead_from_ex(w, nins, i + 5, td, true)) continue;
+        if (ts != td && !a64_reg_dead_from_ex(w, nins, i + 5, ts, true)) continue;
+        site[nt] = i;
+        cond_field[nt] = field;
+        use_fcsel[nt] = fcsel ? 1u : 0u;
+        nt++;
+    }
+    for (int n = nt - 1; n >= 0; n--) {
+        int i = site[n];
+        int del = i + 2;
+        uint32_t kept = w[i + 4];
+        int old_tgt = use_fcsel[n] ? -1 : a64_b_target(i + 4, w[i + 4], true);
+        if (!use_fcsel[n] && (old_tgt < 0 || old_tgt >= nins || (old_tgt >= del && old_tgt < del + 3))) continue;
+        bool pinned = false;
+        for (size_t f = 0; f < a64_lit_fixup_count; f++) {
+            int at = (int)(a64_lit_fixups[f].pos / 4);
+            if (at >= del && at < del + 3) pinned = true;
+        }
+        if (e->output) {
+            for (TB_SymbolPatch* p = e->output->first_patch; p; p = p->next) {
+                int at = (int)(p->pos / 4);
+                if (at >= del && at < del + 3) pinned = true;
+            }
+        }
+        if (pinned) continue;
+        memmove(w + del, w + del + 3, (size_t)(nins - del - 3) * 4);
+        int new_n = nins - 3;
+        for (int p = 0; p < new_n; p++) {
+            if (p == i + 1) continue;
+            int old_p = p < del ? p : p + 3;
+            uint32_t br = w[p];
+            int imm = 0;
+            bool cond = false;
+            if ((br & 0xFC000000u) == 0x14000000u) {
+                imm = (int)(br & 0x3FFFFFFu);
+                if (imm & 0x2000000) imm |= ~0x3FFFFFF;
+            } else if ((br & 0xFF000010u) == 0x54000000u) {
+                cond = true;
+                imm = (int)((br >> 5) & 0x7FFFFu);
+                if (imm & 0x40000) imm |= ~0x7FFFF;
+            } else continue;
+            int old_t = old_p + imm;
+            int new_t = old_t < del ? old_t : old_t - 3;
+            int delta = new_t - p;
+            if (cond) w[p] = (br & 0xFF00001Fu) | ((uint32_t)(delta & 0x7FFFF) << 5);
+            else w[p] = 0x14000000u | ((uint32_t)delta & 0x03FFFFFFu);
+        }
+        if (use_fcsel[n]) {
+            w[i + 1] = (kept & ~(0xFu << 12)) | ((uint32_t)cond_field[n] << 12);
+        } else {
+            int new_t = old_tgt < del ? old_tgt : old_tgt - 3;
+            int delta = new_t - (i + 1);
+            w[i + 1] = 0x54000000u | ((uint32_t)(delta & 0x7FFFF) << 5) | (uint32_t)cond_field[n];
+        }
+        for (size_t f = 0; f < a64_lit_fixup_count; f++) {
+            int at = (int)(a64_lit_fixups[f].pos / 4);
+            if (at >= del + 3) a64_lit_fixups[f].pos -= 12;
+        }
+        if (e->output) {
+            for (TB_SymbolPatch* p = e->output->first_patch; p; p = p->next) {
+                int at = (int)(p->pos / 4);
+                if (at >= del + 3) p->pos -= 12;
+            }
+        }
+        a64_shift_labels(e, (del + 3) * 4, -12);
+        e->count -= 12;
+        nins = new_n;
+    }
+}
+
+// 这条指令有没有把 reg 当 GPR 用。SIMD 的 vN 和 GPR 的 xN 占同一段位域，
+// 认不出来就 known=false，调用方必须放弃，不能当成没用过。
+static bool a64_gpr_touch(uint32_t insn, int reg, bool* known) {
+    bool kr = true, kd = true;
+    bool rd = a64_gpr_read(insn, reg, &kr);
+    int def = a64_gpr_def(insn, &kd);
+    if (kr && rd) { *known = true; return true; }
+    if (kd && def == reg) { *known = true; return true; }
+    if (kr && kd) { *known = true; return false; }
+    if ((insn & 0xFFE00C00u) == 0x3C800000u || (insn & 0xFFE00C00u) == 0x3CC00000u ||
+        (insn & 0xFFE00C00u) == 0xBC000000u || (insn & 0xFFE00C00u) == 0xBC400000u ||
+        (insn & 0xFFE00C00u) == 0xFC000000u || (insn & 0xFFE00C00u) == 0xFC400000u) {
+        *known = true;
+        return ((int)((insn >> 5) & 31u)) == reg;
+    }
+    if ((insn & 0xFFE00C00u) == 0xF8000000u) {
+        *known = true;
+        return ((int)(insn & 31u)) == reg || ((int)((insn >> 5) & 31u)) == reg;
+    }
+    if ((insn & 0xFFC00000u) == 0xACC00000u || (insn & 0x9F000000u) == 0x90000000u) {
+        *known = true;
+        int r = (insn & 0xFFC00000u) == 0xACC00000u ? (int)((insn >> 5) & 31u) : (int)(insn & 31u);
+        return r == reg;
+    }
+    if ((insn & 0xBFE0FC00u) == 0x2E20DC00u || (insn & 0xBFE0FC00u) == 0x0EA01C00u ||
+        ((insn & 0xBFE08400u) == 0x1E000400u && (insn >> 24) == 0x5Eu)) {
+        *known = true;
+        return false;
+    }
+    if ((insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) {
+        *known = true;
+        return false;
+    }
+    *known = false;
+    return true;
+}
+
+static int a64_gpr_def_ex(uint32_t insn, bool* known) {
+    int def = a64_gpr_def(insn, known);
+    if (*known) return def;
+    if ((insn & 0xFFC00000u) == 0xACC00000u) { *known = true; return (int)((insn >> 5) & 31u); }
+    if ((insn & 0x9F000000u) == 0x90000000u) { *known = true; return (int)(insn & 31u); }
+    if ((insn & 0xFFE00C00u) == 0xF8000000u || (insn & 0xFFE00C00u) == 0x3C800000u ||
+        (insn & 0xFFE00C00u) == 0x3CC00000u || (insn & 0xFFE00C00u) == 0xBC000000u ||
+        (insn & 0xFFE00C00u) == 0xBC400000u || (insn & 0xFFE00C00u) == 0xFC000000u ||
+        (insn & 0xFFE00C00u) == 0xFC400000u || (insn & 0xBFE0FC00u) == 0x2E20DC00u ||
+        (insn & 0xBFE0FC00u) == 0x0EA01C00u ||
+        ((insn & 0xBFE08400u) == 0x1E000400u && (insn >> 24) == 0x5Eu) ||
+        (insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) {
+        *known = true;
+        return -1;
+    }
+    return -1;
+}
+
+static void a64_reloc_branches(uint32_t* w, int nins, int skip_lo, int skip_hi, int at, int delta) {
+    for (int p = 0; p < nins; p++) {
+        if (p >= skip_lo && p < skip_hi) continue;
+        int old_p = delta > 0 ? (p < at ? p : p - delta) : (p < at ? p : p - delta);
+        uint32_t br = w[p];
+        int imm = 0;
+        bool cond = false;
+        if ((br & 0xFC000000u) == 0x14000000u) {
+            imm = (int)(br & 0x3FFFFFFu);
+            if (imm & 0x2000000) imm |= ~0x3FFFFFF;
+        } else if ((br & 0xFF000010u) == 0x54000000u) {
+            cond = true;
+            imm = (int)((br >> 5) & 0x7FFFFu);
+            if (imm & 0x40000) imm |= ~0x7FFFF;
+        } else continue;
+        int old_t = old_p + imm;
+        int new_t = old_t < at ? old_t : old_t + delta;
+        int d = new_t - p;
+        if (cond) w[p] = (br & 0xFF00001Fu) | ((uint32_t)(d & 0x7FFFF) << 5);
+        else w[p] = 0x14000000u | ((uint32_t)d & 0x03FFFFFFu);
+    }
+}
+
+static void a64_shift_meta(TB_CGEmitter* e, int at, int delta) {
+    int hole = delta < 0 ? at - delta : at;
+    for (size_t f = 0; f < a64_lit_fixup_count; f++) {
+        int ai = (int)(a64_lit_fixups[f].pos / 4);
+        if (ai >= hole) a64_lit_fixups[f].pos = (uint32_t)((int)a64_lit_fixups[f].pos + delta * 4);
+    }
+    if (e->output) {
+        for (TB_SymbolPatch* p = e->output->first_patch; p; p = p->next) {
+            int ai = (int)(p->pos / 4);
+            if (ai >= hole) p->pos = (uint32_t)((int)p->pos + delta * 4);
+        }
+    }
+    a64_shift_labels(e, hole * 4, delta * 4);
+}
+
+static void a64_insert_insns(TB_CGEmitter* e, int* nins, int at, const uint32_t* neu, int n) {
+    tb_cgemit_reserve(e, (size_t)n * 4);
+    uint32_t* w = (uint32_t*)e->data;
+    memmove(w + at + n, w + at, (size_t)(*nins - at) * 4);
+    for (int i = 0; i < n; i++) w[at + i] = neu[i];
+    int nn = *nins + n;
+    a64_reloc_branches(w, nn, at, at + n, at, n);
+    a64_shift_meta(e, at, n);
+    e->count += (size_t)n * 4;
+    *nins = nn;
+}
+
+static void a64_delete_insns(TB_CGEmitter* e, int* nins, int at, int n) {
+    uint32_t* w = (uint32_t*)e->data;
+    memmove(w + at, w + at + n, (size_t)(*nins - at - n) * 4);
+    int nn = *nins - n;
+    a64_reloc_branches(w, nn, nn, nn, at, -n);
+    a64_shift_meta(e, at, -n);
+    e->count -= (size_t)n * 4;
+    *nins = nn;
+}
+
+// 外层每一行都在用 base+i*stride 重算行指针。预头算第一行，回边前加 stride，
+// 体内那几条删掉。指针放进函数里没用过的 x9–x15，原来的寄存器留给同一轮的
+// bias 临时值。桩里的 ldp 递增的是副本，不是这根指针。
+static void a64_bump_row_ptrs(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    if (nins > 8192) return;
+    uint32_t* w = (uint32_t*)e->data;
+    uint32_t free_mask = 0;
+    for (int r = 9; r <= 15; r++) free_mask |= 1u << r;
+    for (int i = 0; i < nins && free_mask; i++) {
+        for (int r = 9; r <= 15; r++) {
+            if ((free_mask & (1u << r)) == 0) continue;
+            bool known = false;
+            if (!a64_gpr_touch(w[i], r, &known) && known) continue;
+            if (!known || a64_gpr_touch(w[i], r, &known)) free_mask &= ~(1u << r);
+        }
+    }
+    if (free_mask == 0) return;
+
+    enum { MAX_ROW = 4, MAX_USE = 8 };
+    struct {
+        int header, seq, seq_len, latch, xbase, xidx, xrow, stride, reg, ninit, nuse;
+        uint32_t init[3];
+        int use_at[MAX_USE];
+        uint8_t use_field[MAX_USE];
+    } site[MAX_ROW];
+    int ns = 0;
+    for (int i = 0; i + 3 < nins && ns < MAX_ROW; ) {
+        int seq = -1, seq_len = 0, xrow = -1, xidx = -1, xbase = -1, stride = 0, off = 0;
+        int tmp = -1, lo = 0, hi = 0, xa = -1;
+        int rd, rn, rm, sh;
+        bool mz = (w[i] & 0xFFE00000u) == 0xD2800000u && (w[i] & 31u) != 31u;
+        if (mz && i + 4 < nins) {
+            tmp = (int)(w[i] & 31u);
+            lo = (int)((w[i] >> 5) & 0xFFFFu);
+            int p = i + 1;
+            if ((w[p] & 0xFFE00000u) == 0xF2A00000u && (int)(w[p] & 31u) == tmp) {
+                hi = (int)((w[p] >> 5) & 0xFFFFu);
+                p++;
+            }
+            bool a1 = p + 2 < nins && (w[p] & 0xFFE0FC00u) == 0x8B000000u;
+            bool ls = p + 2 < nins && (w[p + 1] & 0xFFC00000u) == 0xD3400000u;
+            bool a2 = p + 2 < nins && (w[p + 2] & 0xFFE0FC00u) == 0x8B000000u;
+            if (a1 && ls && a2) {
+                int immr = (int)((w[p + 1] >> 16) & 63u);
+                int imms = (int)((w[p + 1] >> 10) & 63u);
+                sh = (imms < 63 && immr == ((imms + 1) & 63)) ? 63 - imms : 0;
+                xa = (int)(w[p] & 31u);
+                int ab = (int)((w[p] >> 5) & 31u);
+                int at = (int)((w[p] >> 16) & 31u);
+                xrow = (int)(w[p + 1] & 31u);
+                xidx = (int)((w[p + 1] >> 5) & 31u);
+                rd = (int)(w[p + 2] & 31u);
+                rn = (int)((w[p + 2] >> 5) & 31u);
+                rm = (int)((w[p + 2] >> 16) & 31u);
+                if (sh >= 1 && sh <= 11 && at == tmp && xa != ab && xa != 31 && ab != 31 &&
+                    xrow != 31 && xidx != 31 && rd == xrow && rn == xa && rm == xrow &&
+                    xrow != xa && xrow != xidx && xrow != ab && xrow != tmp && xidx != ab) {
+                    seq = i; seq_len = p + 3 - i; xbase = ab; stride = 1 << sh; off = lo | (hi << 16);
+                }
+            }
+        }
+        if (seq < 0 && mz && i + 2 < nins && (w[i + 1] & 0xFFE0FC00u) == 0x9B007C00u &&
+            (w[i + 2] & 0xFFE0FC00u) == 0x8B000000u) {
+            int imm16 = (int)((w[i] >> 5) & 0xFFFFu);
+            rd = (int)(w[i + 1] & 31u);
+            rn = (int)((w[i + 1] >> 5) & 31u);
+            rm = (int)((w[i + 1] >> 16) & 31u);
+            int ad = (int)(w[i + 2] & 31u);
+            int an = (int)((w[i + 2] >> 5) & 31u);
+            int am = (int)((w[i + 2] >> 16) & 31u);
+            int zd = (int)(w[i] & 31u);
+            if (imm16 >= 1 && imm16 <= 4095 && rd == zd && rm == zd && ad == zd && am == zd &&
+                rn != zd && an != zd && an != 31 && rn != 31) {
+                seq = i; seq_len = 3; xrow = zd; xidx = rn; xbase = an; stride = imm16; off = 0;
+            }
+        }
+        if (seq < 0) { i++; continue; }
+        int header = -1, latch = -1;
+        for (int j = 0; j + 1 < nins; j++) {
+            uint32_t ai = w[j];
+            if ((ai & 0xFFC00000u) != 0x91000000u && (ai & 0xFFC00000u) != 0x11000000u) continue;
+            if ((int)(ai & 31u) != xidx || (int)((ai >> 5) & 31u) != xidx) continue;
+            if ((int)((ai >> 10) & 0xFFFu) != 1) continue;
+            int k = j + 1;
+            while (k < nins && w[k] == 0xD503201Fu) k++;
+            if (k >= nins || (w[k] & 0xFC000000u) != 0x14000000u) continue;
+            int tgt = a64_b_target(k, w[k], false);
+            if (tgt < 0 || tgt > seq || tgt <= header) continue;
+            header = tgt;
+            latch = j;
+        }
+        int exit_br = -1;
+        if (header >= 0) {
+            for (int k = header; k < seq; k++) {
+                uint32_t cm = w[k];
+                bool c64 = (cm & 0xFF00001Fu) == 0xF100001Fu && (cm & 0x00400000u) == 0;
+                bool c32 = (cm & 0xFF00001Fu) == 0x7100001Fu && (cm & 0x00400000u) == 0;
+                if ((!c64 && !c32) || (int)((cm >> 5) & 31u) != xidx) continue;
+                if (k + 1 < seq && (w[k + 1] & 0xFF000010u) == 0x54000000u) exit_br = k + 1;
+                break;
+            }
+        }
+        bool pinned = false;
+        for (int k = seq; k < seq + seq_len; k++) {
+            if (a64_is_branch_target(w, nins, k)) pinned = true;
+        }
+        if (latch >= 0 && a64_is_branch_target(w, nins, latch)) pinned = true;
+        for (size_t f = 0; f < a64_lit_fixup_count && !pinned; f++) {
+            int at = (int)(a64_lit_fixups[f].pos / 4);
+            if (at >= seq && at < seq + seq_len) pinned = true;
+        }
+        if (e->output) {
+            for (TB_SymbolPatch* p = e->output->first_patch; p && !pinned; p = p->next) {
+                int at = (int)(p->pos / 4);
+                if (at >= seq && at < seq + seq_len) pinned = true;
+            }
+        }
+        int nedge = 0;
+        if (header >= 0) {
+            for (int p = 0; p < nins; p++) {
+                uint32_t br = w[p];
+                if ((br & 0xFC000000u) == 0x14000000u && a64_b_target(p, br, false) == header) nedge++;
+                else if ((br & 0xFF000010u) == 0x54000000u && a64_b_target(p, br, true) == header) nedge++;
+            }
+        }
+        bool fall = header == 0 || (header > 0 && (w[header - 1] & 0xFC000000u) != 0x14000000u &&
+                                    (w[header - 1] & 0x9F000000u) != 0x90000000u);
+        if (pinned || header < 0 || latch < 0 || exit_br < 0 || nedge != 1 || !fall ||
+            (latch >= seq && latch < seq + seq_len) || header >= seq) {
+            i += seq_len;
+            continue;
+        }
+        int reg = -1;
+        for (int r = 9; r <= 15; r++) {
+            if (free_mask & (1u << r)) { reg = r; break; }
+        }
+        if (reg < 0) break;
+        uint8_t* seen = calloc((size_t)nins, 1);
+        int* queue = calloc((size_t)nins, sizeof(int));
+        if (!seen || !queue) { free(seen); free(queue); break; }
+        int qn = 0;
+        queue[qn++] = seq + seq_len;
+        seen[seq + seq_len] = 1;
+        int nuse = 0;
+        bool bad = false, saw_ldp = false, saw_latch = false;
+        uint8_t fields[MAX_USE];
+        int uses[MAX_USE];
+        for (int qh = 0; qh < qn && !bad; qh++) {
+            int p = queue[qh];
+            if (p == latch) saw_latch = true;
+            uint32_t insn = w[p];
+            bool call = (insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u;
+            bool kr = false, kb = false, ki = false;
+            bool read_r = a64_gpr_touch(insn, xrow, &kr);
+            a64_gpr_touch(insn, xbase, &kb);
+            a64_gpr_touch(insn, xidx, &ki);
+            bool kd = false, kdb = false, kdi = false;
+            int def_r = a64_gpr_def_ex(insn, &kd);
+            int def_b = a64_gpr_def_ex(insn, &kdb);
+            int def_i = a64_gpr_def_ex(insn, &kdi);
+            if (!kr || !kb || !ki || !kd || !kdb || !kdi) { bad = true; break; }
+            if ((insn & 0xFFC00000u) == 0xACC00000u) saw_ldp = true;
+            if (call || def_b == xbase || (def_i == xidx && p != latch)) { bad = true; break; }
+            bool inseq = p >= seq && p < seq + seq_len;
+            if (def_r == xrow && !inseq) {
+                // 只写不读的是别的值复用了这个寄存器（bias 的 lsl），行指针到此已死。
+                // 读了再写才是在改这根指针，认不了就放弃。
+                bool rk = true;
+                bool real = a64_gpr_read(insn, xrow, &rk);
+                if (!rk) {
+                    int brn = (int)((insn >> 5) & 31u);
+                    int brt = (int)(insn & 31u);
+                    if ((insn & 0xFFC00000u) == 0xACC00000u) real = brn == xrow;
+                    else if ((insn & 0xFFE00C00u) == 0xF8000000u) real = brt == xrow || brn == xrow;
+                    else if ((insn & 0xFFE00C00u) == 0x3C800000u || (insn & 0xFFE00C00u) == 0x3CC00000u ||
+                             (insn & 0xFFE00C00u) == 0xBC000000u || (insn & 0xFFE00C00u) == 0xBC400000u ||
+                             (insn & 0xFFE00C00u) == 0xFC000000u || (insn & 0xFFE00C00u) == 0xFC400000u) {
+                        real = brn == xrow;
+                    } else if ((insn & 0x9F000000u) == 0x90000000u || (insn & 0xBFE0FC00u) == 0x2E20DC00u ||
+                               (insn & 0xBFE0FC00u) == 0x0EA01C00u ||
+                               ((insn & 0xBFE08400u) == 0x1E000400u && (insn >> 24) == 0x5Eu) ||
+                               (insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) {
+                        real = false;
+                    } else bad = true;
+                }
+                if (real) bad = true;
+                continue;
+            }
+            if (read_r && !inseq) {
+                rn = (int)((insn >> 5) & 31u);
+                rm = (int)((insn >> 16) & 31u);
+                uint8_t field = 0;
+                bool shadd = (insn & 0x1F200000u) == 0x0B000000u;
+                bool orr = (insn & 0x7F200000u) == 0x2A000000u;
+                bool ldrr = (insn & 0x3FE00C00u) == 0x3C600800u || (insn & 0x3FE00C00u) == 0x3C200800u;
+                if (shadd || orr || ldrr) {
+                    if (rn == xrow) field |= 1;
+                    if (rm == xrow) field |= 2;
+                } else if (((insn & 0x1F000000u) == 0x11000000u || (insn & 0xFFC00000u) == 0xBD400000u ||
+                            (insn & 0xFFC00000u) == 0xFD400000u || (insn & 0xFFC00000u) == 0xF9400000u ||
+                            (insn & 0xFFE00C00u) == 0xF8400000u) && rn == xrow) {
+                    field = 1;
+                }
+                if (field == 0 || nuse >= MAX_USE) { bad = true; break; }
+                uses[nuse] = p;
+                fields[nuse] = field;
+                nuse++;
+            }
+            if (def_r == xrow) continue;
+            int nxt[2];
+            int nn = 0;
+            if ((insn & 0xFC000000u) == 0x14000000u) nxt[nn++] = a64_b_target(p, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) {
+                nxt[nn++] = p + 1;
+                if (p != exit_br) nxt[nn++] = a64_b_target(p, insn, true);
+            } else if (insn != 0xD65F03C0u && !call) nxt[nn++] = p + 1;
+            for (int t = 0; t < nn; t++) {
+                int to = nxt[t];
+                if (to < 0 || to >= nins) { bad = true; break; }
+                if (!seen[to]) { seen[to] = 1; queue[qn++] = to; }
+            }
+        }
+        free(seen);
+        free(queue);
+        if (bad || !saw_ldp || !saw_latch || nuse < 1) { i += seq_len; continue; }
+        free_mask &= ~(1u << reg);
+        site[ns].header = header;
+        site[ns].seq = seq;
+        site[ns].seq_len = seq_len;
+        site[ns].latch = latch;
+        site[ns].xbase = xbase;
+        site[ns].stride = stride;
+        site[ns].reg = reg;
+        site[ns].nuse = nuse;
+        for (int u = 0; u < nuse; u++) {
+            site[ns].use_at[u] = uses[u];
+            site[ns].use_field[u] = fields[u];
+        }
+        if (off == 0) {
+            site[ns].init[0] = 0xAA0003E0u | ((uint32_t)xbase << 16) | (uint32_t)reg;
+            site[ns].ninit = 1;
+        } else {
+            int ni = 0;
+            site[ns].init[ni++] = 0xD2800000u | (((uint32_t)off & 0xFFFFu) << 5) | (uint32_t)reg;
+            if (off > 0xFFFF) {
+                site[ns].init[ni++] = 0xF2A00000u | (((uint32_t)((off >> 16) & 0xFFFF)) << 5) | (uint32_t)reg;
+            }
+            site[ns].init[ni++] = 0x8B000000u | ((uint32_t)reg << 16) | ((uint32_t)xbase << 5) | (uint32_t)reg;
+            site[ns].ninit = ni;
+        }
+        (void)xidx;
+        ns++;
+        i += seq_len;
+    }
+    if (ns == 0) return;
+    w = (uint32_t*)e->data;
+    for (int s = 0; s < ns; s++) {
+        for (int u = 0; u < site[s].nuse; u++) {
+            uint32_t insn = w[site[s].use_at[u]];
+            int from = -1;
+            // 原行寄存器编码在这条指令的 Rn/Rm 里，扫描时已经记下是哪一段。
+            // 重新认一遍，避免两处命中改同一条。
+            if (site[s].use_field[u] & 1) {
+                from = (int)((insn >> 5) & 31u);
+                insn = (insn & ~(31u << 5)) | ((uint32_t)site[s].reg << 5);
+            }
+            if (site[s].use_field[u] & 2) {
+                insn = (insn & ~(31u << 16)) | ((uint32_t)site[s].reg << 16);
+            }
+            w[site[s].use_at[u]] = insn;
+            (void)from;
+        }
+    }
+    for (int s = ns - 1; s >= 0; s--) {
+        struct { int at, delta; } ed[3];
+        int ne = 0;
+        ed[ne].at = site[s].seq; ed[ne].delta = -site[s].seq_len; ne++;
+        ed[ne].at = site[s].header; ed[ne].delta = site[s].ninit; ne++;
+        ed[ne].at = site[s].latch; ed[ne].delta = 1; ne++;
+        for (int a = 0; a < ne; a++) {
+            for (int b = a + 1; b < ne; b++) {
+                if (ed[b].at > ed[a].at) {
+                    int at = ed[a].at, d = ed[a].delta;
+                    ed[a].at = ed[b].at; ed[a].delta = ed[b].delta;
+                    ed[b].at = at; ed[b].delta = d;
+                }
+            }
+        }
+        for (int eidx = 0; eidx < ne; eidx++) {
+            w = (uint32_t*)e->data;
+            if (ed[eidx].delta > 0) {
+                uint32_t neu[3];
+                int n = ed[eidx].delta;
+                if (ed[eidx].at == site[s].header) {
+                    for (int k = 0; k < n; k++) neu[k] = site[s].init[k];
+                } else {
+                    neu[0] = 0x91000000u | ((uint32_t)site[s].stride << 10) |
+                             ((uint32_t)site[s].reg << 5) | (uint32_t)site[s].reg;
+                }
+                a64_insert_insns(e, &nins, ed[eidx].at, neu, n);
+            } else {
+                a64_delete_insns(e, &nins, ed[eidx].at, -ed[eidx].delta);
+            }
+            for (int t = 0; t < s; t++) {
+                int* idxv[3] = { &site[t].header, &site[t].seq, &site[t].latch };
+                for (int k = 0; k < 3; k++) {
+                    int idx = *idxv[k];
+                    if (ed[eidx].delta > 0) {
+                        if (idx >= ed[eidx].at) *idxv[k] = idx + ed[eidx].delta;
+                    } else {
+                        int n = -ed[eidx].delta;
+                        if (idx >= ed[eidx].at + n) *idxv[k] = idx - n;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static bool a64_fp_names(uint32_t insn, int reg, bool* known) {
+    *known = true;
+    if ((insn >> 24) == 0x1Eu) {
+        int rd = (int)(insn & 31u), rn = (int)((insn >> 5) & 31u), rm = (int)((insn >> 16) & 31u);
+        return rd == reg || rn == reg || rm == reg;
+    }
+    if ((insn & 0xBFE0FC00u) == 0x2E20DC00u || (insn & 0xBFE0FC00u) == 0x0EA01C00u) {
+        int rd = (int)(insn & 31u), rn = (int)((insn >> 5) & 31u), rm = (int)((insn >> 16) & 31u);
+        return rd == reg || rn == reg || rm == reg;
+    }
+    if ((insn & 0xBFE08400u) == 0x1E000400u && (insn >> 24) == 0x5Eu) {
+        return ((int)(insn & 31u)) == reg || ((int)((insn >> 5) & 31u)) == reg;
+    }
+    if ((insn & 0xFFC00000u) == 0xACC00000u) {
+        return ((int)(insn & 31u)) == reg || ((int)((insn >> 10) & 31u)) == reg;
+    }
+    if ((insn & 0xFFE00C00u) == 0x3C800000u || (insn & 0xFFE00C00u) == 0x3CC00000u ||
+        (insn & 0xFFE00C00u) == 0xBC000000u || (insn & 0xFFE00C00u) == 0xBC400000u ||
+        (insn & 0xFFC00000u) == 0xBD400000u || (insn & 0xFFC00000u) == 0xBD000000u ||
+        (insn & 0x3FE00C00u) == 0x3C600800u || (insn & 0x3FE00C00u) == 0x3C200800u) {
+        return ((int)(insn & 31u)) == reg;
+    }
+    uint32_t top = insn >> 24;
+    if (top == 0x0Eu || top == 0x2Eu || top == 0x4Eu || top == 0x6Eu || top == 0x7Eu ||
+        top == 0x0Cu || top == 0x4Cu || top == 0x0Fu || top == 0x4Fu) {
+        *known = false;
+        return true;
+    }
+    return false;
+}
+
+static uint32_t a64_fadd_s(int fd, int fn, int fm) {
+    return 0x1E202800u | ((uint32_t)fm << 16) | ((uint32_t)fn << 5) | (uint32_t)fd;
+}
+
+static uint32_t a64_fmul4(int vd, int vn, int vm) {
+    return 0x6E20DC00u | ((uint32_t)vm << 16) | ((uint32_t)vn << 5) | (uint32_t)vd;
+}
+
+static uint32_t a64_mov_lane(int vd, int vn, int lane) {
+    uint32_t imm5 = 4u | ((uint32_t)lane << 3);
+    return 0x5E040400u | (imm5 << 16) | ((uint32_t)vn << 5) | (uint32_t)vd;
+}
+
+static uint32_t a64_ldp_q_post(int rt, int rt2, int rn) {
+    return 0xACC10000u | ((uint32_t)rt2 << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+
+// 热路径是一根 s0 的 fadd 链，占了 eval 的绝大部分时间。一次做相邻两行：
+// 每行仍按 lane0..7 的顺序加，两条链互不相关，结果和逐行做相同。
+// 只处理向量段正好覆盖内层上限的循环（没有标量尾巴）。
+static void a64_pair_rows(TB_CGEmitter* e) {
+    if (e->count < 64 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    if (nins > 8192) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int loop = -1, subs_at = -1, entry = -1, idx = -1, row = -1, act = -1;
+    int fd = -1, hi0 = -1, fe = -1, hi1 = -1, acc = -1, trips = 0;
+    for (int i = 0; i + 4 < nins; i++) {
+        if ((w[i] & 0xFFC00000u) != 0xACC00000u || ((w[i] >> 5) & 31u) != 16u) continue;
+        if ((w[i + 1] & 0xFFC00000u) != 0xACC00000u || ((w[i + 1] >> 5) & 31u) != 17u) continue;
+        int s = i + 2;
+        while (s < nins && ((w[s] >> 24) == 0x1Eu || (w[s] >> 24) == 0x5Eu || (w[s] >> 24) == 0x6Eu)) s++;
+        if (s >= nins || (w[s] & 0xFFC00000u) != 0xF1000000u || ((w[s] >> 10) & 0xFFFu) != 1u) continue;
+        if ((int)(w[s] & 31u) != (int)((w[s] >> 5) & 31u)) continue;
+        if (s + 1 >= nins || (w[s + 1] & 0xFF00001Fu) != 0x54000001u) continue;
+        if (a64_b_target(s + 1, w[s + 1], true) != i) continue;
+        if (i < 3) continue;
+        uint32_t mv16 = w[i - 3], mv17 = w[i - 2], mvt = w[i - 1];
+        if ((mv16 & 0xFFE0FFE0u) != 0xAA0003E0u || (mv16 & 31u) != 16u) continue;
+        if ((mv17 & 0xFFE0FFE0u) != 0xAA0003E0u || (mv17 & 31u) != 17u) continue;
+        idx = (int)(w[s] & 31u);
+        if ((mvt & 0xFFE0001Fu) != (0xD2800000u | (uint32_t)idx)) continue;
+        trips = (int)((mvt >> 5) & 0xFFFFu);
+        if (trips < 2 || trips > 64) continue;
+        fd = (int)(w[i] & 31u);
+        hi0 = (int)((w[i] >> 10) & 31u);
+        fe = (int)(w[i + 1] & 31u);
+        hi1 = (int)((w[i + 1] >> 10) & 31u);
+        acc = -1;
+        for (int k = i + 2; k < s; k++) {
+            if ((w[k] & ~0x001F03FFu) == 0x1E202800u) { acc = (int)(w[k] & 31u); break; }
+        }
+        if (acc < 0) continue;
+        bool only = true;
+        for (int k = i + 2; k < s; k++) {
+            uint32_t op = w[k] & ~0x001F03FFu;
+            if (op != 0x1E202800u && op != 0x6E20DC00u && (w[k] & 0xFFE0FC00u) != 0x5E000400u) only = false;
+        }
+        if (!only) continue;
+        if (s + 4 >= nins || (w[s + 2] & 0xFFE0001Fu) != (0xD2800000u | (uint32_t)idx)) continue;
+        if ((w[s + 3] & 0xFF00001Fu) != 0xF100001Fu || ((w[s + 3] >> 5) & 31u) != (uint32_t)idx) continue;
+        if ((int)((w[s + 2] >> 5) & 0xFFFFu) != (int)((w[s + 3] >> 10) & 0xFFFu)) continue;
+        if ((w[s + 4] & 0xFF00001Fu) != 0x5400000Au) continue;
+        loop = i; subs_at = s; entry = i - 3;
+        act = (int)((mv16 >> 16) & 31u);
+        row = (int)((mv17 >> 16) & 31u);
+        break;
+    }
+    if (loop < 0) return;
+    if (acc == 4 || fd == 4 || fe == 4 || hi0 == 4 || hi1 == 4) return;
+    int banned[8] = {2, 4, 5, 6, 7, fd, fe, hi0};
+    (void)banned;
+    if (fd == 2 || fe == 2 || hi0 == 2 || hi1 == 2 || fd == 5 || fe == 5 || hi0 == 5 || hi1 == 5 ||
+        fd == 6 || fe == 6 || hi0 == 6 || hi1 == 6 || fd == 7 || fe == 7 || hi0 == 7 || hi1 == 7 ||
+        hi1 == 2 || hi1 == 5 || hi1 == 6 || hi1 == 7) return;
+    int aligned = -1, ilimit = -1, bge_tail = -1;
+    if (subs_at + 4 < nins && (w[subs_at + 2] & 0xFFE0001Fu) == (0xD2800000u | (uint32_t)idx)) {
+        aligned = (int)((w[subs_at + 2] >> 5) & 0xFFFFu);
+        if ((w[subs_at + 3] & 0xFF00001Fu) == 0xF100001Fu && ((w[subs_at + 3] >> 5) & 31u) == (uint32_t)idx) {
+            ilimit = (int)((w[subs_at + 3] >> 10) & 0xFFFu);
+            if ((w[subs_at + 4] & 0xFF00001Fu) == 0x5400000Au) bge_tail = subs_at + 4;
+        }
+    }
+    if (aligned < 0 || aligned != ilimit) return;
+    int caller = -1;
+    for (int i = 0; i < nins; i++) {
+        if ((w[i] & 0xFC000000u) == 0x14000000u && a64_b_target(i, w[i], false) == entry) {
+            if (caller >= 0) return;
+            caller = i;
+        }
+    }
+    if (caller < 0) return;
+    int mov0 = -1;
+    for (int k = caller; k > caller - 6 && k > 0; k--) {
+        if ((w[k] & ~0x1Fu) == 0xAA1F03E0u && (int)(w[k] & 31u) == idx) { mov0 = k; break; }
+    }
+    if (mov0 <= 0) return;
+    uint32_t ld = w[mov0 - 1];
+    if ((ld & 0xFFC00000u) != 0xBD400000u || (int)(ld & 31u) != acc) return;
+    int bias = (int)((ld >> 5) & 31u);
+    int bias_imm = (int)((ld >> 10) & 0xFFFu);
+    if (bias == 31 || bias_imm >= 4095) return;
+    int latch = a64_b_target(bge_tail, w[bge_tail], true);
+    if (latch < 0 || latch + 4 >= nins) return;
+    if ((w[latch] & ~0x001F03FFu) != 0x1E206800u) return;
+    if ((int)(w[latch] & 31u) != acc || (int)((w[latch] >> 16) & 31u) != acc) return;
+    int zero = (int)((w[latch] >> 5) & 31u);
+    uint32_t st = w[latch + 1];
+    if ((st & 0x3FE00C00u) != 0x3C200800u || (int)(st & 31u) != acc) return;
+    int out = (int)((st >> 5) & 31u);
+    int st_rm = (int)((st >> 16) & 31u);
+    uint32_t ar = w[latch + 2];
+    uint32_t ai = w[latch + 3];
+    if ((ar & 0xFFC00000u) != 0x91000000u) return;
+    if ((int)(ar & 31u) != row || (int)((ar >> 5) & 31u) != row) return;
+    int stride = (int)((ar >> 10) & 0xFFFu);
+    if (stride < 4 || stride > 2047) return;
+    if ((ai & 0xFFC00000u) != 0x91000000u) return;
+    int oidx = (int)(ai & 31u);
+    if ((int)((ai >> 5) & 31u) != oidx || ((ai >> 10) & 0xFFFu) != 1u) return;
+    if (oidx == idx || oidx == row || oidx == act || oidx == 11 || oidx == 12 || st_rm != oidx) return;
+    if ((w[latch + 4] & 0xFC000000u) != 0x14000000u) return;
+    int header = a64_b_target(latch + 4, w[latch + 4], false);
+    if (header < 0 || header >= nins) return;
+    int nedge = 0;
+    for (int i = 0; i < nins; i++) {
+        uint32_t br = w[i];
+        if ((br & 0xFC000000u) == 0x14000000u && a64_b_target(i, br, false) == header) nedge++;
+        else if ((br & 0xFF000010u) == 0x54000000u && a64_b_target(i, br, true) == header) nedge++;
+    }
+    if (nedge != 1) return;
+    bool zeroed = false;
+    for (int k = header - 1; k >= 0 && k >= header - 8; k--) {
+        if ((w[k] & ~0x1Fu) == 0xAA1F03E0u && (int)(w[k] & 31u) == oidx) zeroed = true;
+    }
+    if (!zeroed) return;
+    if ((w[header] & 0xFF00001Fu) != 0xF100001Fu || ((w[header] >> 5) & 31u) != (uint32_t)oidx) return;
+    int olimit = (int)((w[header] >> 10) & 0xFFFu);
+    if (olimit < 2 || (olimit & 1)) return;
+    uint8_t* reach = calloc((size_t)nins, 1);
+    if (!reach) return;
+    int* queue = calloc((size_t)nins, sizeof(int));
+    if (!queue) { free(reach); return; }
+    int qn = 0;
+    queue[qn++] = 0;
+    reach[0] = 1;
+    for (int qh = 0; qh < qn; qh++) {
+        int p = queue[qh];
+        uint32_t insn = w[p];
+        int nxt[2];
+        int nn = 0;
+        if ((insn & 0xFC000000u) == 0x14000000u) nxt[nn++] = a64_b_target(p, insn, false);
+        else if ((insn & 0xFF000010u) == 0x54000000u) {
+            nxt[nn++] = p + 1;
+            nxt[nn++] = a64_b_target(p, insn, true);
+        } else if (insn != 0xD65F03C0u && (insn & 0xFC000000u) != 0x94000000u &&
+                   (insn & 0xFFFFFC1Fu) != 0xD63F0000u) {
+            nxt[nn++] = p + 1;
+        }
+        for (int t = 0; t < nn; t++) {
+            int to = nxt[t];
+            if (to < 0 || to >= nins || reach[to]) continue;
+            reach[to] = 1;
+            queue[qn++] = to;
+        }
+    }
+    bool bad = false;
+    int extras_fp[5] = {4, 5, 6, 7, 2};
+    for (int i = 0; i < nins && !bad; i++) {
+        bool known = true;
+        for (int r = 0; r < 5; r++) {
+            if (r == 4 && !reach[i]) continue;
+            if (a64_fp_names(w[i], extras_fp[r], &known) || !known) bad = true;
+        }
+        if (!bad && reach[i]) {
+            bool kx = true, ky = true;
+            if (a64_gpr_touch(w[i], 11, &kx) || !kx) bad = true;
+            if (a64_gpr_touch(w[i], 12, &ky) || !ky) bad = true;
+        }
+    }
+    free(reach);
+    free(queue);
+    if (bad) return;
+    int old_len = subs_at - loop;
+    uint32_t body[48];
+    int nb = 0;
+    int p1a = 5, p1b = 6, xt0 = 2, xt1 = 7, acc2 = 4;
+    body[nb++] = a64_ldp_q_post(fd, hi0, 16);
+    body[nb++] = a64_ldp_q_post(fe, hi1, 17);
+    body[nb++] = a64_ldp_q_post(p1a, p1b, 11);
+    body[nb++] = a64_fmul4(fe, fd, fe);
+    body[nb++] = a64_fmul4(hi1, hi0, hi1);
+    body[nb++] = a64_fmul4(p1a, fd, p1a);
+    body[nb++] = a64_fmul4(p1b, hi0, p1b);
+    int srcs[2][2] = {{fe, p1a}, {hi1, p1b}};
+    for (int half = 0; half < 2; half++) {
+        body[nb++] = a64_fadd_s(acc, acc, srcs[half][0]);
+        body[nb++] = a64_fadd_s(acc2, acc2, srcs[half][1]);
+        for (int lane = 1; lane <= 3; lane++) {
+            body[nb++] = a64_mov_lane(xt0, srcs[half][0], lane);
+            body[nb++] = a64_mov_lane(xt1, srcs[half][1], lane);
+            body[nb++] = a64_fadd_s(acc, acc, xt0);
+            body[nb++] = a64_fadd_s(acc2, acc2, xt1);
+        }
+    }
+    if (nb <= old_len || nb > 48) return;
+    int grow = nb - old_len;
+    uint32_t nops[24];
+    for (int i = 0; i < grow; i++) nops[i] = 0xD503201Fu;
+    a64_insert_insns(e, &nins, subs_at, nops, grow);
+    int trips_at = loop - 1;
+    uint32_t add11 = 0x91000000u | ((uint32_t)stride << 10) | ((uint32_t)row << 5) | 11u;
+    a64_insert_insns(e, &nins, trips_at, &add11, 1);
+    loop += 1;
+    w = (uint32_t*)e->data;
+    for (int i = 0; i < nb; i++) w[loop + i] = body[i];
+    if (mov0 - 1 >= trips_at) mov0 += 1;
+    if (latch >= subs_at) latch += grow;
+    if (latch >= trips_at) latch += 1;
+    uint32_t ld4 = 0xBD400000u | ((uint32_t)(bias_imm + 1) << 10) | ((uint32_t)bias << 5) | 4u;
+    int ld_at = mov0;
+    a64_insert_insns(e, &nins, ld_at, &ld4, 1);
+    if (latch >= ld_at) latch += 1;
+    w = (uint32_t*)e->data;
+    w[latch + 2] = 0x91000000u | ((uint32_t)(stride * 2) << 10) | ((uint32_t)row << 5) | (uint32_t)row;
+    w[latch + 3] = 0x91000000u | (2u << 10) | ((uint32_t)oidx << 5) | (uint32_t)oidx;
+    uint32_t fmax2 = 0x1E206800u | ((uint32_t)acc2 << 16) | ((uint32_t)zero << 5) | (uint32_t)acc2;
+    a64_insert_insns(e, &nins, latch + 1, &fmax2, 1);
+    int add_row_at = latch + 3;
+    uint32_t extra[2];
+    extra[0] = 0x91000400u | ((uint32_t)oidx << 5) | 12u;
+    extra[1] = (st & ~(31u | (31u << 16))) | 4u | (12u << 16);
+    a64_insert_insns(e, &nins, add_row_at, extra, 2);
+}
+
 static void post_emit(Ctx* restrict ctx, TB_CGEmitter* e) {
     (void)ctx;
+    a64_hoist_sp_reloads(e);
+    a64_widen_mac_loops(e);
+    a64_fold_fmaxnm(e);
+    a64_fold_loop_test(e);
+    a64_bump_row_ptrs(e);
+    a64_pair_rows(e);
     TB_ASSERT(a64_fixup_count == 0 && "存在未解析的分支目标");
     if (a64_lit_fixup_count > 0) {
         // pool 紧随最后一条指令（ret 之后不可达）。16 字节对齐（≥ 访问
@@ -1796,11 +3494,19 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         // CONTROL + MEMORY
         ////////////////////////////////
         case TB_CALL: {            // (Control, Memory, Ptr, Data...) -> (Control, Memory, Data)
-            if (n->inputs[2]->type == TB_SYMBOL) {
+            // 直接调用的目标经常被 RA 包成 MACH_COPY（溢出再重新载入）。
+            // 那次 store 可能只在兄弟块里，跳转表进来的路径读到的是没写过的
+            // 槽（bytes 测试 arena_free_all 的 blr 因此跳进栈）。顺着拷贝找到
+            // 符号就发 bl，不再依赖那次载入。
+            TB_Node* target = n->inputs[2];
+            for (int guard = 0; target && target->type == TB_MACH_COPY && guard < 8; guard++) {
+                target = target->inputs[1];
+            }
+            if (target && target->type == TB_SYMBOL) {
                 // 直接调用：bl + BRANCH26。ld64 对 dylib 外部符号自动合成
                 // stub，段内符号直接解析——比 adrp/add/blr 直取更稳（后者
                 // 对无静态地址的外部符号会报 arm64_adrp_lo12 fixup error）
-                TB_Symbol* sym = TB_NODE_GET_EXTRA_T(n->inputs[2], TB_NodeSymbol)->sym;
+                TB_Symbol* sym = TB_NODE_GET_EXTRA_T(target, TB_NodeSymbol)->sym;
                 uint32_t pos = e->count;
                 EMIT4(e, 0x94000000); // bl #0（imm26 由重定位填）
                 tb_emit_symbol_patch(e->output, sym, pos, TB_OBJECT_RELOC_BRANCH26);
@@ -1887,6 +3593,53 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 size_in_reg = false;
             }
             int ptr = op_reg_at(ctx, n->inputs[2], REG_CLASS_GPR);
+
+            // PATCH(odin-tilde): 小常数尺寸展开成直线存储。逐字节循环加上
+            // ptr/size 的保存恢复，比 2 字节、8 字节清零本身还贵
+            // （tank@game_step 里两种都有）。填 0 直接存 ZR；折叠的非零
+            // 字节先 splat 进 A64_SCRATCH2。填值还在寄存器里时只发字节存储
+            // （高位可能是脏的），并且只在展开比循环短的时候做。chunk 宽度
+            // 受 align 约束，和上面 TB_MEMCPY 的快路径同一规则。
+            if (!size_in_reg && a->has_count && a->imm_count > 0 && a->imm_count <= 64) {
+                uint64_t count = a->imm_count;
+                uint64_t max_chunk = a->align >= 8 ? 8 : (a->align >= 4 ? 4 : (a->align >= 2 ? 2 : 1));
+                int data = val;
+                bool expand = true;
+                if (a->has_fill) {
+                    uint64_t b = a->imm_fill & 0xFF;
+                    if (b == 0) {
+                        data = ZR;
+                    } else {
+                        uint64_t bits = b * 0x0101010101010101ull;
+                        MoveOp op = MOVZ;
+                        bool started = false;
+                        for (int shift = 0; bits; bits >>= 16, shift++) {
+                            uint16_t v = bits & 0xFFFF;
+                            if (v) { dpimm_movewide(e, true, op, A64_SCRATCH2, v, shift); op = MOVK; started = true; }
+                        }
+                        if (!started) { dpimm_movewide(e, true, MOVZ, A64_SCRATCH2, 0, 0); }
+                        data = A64_SCRATCH2;
+                    }
+                } else {
+                    max_chunk = 1;
+                    if (count > 16) { expand = false; }
+                }
+                if (expand) {
+                    int64_t off = 0;
+                    while (count > 0) {
+                        TB_DataType dt;
+                        uint64_t chunk;
+                        if (count >= 8 && max_chunk >= 8)      { dt = TB_TYPE_I64; chunk = 8; }
+                        else if (count >= 4 && max_chunk >= 4) { dt = TB_TYPE_I32; chunk = 4; }
+                        else if (count >= 2 && max_chunk >= 2) { dt = TB_TYPE_I16; chunk = 2; }
+                        else                                   { dt = TB_TYPE_I8;  chunk = 1; }
+                        a64_ldst_ex(e, true, dt, data, ptr, off, A64_SCRATCH);
+                        off += (int64_t) chunk;
+                        count -= chunk;
+                    }
+                    break;
+                }
+            }
 
             int64_t scr = A64_EMIT_SCRATCH(ctx);
             a64_ldst_ex(e, true, TB_TYPE_I64, ptr, SP, scr, A64_SCRATCH);      // 保存 ptr
