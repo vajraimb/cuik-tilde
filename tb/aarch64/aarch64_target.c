@@ -3540,6 +3540,18 @@ static void a64_promote_invariant_slots(TB_CGEmitter* e) {
     if (!used) return;
     int sp_off[32];
     for (int r = 0; r < 32; r++) sp_off[r] = -1;
+    // PATCH(odin-tilde): the loop-invariance scan below used to only look
+    // at SP-based stores (rn==31). A store through a register holding
+    // sp+offset (add x9,sp,#o … str [x9]) escaped it, so the slot was
+    // promoted while the loop still wrote it — array_push_back_elem's
+    // caller read a stale element pointer (x2=10) and crashed. Snapshot
+    // the sp-derivation state per instruction and check derived bases too;
+    // a derived base that is redefined inside the loop can wander across
+    // the frame, so that invalidates every slot.
+    int* sp_snap = calloc((size_t)nins * 32, sizeof(int));
+    uint8_t sp_ever[32];
+    memset(sp_ever, 0, sizeof(sp_ever));
+    if (!sp_snap) { free(used); free(sp_snap); return; }
 
     for (int i = 0; i < nins; i++) {
         uint32_t insn = w[i];
@@ -3548,6 +3560,10 @@ static void a64_promote_invariant_slots(TB_CGEmitter* e) {
         int off = 0, size = 0, is_store = 0, is_sp = 0;
         uint32_t u = insn & 0xFFE00C00u;
         uint32_t sc = insn & 0xFFC00000u;
+        // PATCH(odin-tilde): state BEFORE this instruction executes (see
+        // sp_snap comment above).
+        memcpy(&sp_snap[i * 32], sp_off, sizeof(sp_off));
+        for (int r = 0; r < 32; r++) if (sp_off[r] >= 0) sp_ever[r] = 1;
         if (u == 0xF8400000u || u == 0xF8000000u) { size = 8; off = a64_ldur_off(insn); is_store = u == 0xF8000000u; }
         else if (u == 0xB8400000u || u == 0xB8000000u || u == 0xBC400000u || u == 0xBC000000u) {
             size = 4; off = a64_ldur_off(insn); is_store = u == 0xB8000000u || u == 0xBC000000u;
@@ -3564,11 +3580,11 @@ static void a64_promote_invariant_slots(TB_CGEmitter* e) {
                 if (off >= 0 && off + size <= frame) {
                     for (int b = off; b < off + size; b++) used[b] = 1;
                 } else {
-                    free(used); return;
+                    free(used); free(sp_snap); return;
                 }
             } else if (is_store && sp_off[rn] >= 0) {
                 int at = sp_off[rn] + off;
-                if (at < 0 || at + size > frame) { free(used); return; }
+                if (at < 0 || at + size > frame) { free(used); free(sp_snap); return; }
                 for (int b = at; b < at + size; b++) used[b] = 1;
             }
         }
@@ -3612,9 +3628,9 @@ static void a64_promote_invariant_slots(TB_CGEmitter* e) {
         }
         if (nld > best_n) { best_n = nld; best_h = h; best_b = i; }
     }
-    if (best_h < 0) { free(used); return; }
+    if (best_h < 0) { free(used); free(sp_snap); return; }
     for (int i = best_h; i < nins; i++) {
-        if ((w[i] & 0x9F000000u) == 0x90000000u) { free(used); return; }
+        if ((w[i] & 0x9F000000u) == 0x90000000u) { free(used); free(sp_snap); return; }
     }
     int epi = -1;
     for (int i = best_b; i < nins; i++) {
@@ -3622,10 +3638,10 @@ static void a64_promote_invariant_slots(TB_CGEmitter* e) {
         int sh = (int)((w[i] >> 22) & 1u);
         int imm = (int)((w[i] >> 10) & 0xFFFu);
         if ((sh ? imm << 12 : imm) != frame) continue;
-        if (epi >= 0) { free(used); return; }
+        if (epi >= 0) { free(used); free(sp_snap); return; }
         epi = i;
     }
-    if (epi < 0) { free(used); return; }
+    if (epi < 0) { free(used); free(sp_snap); return; }
 
     enum { MAXP = 6 };
     struct { int off, size, count; } slot[32];
@@ -3645,13 +3661,35 @@ static void a64_promote_invariant_slots(TB_CGEmitter* e) {
     }
     for (int s = 0; s < ns; ) {
         bool bad = false;
+        // PATCH(odin-tilde): a register that anywhere holds an sp-derived
+        // address and is redefined inside the loop can point anywhere in
+        // the frame on later iterations — no slot is safe then.
+        bool wander = false;
+        for (int k = best_h; k < best_b && !wander; k++) {
+            bool known = false;
+            int def = a64_gpr_def2(w[k], &known);
+            if (def >= 0 && def < 31 && sp_ever[def]) wander = true;
+        }
         for (int k = best_h; k < best_b; k++) {
             uint32_t in = w[k];
             int so = 0, ss = 0;
             uint32_t uu = in & 0xFFE00C00u;
             uint32_t sc2 = in & 0xFFC00000u;
             int rn = (int)((in >> 5) & 31u);
-            if (rn != 31) continue;
+            int rt = (int)(in & 31u);
+            if (rn != 31) {
+                // PATCH(odin-tilde): store through an sp-derived register
+                // (sp_snap state at this instruction) aliases the frame.
+                bool is_st = uu == 0xF8000000u || uu == 0xB8000000u || uu == 0xBC000000u ||
+                             uu == 0x3C800000u || sc2 == 0xF9000000u || sc2 == 0xB9000000u || sc2 == 0xBD000000u;
+                if (!is_st) continue;
+                int base = sp_snap[k * 32 + rn];
+                if (base < 0) continue;
+                int sz2 = uu == 0xF8000000u || sc2 == 0xF9000000u ? 8 :
+                          (uu == 0x3C800000u ? 16 : 4);
+                if (base < slot[s].off + slot[s].size && base + sz2 > slot[s].off) bad = true;
+                continue;
+            }
             if (uu == 0xF8000000u) { ss = 8; so = a64_ldur_off(in); }
             else if (uu == 0xBC000000u || uu == 0xB8000000u) { ss = 4; so = a64_ldur_off(in); }
             else if (uu == 0x3C800000u) { ss = 16; so = a64_ldur_off(in); }
@@ -3659,6 +3697,7 @@ static void a64_promote_invariant_slots(TB_CGEmitter* e) {
             else if (sc2 == 0xBD000000u || sc2 == 0xB9000000u) { ss = 4; so = (int)(((in >> 10) & 0xFFFu) * 4u); }
             if (ss && so < slot[s].off + slot[s].size && so + ss > slot[s].off) bad = true;
         }
+        if (wander) bad = true;
         // 循环前要有一次支配头的存储。
         int st = -1;
         for (int k = 0; k < best_h; k++) {
@@ -3709,7 +3748,7 @@ static void a64_promote_invariant_slots(TB_CGEmitter* e) {
         taken |= 1u << reg;
         csr[np] = reg; hole[np] = h; poff[np] = slot[s].off; psz[np] = slot[s].size; np++;
     }
-    free(used);
+    free(used); free(sp_snap);
     if (np == 0) return;
 
     for (int k = best_h; k < best_b; k++) {
@@ -7014,11 +7053,7 @@ static void post_emit(Ctx* restrict ctx, TB_CGEmitter* e) {
         {"fold_fccmp", a64_fold_fccmp},
         {"bump_row_ptrs", a64_bump_row_ptrs},
         {"pair_rows", a64_pair_rows},
-        // PATCH(odin-tilde): promote_invariant_slots remains disabled —
-        // with all other knives on (incl. the fixed drop_stack_copies),
-        // re-enabling it still fails slice+container 3/3 each (2026-11-23
-        // retest). Loop-invariant slot promotion needs a CFG-aware rewrite.
-        // {"promote_invariant_slots", a64_promote_invariant_slots},
+        {"promote_invariant_slots", a64_promote_invariant_slots},
         // PATCH(odin-tilde): drop_stack_copies re-enabled 2026-11-23. The
         // branch-joined-reload bug (thread@_create's return phi) is fixed by
         // clearing the hold records at branch-target instructions (see the
@@ -7047,7 +7082,15 @@ static void post_emit(Ctx* restrict ctx, TB_CGEmitter* e) {
     int knife_count = (int)(sizeof(knives) / sizeof(knives[0]));
     int cutoff = knife_count;
     if (getenv("A64_KNIFE_CUTOFF") != NULL) { cutoff = atoi(getenv("A64_KNIFE_CUTOFF")); }
+    // PATCH(odin-tilde): promote_invariant_slots re-enabled 2026-11-23 —
+    // the loop-invariance scan now also checks stores through sp-derived
+    // registers (sp_snap per-insn snapshot) and gives up entirely when a
+    // register that ever holds an sp-derived address is redefined inside
+    // the loop (it can wander across the frame on later iterations).
+    // A64_PROMOTE_OFF=1 forces it off for A/B debugging (see knife loop).
+    bool promote_on = getenv("A64_PROMOTE_OFF") == NULL;
     for (int i = 0; i < knife_count && i < cutoff; i++) {
+        if (knives[i].fn == a64_promote_invariant_slots && !promote_on) continue;
         knives[i].fn(e);
     }
     TB_ASSERT(a64_fixup_count == 0 && "存在未解析的分支目标");
