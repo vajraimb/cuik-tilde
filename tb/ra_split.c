@@ -604,6 +604,223 @@ static void* arena_zalloc(TB_Arena* arena, size_t size) {
     return ptr;
 }
 
+// True when `def` is a copy chain that produces `in` (same value).
+static bool spill_store_carries(TB_Node* def, TB_Node* in) {
+    TB_Node* n = def;
+    for (int i = 0; n != NULL && i < 8; i++) {
+        if (n == in) {
+            return true;
+        }
+        if (n->type != TB_MACH_COPY || n->input_count < 2 || n->inputs[1] == NULL) {
+            return false;
+        }
+        n = n->inputs[1];
+    }
+    return false;
+}
+
+static TB_Node* peel_mach_copies(TB_Node* n) {
+    for (int i = 0; n != NULL && n->type == TB_MACH_COPY && n->input_count >= 2 && n->inputs[1] != NULL && i < 8; i++) {
+        n = n->inputs[1];
+    }
+    return n;
+}
+
+// `a` and `b` are the two names of a parallel phi swap, allowing one
+// hop through an inner-loop phi. itoa's `q, temp = temp, q` is this
+// shape: each phi's backedge is the other, and the inner digit loop
+// carries one of them.
+static bool phi_swap_pair(TB_Node* a, TB_Node* b) {
+    if (a == NULL || b == NULL || a == b || a->type != TB_PHI || b->type != TB_PHI) {
+        return false;
+    }
+    bool ab = false, ba = false;
+    FOR_N(i, 1, a->input_count) {
+        TB_Node* p = peel_mach_copies(a->inputs[i]);
+        if (p == b) {
+            ab = true;
+        } else if (p != NULL && p->type == TB_PHI) {
+            FOR_N(k, 1, p->input_count) {
+                if (peel_mach_copies(p->inputs[k]) == b) ab = true;
+            }
+        }
+    }
+    FOR_N(i, 1, b->input_count) {
+        TB_Node* p = peel_mach_copies(b->inputs[i]);
+        if (p == a) {
+            ba = true;
+        } else if (p != NULL && p->type == TB_PHI) {
+            FOR_N(k, 1, p->input_count) {
+                if (peel_mach_copies(p->inputs[k]) == a) ba = true;
+            }
+        }
+    }
+    return ab && ba;
+}
+
+// The copy carries one side of a phi swap into the other phi. It must
+// keep that pre-store value. A copy that merely feeds a later user of
+// a phi store is not this shape.
+static bool copy_feeds_swap(TB_Node* n, TB_Node* in_src) {
+    if (n == NULL || in_src == NULL || in_src->type != TB_PHI) {
+        return false;
+    }
+    FOR_USERS(u, n) {
+        TB_Node* un = USERN(u);
+        if (phi_swap_pair(in_src, un)) {
+            return true;
+        }
+        if (un->type == TB_MACH_COPY) {
+            for (TB_User* v = un->users; v != un->users + un->user_count; v++) {
+                if (phi_swap_pair(in_src, USERN(v))) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// The other half of a parallel swap: `n` writes spill B, `def` is the store
+// of B into spill A, and `in` is the pre-store value of A. A normal
+// assignment (`i = j`, `i = i + 1`) is not this shape — its later uses are
+// not themselves the spill of the stored value.
+// Do not snapshot every copy into a different spill. SM3's
+// `a, b = tt1, a` is the extra case: the copy reads a phi, a phi reads the
+// copy, and the store writes a fresh value rather than another phi.
+// Copies whose input is not a phi (map/strconv helpers in test_itoa) must
+// keep the latest store.
+static bool is_parallel_swap_use(RegSplitter* splitter, TB_Node* n, TB_Node* def, TB_Node* in, int spill) {
+    if (n->type != TB_MACH_COPY || !is_spill_store(def) || spill_store_carries(def, in)) {
+        return false;
+    }
+    int nspill = spill_map_get2(&splitter->spill_map, n);
+    if (nspill == spill) {
+        return false;
+    }
+    TB_Node* src = def->inputs[1];
+    for (int i = 0; src != NULL && src->type == TB_MACH_COPY && src->inputs[1] != NULL && i < 8; i++) {
+        src = src->inputs[1];
+    }
+    if (src == NULL) {
+        return false;
+    }
+    // Register reload (no spill of its own). In SM3 compress the copy that
+    // feeds the next phi has nspill -1, so the slot-to-slot test never saw
+    // it and the reload was retargeted at the fresh store. A phi user, or a
+    // spill into a different slot, still wants the pre-store phi.
+    if (nspill < 0) {
+        TB_Node* in_src = in;
+        for (int i = 0; in_src->type == TB_MACH_COPY && in_src->input_count >= 2 && in_src->inputs[1] != NULL && i < 8; i++) {
+            in_src = in_src->inputs[1];
+        }
+        if (in_src->type != TB_PHI) {
+            return false;
+        }
+        // Two phis swapped in parallel. Snapshot only when this copy
+        // feeds the partner phi. Any other user of a phi store keeps
+        // the latest value (map/strconv helpers in test_itoa).
+        if (src->type == TB_PHI) {
+            return copy_feeds_swap(n, in_src);
+        }
+        FOR_USERS(u, n) {
+            TB_Node* un = USERN(u);
+            if (un->type == TB_PHI) {
+                return true;
+            }
+            if (un->type != TB_MACH_COPY || !is_spill_store(un)) {
+                continue;
+            }
+            int uspill = spill_map_get2(&splitter->spill_map, un);
+            if (uspill >= 0 && uspill != spill) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (spill_map_get2(&splitter->spill_map, src) == nspill) {
+        return true;
+    }
+    // The spilled phi often reaches the copy through a reload, so `in`
+    // itself is a mach_copy. The stored value still has to be a fresh
+    // computation, or the other phi of a parallel swap (the copy feeds
+    // that phi). A phi store that this copy does not feed must keep the
+    // latest store — that is the map/strconv helper in test_itoa.
+    TB_Node* in_src = in;
+    for (int i = 0; in_src->type == TB_MACH_COPY && in_src->input_count >= 2 && in_src->inputs[1] != NULL && i < 8; i++) {
+        in_src = in_src->inputs[1];
+    }
+    if (in_src->type != TB_PHI) {
+        return false;
+    }
+    if (src->type != TB_PHI) {
+        return true;
+    }
+    return copy_feeds_swap(n, in_src);
+}
+
+// PATCH(odin-tilde): a spill store that does not carry `in` is a different
+// value written into this slot — the other half of a parallel phi move
+// (big._itoa_raw_full's `q, temp = temp, q`). The use is scheduled after
+// that store, and retargeting it at the store makes both names the new
+// value. Load `in` into a fresh register before the store and read that.
+static TB_Node* capture_pre_store(Ctx* ctx, Rogers* ra, RegSplitter* splitter, TB_BasicBlock* bb, size_t* j_ptr, TB_Node* def, TB_Node* in) {
+    if (in == NULL || def == NULL || def == in) {
+        return NULL;
+    }
+    TB_Function* f = ctx->f;
+    if (def->gvn >= f->node_count || f->scheduled[def->gvn] != bb) {
+        return NULL;
+    }
+    size_t pos = 0;
+    bool found = false;
+    aarray_for(i, bb->items) {
+        if (bb->items[i] == def) {
+            pos = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found || pos >= *j_ptr) {
+        return NULL;
+    }
+
+    // Class 1 is GPR on x64 and a64; class 2 is the vector/float class.
+    int cls = 1;
+    if (TB_IS_FLOAT_TYPE(in->dt) || TB_IS_VECTOR_TYPE(in->dt)) {
+        cls = ctx->num_classes > 2 ? 2 : 1;
+    }
+    RegMask* use_rm = NULL;
+    int vid = in->gvn < aarray_length(ctx->vreg_map) ? ctx->vreg_map[in->gvn] : 0;
+    if (vid > 0 && (size_t)vid < aarray_length(ctx->vregs) &&
+        ctx->vregs[vid].mask != NULL && ctx->vregs[vid].mask != &TB_REG_EMPTY) {
+        use_rm = ctx->vregs[vid].mask;
+        if (use_rm->class != REG_CLASS_STK && use_rm->class < ctx->num_classes) {
+            cls = use_rm->class;
+        }
+    }
+    if (cls >= ctx->num_classes || ctx->normie_mask[cls] == NULL) {
+        return NULL;
+    }
+    RegMask* rm = ctx->normie_mask[cls];
+    if (use_rm == NULL) {
+        use_rm = rm;
+    }
+    TB_Node* cpy = tb_alloc_node(f, TB_MACH_COPY, in->dt, 2, sizeof(TB_NodeMachCopy));
+    set_input(f, cpy, in, 1);
+    TB_NODE_SET_EXTRA(cpy, TB_NodeMachCopy, .def = rm, .use = use_rm);
+
+    size_t bb_id = bb - ctx->cfg.blocks;
+    rogers_insert_op(ctx, bb_id, cpy, (int)pos);
+    *j_ptr += 1;
+    FOR_N(class, 1, ctx->num_classes) {
+        ra->hrp[bb_id].start[class] += pos <= ra->hrp[bb_id].start[class];
+        ra->hrp[bb_id].end[class] += pos <= ra->hrp[bb_id].end[class];
+    }
+    aarray_push(splitter->all_defs, cpy);
+    return cpy;
+}
+
 static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* splits, size_t num_spills) {
     TB_Arena* arena = ra->arena;
     TB_Function* f = ctx->f;
@@ -1160,6 +1377,35 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                     if (def == NULL) { // PATCH(odin-tilde): no split def reaches this use; keep the original input
                         continue;
                     }
+                    // PATCH(odin-tilde): parallel phi swap. Snapshot `in`
+                    // before the store. Ordinary updates still retarget.
+                    if (is_parallel_swap_use(&splitter, n, def, in, spill)) {
+                        // The copy already sits before the store. Leave that
+                        // edge. Retargeting it makes the reload depend on the
+                        // store, and sequentialize then writes the slot first
+                        // (SM3 compress: str [sp,#0x378] / ldr the same slot).
+                        size_t store_at = SIZE_MAX;
+                        aarray_for(si, bb->items) {
+                            if (bb->items[si] == def) { store_at = si; break; }
+                        }
+                        if (store_at != SIZE_MAX && j < store_at) {
+                            continue;
+                        }
+                        TB_Node* cap = capture_pre_store(ctx, ra, &splitter, bb, &j, def, in);
+                        if (cap != NULL) {
+                            set_input(f, n, cap, k);
+                            FOR_N(l, k + 1, n->input_count) {
+                                if (n->inputs[l] == in) {
+                                    set_input(f, n, cap, l);
+                                }
+                            }
+                            if (n->type == TB_MACH_COPY) {
+                                TB_NodeMachCopy* dst = TB_NODE_GET_EXTRA(n);
+                                dst->use = TB_NODE_GET_EXTRA_T(cap, TB_NodeMachCopy)->def;
+                            }
+                            continue;
+                        }
+                    }
                     if ((W >> spill) & 1) {
                         // the reload mask might not overlap with the use mask if we clobbered
                         // a reg and realized we couldn't maintain the old mask, this might force a copy right before the
@@ -1273,6 +1519,14 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                     }
 
                     if (in != def) {
+                        // A parallel phi swap's edge copy has to keep the
+                        // pre-store name. Retargeting it at the other phi's
+                        // spill def makes both names the same pointer
+                        // (big._itoa_raw_full: one Int freed twice, the
+                        // other leaked).
+                        if (n->type == TB_MACH_COPY && copy_feeds_swap(n, peel_mach_copies(in))) {
+                            continue;
+                        }
                         set_input(f, n, def, k);
 
                         // if there's other edges on the node that refer to the old node, we

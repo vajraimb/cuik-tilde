@@ -62,7 +62,12 @@ static void loop_compute_depth(TB_LoopTree* loop, int d) {
         // deep). -2 is an on-current-path sentinel (real depths are >= 1);
         // it must be cleared only AFTER the kid subtree is done, otherwise
         // self-loops (A.kid == A) slip past the check.
-        if (loop->depth == -2) { break; }
+        // A sibling `next` cycle is different: the sentinel is cleared before
+        // the next node is followed, so the walk spins forever without growing
+        // the stack (serve, the proc after extract_responses_input). A node
+        // whose depth is already finalized had its next-chain walked with it;
+        // stop there. Acyclic trees never hit this, each node is visited once.
+        if (loop->depth == -2 || loop->depth > 0) { break; }
 
         TB_LoopTree* next = loop->next;
         loop->depth = -2;
@@ -133,9 +138,18 @@ static void loop_scc_walk(LoopSCC* restrict scc, TB_CFG* restrict cfg, TB_BasicB
             } else if (new_loop != cfg->root_loop) {
                 // if we're not dominated by the loop header, it means we should bump out of this loop nest
                 TB_LoopTree* last = NULL;
+                int climb = 0;
+                int climb_limit = (int)aarray_length(cfg->blocks) + 1;
                 while (cfg->root_loop && !slow_dommy(cfg, cfg->root_loop->header, succ_bb->start)) {
                     last = cfg->root_loop;
                     cfg->root_loop = cfg->root_loop->parent;
+                    // A parent cycle (shared header) would spin here. A real
+                    // nest is at most one loop per block; past that, leave the
+                    // nest so the backedge is recorded as a sibling instead.
+                    if (++climb > climb_limit) {
+                        cfg->root_loop = NULL;
+                        break;
+                    }
                 }
 
                 if (cfg->root_loop == NULL) {
@@ -289,7 +303,9 @@ static void loop_find(TB_Function* f, TB_CFG* restrict cfg, LoopOpt* restrict ct
         loop_scc_walk(&scc, cfg, &cfg->blocks[0]);
 
         if (cfg->root_loop) {
-            while (cfg->root_loop->parent != NULL) {
+            int climb = 0;
+            int climb_limit = (int)block_count + 1;
+            while (cfg->root_loop->parent != NULL && climb++ < climb_limit) {
                 cfg->root_loop = cfg->root_loop->parent;
             }
         }
@@ -336,7 +352,10 @@ static void loop_hoist_ops(TB_Function* f, TB_Node* ctrl, TB_Node* earlier) {
 }
 
 static bool loop_inside(TB_LoopTree* a, TB_LoopTree* b) {
-    while (b && a != b) {
+    // Parent links can cycle on a shared header. A real nest is shallower
+    // than the block count; past that, treat it as "not inside" so rotation
+    // skips the loop instead of spinning.
+    for (int i = 0; b && a != b && i < 1000000; i++) {
         b = b->parent;
     }
     return a == b;
@@ -1262,6 +1281,24 @@ void tb_compute_synthetic_loop_freq(TB_Function* f, TB_CFG* cfg) {
 
             float edge = tb_edge_prob(bb->start);
             bb->freq = pred_bb->freq * edge;
+        } else if (i != 0 && NODE_ISA(bb->start, REGION) &&
+                   !(loop && loop->header == bb->start)) {
+            // 汇合块原来停在 1（或循环深度那一档），单入口的前驱却是父块乘分支概率。
+            // 汇合看起来比前驱更热，除法就被提前到两边都会走的块里。
+            // 循环头仍用 8^depth，不在这里改。
+            float sum = 0;
+            bool ready = true;
+            FOR_N(p, 0, bb->start->input_count) {
+                TB_BasicBlock* pred_bb = cfg_get_pred_bb(cfg, bb->start, p);
+                if (pred_bb == NULL || pred_bb - cfg->blocks > (ptrdiff_t)i) {
+                    ready = false;
+                    break;
+                }
+                sum += pred_bb->freq;
+            }
+            if (ready && sum > 0) {
+                bb->freq = sum;
+            }
         }
 
         TB_Node* fallthru = bb->end;
@@ -1579,8 +1616,13 @@ static bool loop_opt_canonicalize(TB_Function* f, LoopOpt* ctx, TB_Worklist* tmp
             // the header IF is the backedge, and the exit block is the parent
             // header, so exit_block_ok is already false. Padding that edge
             // makes tb_global_schedule walk a cyclic list.
+            // PATCH(odin-tilde): also do not rotate when the backedge proj has
+            // other users. The IV step lives on that edge (future -= 1). Moving
+            // the header test below the body leaves the compare on the pre-step
+            // phi, so the body runs once after the condition has failed
+            // (flags unix consumes one extra argument).
             if (exit_proj && exit_block_ok && !backedge_is_merged_region &&
-                (!cfg_is_cproj(exit_proj) || header->inputs[1]->user_count != 1)) {
+                !cfg_is_cproj(exit_proj)) {
                 #if 1
                 TB_OPTDEBUG(PASSES)(printf("      * Rotating loop %%%u %p\n", header->gvn, exit_proj));
 

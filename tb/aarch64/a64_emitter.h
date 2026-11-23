@@ -616,6 +616,7 @@ static void simd_dp_float2int(TB_CGEmitter* restrict e, bool wide, FPtype type, 
 ENUM(FPDP1op) {
     //       oooooo
     FMOV = 0b000000,
+    FABS = 0b000001,
     FNEG = 0b000010,
     FSQRT = 0b000011,
 };
@@ -680,6 +681,19 @@ static void simd_dp_floatdp2(TB_CGEmitter* restrict e, FPtype type, FPDP2op op, 
 //!! floating-point conditional select
 
 //!! floating-point data-processing (3 source)
+// FMADD Rd, Rn, Rm, Ra computes Rd = Ra + Rn*Rm. o1:o0 selects the
+// negation pattern; 00 is FMADD. fmadd s0, s1, s2, s3 is 0x1F020C20.
+static void simd_dp_floatdp3(TB_CGEmitter* restrict e, FPtype type, uint32_t o1, uint32_t o0, GPR Rd, GPR Rn, GPR Rm, GPR Ra) {
+    uint32_t inst = 0x1F000000u;
+    inst |= PUT_BITS(22, 2, type);
+    inst |= PUT_BITS(21, 1, o1);
+    inst |= PUT_BITS(16, 5, Rm);
+    inst |= PUT_BITS(15, 1, o0);
+    inst |= PUT_BITS(10, 5, Ra);
+    inst |= PUT_BITS(5, 5, Rn);
+    inst |= PUT_BITS(0, 5, Rd);
+    EMIT4(e, inst);
+}
 
 /* load register (literal)
     pp01 1r00 iiii iiii iiii iiii iiit tttt

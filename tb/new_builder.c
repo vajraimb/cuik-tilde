@@ -44,9 +44,14 @@ TB_Node* tb_alloc_node_dyn(TB_Function* f, int type, TB_DataType dt, int input_c
 
     if (input_cap > 0) {
         n->inputs = tb_arena_alloc(&f->arena, input_cap * sizeof(TB_Node*));
-        FOR_N(i, 0, input_cap) { n->inputs[i] = NULL; }
+        n->use_pos = tb_arena_alloc(&f->arena, input_cap * sizeof(uint32_t));
+        FOR_N(i, 0, input_cap) {
+            n->inputs[i] = NULL;
+            n->use_pos[i] = UINT32_MAX;
+        }
     } else {
         n->inputs = NULL;
+        n->use_pos = NULL;
     }
 
     // most nodes don't have many users, although the ones which do will have a shit load (root node)
@@ -409,6 +414,19 @@ TB_Node* tb_builder_binop_float(TB_GraphBuilder* g, int type, TB_Node* a, TB_Nod
     TB_Node* n = tb_alloc_node(f, type, a->dt, 3, 0);
     set_input(f, n, a, 1);
     set_input(f, n, b, 2);
+    return g->peep(f, n);
+}
+
+// a*b+c, one rounding. Inputs are 1, 2, 3 so it is not an fadd of an fmul.
+TB_Node* tb_builder_fma(TB_GraphBuilder* g, TB_Node* a, TB_Node* b, TB_Node* c) {
+    TB_ASSERT_MSG(TB_DATA_TYPE_EQUALS(a->dt, b->dt) && TB_DATA_TYPE_EQUALS(a->dt, c->dt), "datatype mismatch");
+    TB_ASSERT_MSG(a->dt.type == TB_TAG_F32 || a->dt.type == TB_TAG_F64, "datatype wasn't a float");
+
+    TB_Function* f = g->f;
+    TB_Node* n = tb_alloc_node(f, TB_FMA, a->dt, 4, 0);
+    set_input(f, n, a, 1);
+    set_input(f, n, b, 2);
+    set_input(f, n, c, 3);
     return g->peep(f, n);
 }
 

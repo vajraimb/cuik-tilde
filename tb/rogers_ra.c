@@ -1682,6 +1682,28 @@ static bool interfere_in_block(TB_BasicBlock* blocks, int* order, TB_BasicBlock*
     if (lhs == rhs || lhs_gvn == rhs_gvn) { return false; }
     TB_ASSERT(lhs != rhs && "i... why?");
 
+    // PATCH(odin-tilde): two phis in the same block are both defined at
+    // the entry, so their live ranges overlap there. Coalescing them put
+    // big._itoa_raw_full's `q, temp = temp, q` in one stack slot: after the
+    // first iteration both names were the quotient, destroy freed it twice
+    // and leaked the copy. Phi inputs are uses at the predecessor edge and
+    // were not always in live_out, so the check below missed the overlap.
+    if (lhs->type == TB_PHI && rhs->type == TB_PHI &&
+        scheduled[lhs_gvn] != NULL && scheduled[lhs_gvn] == scheduled[rhs_gvn]) {
+        return true;
+    }
+
+    // PATCH(odin-tilde): the two data projections of a widening multiply are
+    // one instruction. a64 isel writes the low half, then moves the high half
+    // out of a scratch; if both projections share a register that move
+    // clobbers the low half and big.itoa remainders index the wrong digit.
+    // x64 pins them to RAX/RDX, so they already cannot alias.
+    if (lhs->type == TB_PROJ && rhs->type == TB_PROJ &&
+        lhs->inputs[0] == rhs->inputs[0] && lhs->inputs[0] &&
+        (lhs->inputs[0]->type == TB_UMULPAIR || lhs->inputs[0]->type == TB_SMULPAIR)) {
+        return true;
+    }
+
     // phis might have a liveness hole in the middle
     bool lhs_live_out = set_get(&block->live_out, lhs_gvn);
     bool rhs_live_out = set_get(&block->live_out, rhs_gvn);

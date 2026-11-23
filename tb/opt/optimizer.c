@@ -72,6 +72,16 @@ static void node_resize_inputs(TB_Function* f, TB_Node* n, size_t cnt) {
 
         n->inputs = new_inputs;
         n->input_cap = new_cap;
+
+        uint32_t* new_pos = tb_arena_alloc(&f->arena, new_cap * sizeof(uint32_t));
+        size_t old_kept = n->use_pos ? cnt : 0;
+        if (old_kept) {
+            memcpy(new_pos, n->use_pos, old_kept * sizeof(uint32_t));
+        }
+        FOR_N(i, old_kept, new_cap) {
+            new_pos[i] = UINT32_MAX;
+        }
+        n->use_pos = new_pos;
     }
 }
 
@@ -822,23 +832,29 @@ static void remove_user(TB_Function* f, TB_Node* n, int slot) {
     if (n->inputs[slot] == NULL) { return; }
 
     TB_Node* old = n->inputs[slot];
-    TB_User* old_use = old->users;
-
-    // remove-swap
-    FOR_N(i, 0, old->user_count) {
-        if (USERN(&old_use[i]) == n && USERI(&old_use[i]) == slot) {
-            old->user_count -= 1;
-            old_use[i] = old_use[old->user_count];
-
-            // push to worklist, we've got a dead node
-            if (old->user_count == 0 && f->worklist) {
-                worklist_push(f->worklist, old);
-            }
-            return;
-        }
+    uint32_t pos = n->use_pos[slot];
+    if (pos >= old->user_count) {
+        tb_panic("user index %u out of range %u removing %p from %p", pos, old->user_count, n, old);
+    }
+    TB_User* u = &old->users[pos];
+    if (USERN(u) != n || USERI(u) != slot) {
+        tb_panic("user index %u does not match %p slot %d", pos, n, slot);
     }
 
-    tb_panic("Failed to remove non-existent user %p from %p (slot %d)", old, n, slot);
+    uint32_t last = old->user_count - 1;
+    if (pos != last) {
+        old->users[pos] = old->users[last];
+        TB_Node* moved = USERN(&old->users[pos]);
+        int moved_slot = USERI(&old->users[pos]);
+        moved->use_pos[moved_slot] = pos;
+    }
+    old->user_count = last;
+    n->use_pos[slot] = UINT32_MAX;
+
+    // push to worklist, we've got a dead node
+    if (old->user_count == 0 && f->worklist) {
+        worklist_push(f->worklist, old);
+    }
 }
 
 void set_input(TB_Function* f, TB_Node* n, TB_Node* in, int slot) {
@@ -853,14 +869,9 @@ void set_input(TB_Function* f, TB_Node* n, TB_Node* in, int slot) {
 void add_user(TB_Function* f, TB_Node* n, TB_Node* in, int slot) {
     if (in->user_count >= in->user_cap) {
         size_t new_cap = ((size_t) in->user_cap) * 2;
-        // NOTE(odin-tilde): clamp to the uint16_t cap instead of panicking
-        // at the doubling boundary — the spill-heavy memory model pushes
-        // MACH_FRAME_PTR past 32k users on very large functions
-        // (core:encoding/xml's generated entity switch).
-        if (new_cap > UINT16_MAX) {
-            new_cap = UINT16_MAX;
-        }
-        if (in->user_count >= new_cap) {
+        // The XML entity switch keeps a use of the frame pointer in
+        // every case. Past 65535 that no longer fits in 16 bits.
+        if (new_cap > UINT32_MAX) {
             tb_panic("Too many users to one node");
         }
 
@@ -886,13 +897,16 @@ void add_user(TB_Function* f, TB_Node* n, TB_Node* in, int slot) {
     in->users[in->user_count]._n    = n;
     in->users[in->user_count]._slot = slot;
     #endif
+    n->use_pos[slot] = in->user_count;
     in->user_count += 1;
 }
 
 void node_ensure_users_cap(TB_Function* f, TB_Node* n, size_t extra) {
     if (n->user_count + extra >= n->user_cap) {
         size_t new_cap = tb_next_pow2(n->user_count + extra + 4);
-        TB_ASSERT(new_cap < UINT16_MAX);
+        if (new_cap > UINT32_MAX) {
+            tb_panic("Too many users to one node");
+        }
 
         // resize
         TB_User* users = tb_arena_alloc(&f->arena, new_cap * sizeof(TB_User));
@@ -927,6 +941,7 @@ void subsume_node_without_phis(TB_Function* f, TB_Node* n, TB_Node* new_n) {
         un->inputs[ui] = new_n;
 
         // we've resized in bulk, so no need to check in this loop
+        un->use_pos[ui] = new_n->user_count;
         new_n->users[new_n->user_count++] = u;
     }
 }
@@ -950,6 +965,7 @@ void subsume_node2(TB_Function* f, TB_Node* n, TB_Node* new_n) {
         un->inputs[ui] = new_n;
 
         // we've resized in bulk, so no need to check in this loop
+        un->use_pos[ui] = new_n->user_count;
         new_n->users[new_n->user_count++] = u;
     }
 }

@@ -61,17 +61,36 @@ static TB_Node* ideal_arith(TB_Function* f, TB_Node* n) {
             TB_Node* con1 = a->inputs[2];
             TB_Node* con2 = b->inputs[2];
 
-            // x = a - b
-            a->type = TB_SUB;
-            // set_input(f, a, a->inputs[1], 1);
-            set_input(f, a, b->inputs[1], 2);
+            // PATCH(odin-tilde): a and b are often the values of other locals
+            // (n = x.used-1, t = y.used-1). Rewriting those nodes in place
+            // turned every use of n into x.used-y.used and every use of t
+            // into 0, so school division started at the wrong limb and loaded
+            // y.digit[0]. Only mutate them when this subtraction is the sole user.
+            if (a->user_count == 1 && b->user_count == 1) {
+                a->type = TB_SUB;
+                set_input(f, a, b->inputs[1], 2);
 
-            // y = con1 - con2
-            b->type = TB_SUB;
-            set_input(f, b, con1, 1);
-            set_input(f, b, con2, 2);
+                b->type = TB_SUB;
+                set_input(f, b, con1, 1);
+                set_input(f, b, con2, 2);
+
+                n->type = TB_ADD;
+                return n;
+            }
+
+            TB_Node* diff = tb_alloc_node(f, TB_SUB, n->dt, 3, sizeof(TB_NodeBinopInt));
+            set_input(f, diff, a->inputs[1], 1);
+            set_input(f, diff, b->inputs[1], 2);
+            mark_node(f, diff);
+
+            TB_Node* cdiff = tb_alloc_node(f, TB_SUB, n->dt, 3, sizeof(TB_NodeBinopInt));
+            set_input(f, cdiff, con1, 1);
+            set_input(f, cdiff, con2, 2);
+            mark_node(f, cdiff);
 
             n->type = TB_ADD;
+            set_input(f, n, diff, 1);
+            set_input(f, n, cdiff, 2);
             return n;
         }
     } else {
@@ -399,6 +418,13 @@ static TB_Node* ideal_shift(TB_Function* f, TB_Node* n) {
         // track how far we're shifting
         int amt = inner_shift == TB_SHL ? amt1 : -amt1;
         amt += type == TB_SHL ? amt2 : -amt2;
+
+        // A same-direction pair can leave the register width: (x << 1) << 63
+        // is 0, not x << 64. a64 LSLV and x64 SHL mask the count, so a shift
+        // of 64 is emitted as a shift of 0 (GHASH `(v0 << 1) << 63`).
+        if (amt >= bits || amt <= -bits) {
+            return make_int_node(f, n->dt, 0);
+        }
 
         // the outer shift clears its amt2 bits on the far side (high bits for
         // SHR, low bits for SHL), the net shift doesn't (rand@int63's

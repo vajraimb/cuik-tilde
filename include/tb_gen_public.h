@@ -199,5 +199,9 @@ typedef enum TB_NodeTypeEnum {
     TB_a64_jcc_imm         = 164,
     TB_a64_csel            = 165,
     TB_a64_jmp_multi       = 166,
+    // a*b+c with one rounding. Distinct from fadd(fmul) so a one-use
+    // multiply that feeds an add stays two roundings.
+    TB_FMA                 = 167,
+    TB_FABS                = 168,
     TB_NODE_TYPE_MAX,
 } TB_NodeTypeEnum;

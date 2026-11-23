@@ -36,6 +36,185 @@ static int node_2addr(TB_Node* n);
 //   returns true if it's possible to rematerialize rather than spill this node.
 static bool node_remat(TB_Node* n);
 
+// PATCH(odin-tilde): phi/coalesce copies are sequentialized in schedule order,
+// which is fixed before registers are chosen. A later copy can read a register
+// an earlier copy already overwrote (big.digit_log's saved bracket became the
+// new square, so log2(16) returned 2). Within a run of register copies, emit
+// a move only once its destination is no longer a source for the run.
+// A swap is a cycle: neither move can go first. Parking the overwritten value
+// in the emit scratch slot breaks the cycle (big._itoa_raw_full's
+// `q, temp = temp, q` otherwise made both pointers the quotient and
+// double-freed its digits).
+static bool mach_copy_loc(Ctx* ctx, TB_Node* n, int* cls, int* reg) {
+    if (n == NULL) { return false; }
+    if ((size_t)n->gvn >= aarray_length(ctx->vreg_map)) { return false; }
+    int vid = ctx->vreg_map[n->gvn];
+    if (vid <= 0 || (size_t)vid >= aarray_length(ctx->vregs)) { return false; }
+    VReg* v = &ctx->vregs[vid];
+    if (v->assigned < 0) { return false; }
+    *cls = v->class;
+    *reg = v->assigned;
+    return true;
+}
+
+static bool is_reg_copy(Ctx* ctx, TB_Node* n) {
+    int dc, dr, sc, sr;
+    if (n->type != TB_MACH_COPY || n->input_count < 2) { return false; }
+    if (!mach_copy_loc(ctx, n, &dc, &dr)) { return false; }
+    if (!mach_copy_loc(ctx, n->inputs[1], &sc, &sr)) { return false; }
+    return true;
+}
+
+#ifdef TB_HAS_EMIT_SCRATCH
+// Park the value currently in (cls, reg) into the 16-byte emit scratch and
+// retarget every still-pending reader of that location at the new copy.
+// Returns false when the scratch is full or the run is not a real cycle.
+static bool break_copy_cycle(Ctx* ctx, TB_BasicBlock* bb, size_t base, size_t count, uint8_t* done, int* scratch_bytes, TB_Node** hold_out) {
+    if (*scratch_bytes >= 16) { return false; }
+    FOR_N(a, 0, count) {
+        if (done[a]) { continue; }
+        TB_Node* writer = bb->items[base + a];
+        int dc, dr;
+        if (!mach_copy_loc(ctx, writer, &dc, &dr)) { continue; }
+        TB_Node* val = NULL;
+        FOR_N(b, 0, count) {
+            if (a == b || done[b]) { continue; }
+            TB_Node* reader = bb->items[base + b];
+            if (reader->inputs[1] == NULL) { continue; }
+            int sc, sr;
+            if (!mach_copy_loc(ctx, reader->inputs[1], &sc, &sr)) { continue; }
+            if (sc == dc && sr == dr) { val = reader->inputs[1]; break; }
+        }
+        if (val == NULL) { continue; }
+        int bytes = 8;
+        if (TB_IS_VECTOR_TYPE(val->dt) && val->dt.type != TB_TAG_V64) { bytes = 16; }
+        if (*scratch_bytes + bytes > 16) { return false; }
+        int spill_num = ctx->num_spills + *scratch_bytes / 8;
+        int slot = 1 + ctx->param_count + ctx->call_usage + spill_num;
+        TB_Function* f = ctx->f;
+        TB_Node* hold = tb_alloc_node(f, TB_MACH_COPY, val->dt, 2, sizeof(TB_NodeMachCopy));
+        set_input(f, hold, val, 1);
+        VReg* hv = tb__set_node_vreg(ctx, hold);
+        hv->class = REG_CLASS_STK;
+        hv->assigned = (int16_t)slot;
+        hv->reg_width = bytes > 8 ? 2 : 1;
+        VReg* sv = &ctx->vregs[ctx->vreg_map[val->gvn]];
+        hv->mask = sv->mask;
+        TB_NODE_SET_EXTRA(hold, TB_NodeMachCopy, .def = sv->mask, .use = sv->mask);
+        tb__insert(ctx, f, bb, hold);
+        FOR_N(b, 0, count) {
+            if (done[b]) { continue; }
+            TB_Node* reader = bb->items[base + b];
+            int sc, sr;
+            if (!mach_copy_loc(ctx, reader->inputs[1], &sc, &sr)) { continue; }
+            if (sc == dc && sr == dr) { set_input(f, reader, hold, 1); }
+        }
+        *scratch_bytes += bytes;
+        *hold_out = hold;
+        return true;
+    }
+    return false;
+}
+#endif
+
+static void sequentialize_reg_copies(Ctx* ctx) {
+    FOR_N(bi, 0, ctx->bb_count) {
+        TB_BasicBlock* bb = &ctx->cfg.blocks[bi];
+        size_t n = aarray_length(bb->items);
+        size_t i = 0;
+        while (i < n) {
+            if (!is_reg_copy(ctx, bb->items[i])) { i++; continue; }
+            size_t j = i + 1;
+            while (j < n && is_reg_copy(ctx, bb->items[j])) { j++; }
+            size_t count = j - i;
+            if (count >= 2) {
+                size_t cap = count + 4;
+                TB_Node** tmp = tb_arena_alloc(&ctx->f->tmp_arena, cap * sizeof(TB_Node*));
+                uint8_t* done = tb_arena_alloc(&ctx->f->tmp_arena, count);
+                memset(done, 0, count);
+                size_t out = 0;
+#ifdef TB_HAS_EMIT_SCRATCH
+                int scratch_bytes = 0;
+                int breaks = 0;
+#endif
+                for (;;) {
+                    bool progress = false;
+                    FOR_N(a, 0, count) {
+                        if (done[a]) { continue; }
+                        TB_Node* mv = bb->items[i + a];
+                        int dc, dr, sc, sr;
+                        mach_copy_loc(ctx, mv, &dc, &dr);
+                        mach_copy_loc(ctx, mv->inputs[1], &sc, &sr);
+                        if (dc == sc && dr == sr) {
+                            done[a] = 1;
+                            tmp[out++] = mv;
+                            progress = true;
+                            continue;
+                        }
+                        bool blocked = false;
+                        int mv_at = (int)(i + a);
+                        FOR_N(b, 0, count) {
+                            if (a == b || done[b]) { continue; }
+                            TB_Node* other = bb->items[i + b];
+                            // SSA input is another move in the run: wait for it.
+                            if (mv->inputs[1] == other) { blocked = true; break; }
+                            if (other->inputs[1] == mv) { continue; }
+                            int bc, br;
+                            if (!mach_copy_loc(ctx, other->inputs[1], &bc, &br)) { continue; }
+                            if (bc != dc || br != dr) { continue; }
+                            // That reader needs the pre-move value only when its
+                            // SSA input is not produced later in this block.
+                            TB_Node* nsrc = other->inputs[1];
+                            int nsrc_at = -1;
+                            FOR_N(t, 0, n) {
+                                if (bb->items[t] == nsrc) { nsrc_at = (int)t; break; }
+                            }
+                            if (nsrc_at >= 0 && nsrc_at > mv_at) { continue; }
+                            blocked = true;
+                            break;
+                        }
+                        if (!blocked) {
+                            done[a] = 1;
+                            tmp[out++] = mv;
+                            progress = true;
+                        }
+                    }
+                    if (!progress) {
+#ifdef TB_HAS_EMIT_SCRATCH
+                        TB_Node* hold = NULL;
+                        if (breaks < 4 && out + 1 < cap &&
+                            break_copy_cycle(ctx, bb, i, count, done, &scratch_bytes, &hold)) {
+                            tmp[out++] = hold;
+                            breaks++;
+                            continue;
+                        }
+#endif
+                        break;
+                    }
+                    bool all_done = true;
+                    FOR_N(a, 0, count) {
+                        if (!done[a]) { all_done = false; break; }
+                    }
+                    if (all_done) { break; }
+                }
+                FOR_N(a, 0, count) {
+                    if (!done[a]) { tmp[out++] = bb->items[i + a]; }
+                }
+                size_t extra = out > count ? out - count : 0;
+                FOR_N(k, 0, extra) {
+                    aarray_insert(bb->items, i, NULL);
+                }
+                FOR_N(a, 0, out) {
+                    bb->items[i + a] = tmp[a];
+                }
+                n = aarray_length(bb->items);
+                j += extra;
+            }
+            i = j;
+        }
+    }
+}
+
 // Code emit:
 //   finally write bytes, this is done post-RA so you're expected to use the VReg data
 //   to know which regs you were assigned.
@@ -579,6 +758,28 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
             FOR_USERS(u, n) { worklist_push(ws, USERN(u)); }
         }
 
+#ifdef TB_SPLIT_FMA
+        // x64 isel has no TB_FMA pattern. Split into fmul+fadd before
+        // selection (two roundings). a64 keeps the node and emits fmadd.
+        // subsume_node2 leaves the old node alive so the worklist pointer
+        // stays valid; dead-node elim below frees it.
+        for (size_t fi = 0; fi < dyn_array_length(ws->items); fi++) {
+            TB_Node* n = ws->items[fi];
+            if (n->type != TB_FMA || n->input_count < 4) {
+                continue;
+            }
+            TB_Node* m = tb_alloc_node(f, TB_FMUL, n->dt, 3, 0);
+            set_input(f, m, n->inputs[1], 1);
+            set_input(f, m, n->inputs[2], 2);
+            TB_Node* a = tb_alloc_node(f, TB_FADD, n->dt, 3, 0);
+            set_input(f, a, m, 1);
+            set_input(f, a, n->inputs[3], 2);
+            set_put(&shared, m->gvn);
+            set_put(&shared, a->gvn);
+            subsume_node2(f, n, a);
+        }
+#endif
+
         // PATCH(odin-tilde): the x64 DFA has no lowering for (z|s)ext with a
         // bool result (x64.machine only covers i16/i32/i64 outputs), so an
         // ext-to-bool survives selection and crashes the RA constraint walk.
@@ -886,6 +1087,11 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
         set_free(&shared);
         worklist_clear(ws);
         tb_arena_restore(&f->tmp_arena, pins_sp);
+#ifdef TB_A64_FOLD_ADDR
+        // isel 已把常数 PTR_OFFSET 收成 a64_add_imm。在调度和 RA 之前
+        // 把这层加折进 load/store 的立即数偏移，基址的活区间才覆盖到访存。
+        a64_fold_addr_modes(f);
+#endif
         log_phase_end(f, og_size, "isel");
 
         TB_OPTDEBUG(SERVER)(dbg_submit_event(f, "ISel"));
@@ -1201,6 +1407,7 @@ static void compile_function(TB_Function* restrict f, TB_CodegenRA ra, TB_Functi
         TB_OPTDEBUG(EMIT)(printf("====== EMIT %-20s ======\n", ctx.f->super.name));
 
         ArenaArray(TB_Safepoint*) safepoints = aarray_create(code_arena, TB_Safepoint*, 16);
+        sequentialize_reg_copies(&ctx);
         FOR_N(i, 0, final_order_count) {
             int id = final_order[i];
             TB_BasicBlock* bb = &cfg.blocks[id];

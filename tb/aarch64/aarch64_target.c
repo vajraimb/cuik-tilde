@@ -46,6 +46,8 @@ static bool a64_idx_scale_ok(TB_Function* f, TB_DataType dt, TB_Node* shift, TB_
 struct Ctx; // 文件作用域前置声明（写在函数原型参数里会变成原型作用域，与 codegen.h 的 Ctx 撞类型）
 static TB_Node* a64_multi_way_branch(struct Ctx* ctx, TB_Function* f, TB_Node* n);
 static TB_Node* a64_isel_if_branch(struct Ctx* ctx, TB_Function* f, TB_Node* n);
+#define TB_A64_FOLD_ADDR 1
+static void a64_fold_addr_modes(TB_Function* f);
 #include "a64_gen.h"
 
 #include "a64_emitter.h"
@@ -93,6 +95,17 @@ static _Thread_local uint64_t    a64_lit_pool[A64_MAX_LIT_POOL];
 static _Thread_local uint32_t    a64_lit_pool_count;
 static _Thread_local A64LitFixup a64_lit_fixups[A64_MAX_LIT_FIXUPS];
 static _Thread_local size_t      a64_lit_fixup_count;
+
+// switch 的 br 目标是基本块标签。停放溢出槽时按这些边算支配，不再整段放弃。
+#define A64_MAX_BR_SITES 8
+#define A64_MAX_BR_TGTS  16
+typedef struct {
+    uint32_t pos;
+    int nt;
+    int labels[A64_MAX_BR_TGTS];
+} A64BrSite;
+static _Thread_local A64BrSite a64_br_sites[A64_MAX_BR_SITES];
+static _Thread_local int       a64_br_site_count;
 
 static void a64_patch_branch(TB_CGEmitter* e, uint32_t pos, uint32_t target, A64FixupKind kind) {
     int64_t delta = ((int64_t)target - (int64_t)pos) >> 2;
@@ -301,50 +314,38 @@ static TB_Node* a64_insert_range_check(Ctx* ctx, TB_Function* f, TB_Node* n, TB_
     TB_Node* into_table = make_proj_node(f, TB_TYPE_CONTROL, jcc, 0);
     TB_Node* early_exit = make_proj_node(f, TB_TYPE_CONTROL, jcc, 1);
 
-    // early_exit 需要接到 default_case 的后继上
-    TB_User default_succ = *cfg_next_user(default_case);
-    if (USERN(&default_succ)->type == TB_REGION) {
-        TB_Node* region = USERN(&default_succ);
-        add_input_late(f, region, early_exit);
+    // 越界必须走进 default 主体，不能接到它的后继 region 上。
+    // default 投影的控制后继经常是汇合块：臂里的 store/memcpy 不是控制节点，
+    // cfg_next_user 看不见它们。直接把 miss 边接到汇合块会跳过
+    // future_args=1（flags 的 UNIX string / 动态数组），内存 phi 却仍指向
+    // 那条没执行的 store。新 region 接住 default 边的全部使用者，miss 作为
+    // 第二条入边，两条路都跑完主体。
+    size_t uc = default_case->user_count;
+    TB_Node** saved = tb_arena_alloc(&f->tmp_arena, (uc + 1) * sizeof(TB_Node*));
+    size_t sn = 0;
+    FOR_USERS(u, default_case) { saved[sn++] = USERN(u); }
 
-        int path = 1 + USERI(&default_succ);
-        FOR_USERS(u, region) {
-            TB_Node* phi = USERN(u);
-            if (phi->type == TB_PHI) {
-                add_input_late(f, phi, phi->inputs[path]);
+    TB_Node* entry = tb_alloc_node(f, TB_REGION, TB_TYPE_CONTROL, 1, sizeof(TB_NodeRegion));
+    set_input(f, entry, default_case, 0);
+    FOR_N(i, 0, sn) {
+        TB_Node* un = saved[i];
+        if (un == entry) { continue; }
+        if (un->type == TB_PHI && un->inputs[0] == default_case) {
+            set_input(f, un, entry, 0);
+            continue;
+        }
+        FOR_N(slot, 0, un->input_count) {
+            if (un->inputs[slot] == default_case) {
+                set_input(f, un, entry, slot);
+                break;
             }
         }
-    } else {
-        // default 块的入口 region 已被优化合并掉：新起一个 region 接管
-        // default 边的全部 ctrl 用户，early_exit 作为第二前驱加入，
-        // 两条路径都执行完整的 default 主体（与 x64 同款处理）
-        size_t uc = default_case->user_count;
-        TB_Node** saved = tb_arena_alloc(&f->tmp_arena, (uc + 1) * sizeof(TB_Node*));
-        size_t sn = 0;
-        FOR_USERS(u, default_case) { saved[sn++] = USERN(u); }
-
-        TB_Node* entry = tb_alloc_node(f, TB_REGION, TB_TYPE_CONTROL, 1, sizeof(TB_NodeRegion));
-        set_input(f, entry, default_case, 0);
-        FOR_N(i, 0, sn) {
-            TB_Node* un = saved[i];
-            if (un == entry) { continue; }
-            if (un->type == TB_PHI && un->inputs[0] == default_case) {
-                set_input(f, un, entry, 0);
-                continue;
-            }
-            FOR_N(slot, 0, un->input_count) {
-                if (un->inputs[slot] == default_case) {
-                    set_input(f, un, entry, slot);
-                    break;
-                }
-            }
-        }
-        add_input_late(f, entry, early_exit);
-        FOR_USERS(u, entry) {
-            TB_Node* phi = USERN(u);
-            if (phi->type == TB_PHI && phi->inputs[0] == entry) {
-                add_input_late(f, phi, phi->inputs[1]);
-            }
+    }
+    add_input_late(f, entry, early_exit);
+    FOR_USERS(u, entry) {
+        TB_Node* phi = USERN(u);
+        if (phi->type == TB_PHI && phi->inputs[0] == entry) {
+            add_input_late(f, phi, phi->inputs[1]);
         }
     }
 
@@ -386,19 +387,44 @@ static TB_Node* a64_isel_if_branch(Ctx* ctx, TB_Function* f, TB_Node* n) {
 }
 
 static TB_Node* a64_fuse_if_cmp(Ctx* ctx, TB_Function* f, TB_Node* n) {
-    // 整数比较直接融进分叉（cmp + b.cond），省掉 cset/uxtb/cmp #0/b.ne；
-    // 浮点比较仍走 COND + jcc_imm（jcc 只发整数 cmp）
+    // 整数比较直接融进分叉（cmp + b.cond），省掉 cset/uxtb/cmp #0/b.ne。
+    // 谓词经常先被零扩展成 i32（uxtb）再拿去分支；扩展不改变 0/1，
+    // 透过它才能融到里面的比较。浮点比较同样融成 fcmp + b.cond。
     TB_Node* c = n->inputs[1];
+    if (c && (c->type == TB_ZERO_EXT || c->type == TB_SIGN_EXT) && c->input_count > 1 && c->inputs[1]) {
+        TB_Node* src = c->inputs[1];
+        if (src->type == TB_a64_COND || src->type == TB_a64_COND_IMM ||
+            (src->type >= TB_CMP_EQ && src->type <= TB_CMP_SLE)) {
+            c = src;
+        }
+    }
     float prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
     TB_Node* jcc = NULL;
     if (c->type == TB_a64_COND || c->type == TB_a64_COND_IMM) {
         A64Cond* op = TB_NODE_GET_EXTRA(c);
-        if (TB_IS_FLOAT_TYPE(op->extra_dt)) { return NULL; }
-        jcc = c->type == TB_a64_COND
-            ? a64_mach_jcc(ctx, f, n->inputs[0], c->inputs[1], c->inputs[2], 0, op->cond, op->extra_dt)
-            : a64_mach_jcc(ctx, f, n->inputs[0], c->inputs[1], NULL, op->imm, op->cond, op->extra_dt);
-    } else if (c->type >= TB_CMP_EQ && c->type <= TB_CMP_SLE) {
+        if (TB_IS_FLOAT_TYPE(op->extra_dt)) {
+            if (c->type != TB_a64_COND) { return NULL; }
+            jcc = a64_mach_jcc(ctx, f, n->inputs[0], c->inputs[1], c->inputs[2], 0, op->cond, op->extra_dt);
+        } else {
+            jcc = c->type == TB_a64_COND
+                ? a64_mach_jcc(ctx, f, n->inputs[0], c->inputs[1], c->inputs[2], 0, op->cond, op->extra_dt)
+                : a64_mach_jcc(ctx, f, n->inputs[0], c->inputs[1], NULL, op->imm, op->cond, op->extra_dt);
+        }
+    } else if (c->type >= TB_CMP_EQ && c->type <= TB_CMP_FLE) {
         TB_DataType cmp_dt = TB_NODE_GET_EXTRA_T(c, TB_NodeCompare)->cmp_dt;
+        if (TB_IS_FLOAT_TYPE(cmp_dt)) {
+            int cond;
+            switch (c->type) {
+                case TB_CMP_EQ:  cond = A64_EQ; break;
+                case TB_CMP_NE:  cond = A64_NE; break;
+                case TB_CMP_FLT: cond = A64_MI; break;
+                case TB_CMP_FLE: cond = A64_LS; break;
+                default: return NULL;
+            }
+            jcc = a64_mach_jcc(ctx, f, n->inputs[0], c->inputs[1], c->inputs[2], 0, cond, cmp_dt);
+            TB_NODE_GET_EXTRA_T(jcc, A64Cond)->prob = prob;
+            return jcc;
+        }
         if (!TB_IS_BOOL_INT_PTR(cmp_dt)) { return NULL; }
         int cond;
         switch (c->type) {
@@ -976,7 +1002,22 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
                     ins[3] = intern_regmask2(ctx, REG_CLASS_GPR, false, 8);
                     first_arg = 4;
                 }
+                // Darwin arm64 的 C 可变参数全部在栈上，每个 8 字节，从调用方
+                // 的 [sp] 起。命名参数仍走寄存器；寄存器溢出的命名参数占前面的
+                // 出参槽，可变参数接在后面。原型把可变参数占位算进 param_count，
+                // 调用点从那个槽开始才是真正的可变实参。libc open 读 [x29,#0x10]
+                // （即调用方 [sp]）当 mode，放进 x2 会被忽略，文件模式变成栈垃圾。
+                bool darwin_vararg = call_proto && call_proto->has_varargs
+                    && ctx->f->super.module->target_system == TB_SYSTEM_MACOS;
+                int vararg_at = darwin_vararg
+                    ? (int)(3 + call_proto->param_count - 1)
+                    : (int)n->input_count;
                 FOR_N(i, first_arg, n->input_count) {
+                    if ((int)i >= vararg_at) {
+                        ins[i] = intern_regmask2(ctx, REG_CLASS_STK, false, nsaa);
+                        nsaa += 1;
+                        continue;
+                    }
                     int type = n->inputs[i]->dt.type;
                     bool is_single = type == TB_TAG_F32;
                     bool is_double = type == TB_TAG_F64;
@@ -1227,7 +1268,8 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
             return ctx->normie_mask[REG_CLASS_GPR];
         }
 
-        case TB_FNEG: {
+        case TB_FNEG:
+        case TB_FABS: {
             if (ins) {
                 ins[1] = ctx->normie_mask[REG_CLASS_FPR];
             }
@@ -1272,6 +1314,15 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
             if (ins) {
                 ins[1] = ctx->normie_mask[REG_CLASS_FPR];
                 ins[2] = ctx->normie_mask[REG_CLASS_FPR];
+            }
+            return ctx->normie_mask[REG_CLASS_FPR];
+        }
+
+        case TB_FMA: {
+            if (ins) {
+                ins[1] = ctx->normie_mask[REG_CLASS_FPR];
+                ins[2] = ctx->normie_mask[REG_CLASS_FPR];
+                ins[3] = ctx->normie_mask[REG_CLASS_FPR];
             }
             return ctx->normie_mask[REG_CLASS_FPR];
         }
@@ -1371,8 +1422,11 @@ static RegMask* node_constraint(Ctx* restrict ctx, TB_Node* n, RegMask** ins) {
         case TB_a64_jcc: {
             if (ins) {
                 ins[0] = &TB_REG_EMPTY; // ctrl
-                ins[1] = ctx->normie_mask[REG_CLASS_GPR];
-                ins[2] = ctx->normie_mask[REG_CLASS_GPR];
+                RegMask* rm = TB_IS_FLOAT_TYPE(TB_NODE_GET_EXTRA_T(n, A64Cond)->extra_dt)
+                    ? ctx->normie_mask[REG_CLASS_FPR]
+                    : ctx->normie_mask[REG_CLASS_GPR];
+                ins[1] = rm;
+                ins[2] = rm;
             }
             return &TB_REG_EMPTY;
         }
@@ -1513,13 +1567,104 @@ static void a64_ldst_ex(TB_CGEmitter* e, bool is_store, TB_DataType dt, int rt, 
         ldst_mem_imm(e, fp, size_log2, opc, rt, scratch, 0);
     }
 }
-// reload（load）专用：Rt 是新鲜 vreg，可直接借作地址暂存
+// reload（load）专用：整数 Rt 是新鲜 vreg，可直接借作地址暂存。
+// 浮点/向量的 Rt 编号和 GPR 重叠（d0 与 x0 都是 0），拿它当 GPR
+// 暂存会冲掉仍然活着的基址（forward_cached 的 ldr d0 把 x0 写成
+// #0x9400，下一条按这个地址读就 SIGBUS）。
 static void a64_ldst(TB_CGEmitter* e, bool is_store, TB_DataType dt, int rt, int rn, int64_t off) {
-    if (is_store) {
-        a64_ldst_ex(e, true, dt, rt, rn, off, A64_SCRATCH);
-    } else {
-        a64_ldst_ex(e, false, dt, rt, rn, off, rt != rn ? rt : A64_SCRATCH);
+    bool gpr_dst = !TB_IS_FLOAT_TYPE(dt) && !TB_IS_VECTOR_TYPE(dt);
+    int scratch = (!is_store && gpr_dst && rt != rn) ? rt : A64_SCRATCH;
+    a64_ldst_ex(e, is_store, dt, rt, rn, off, scratch);
+}
+
+// isel 之后、调度之前：a64_add_imm(base, k) 当访存地址时，把 k 折进
+// ldr/str 的立即数偏移，访存直接用 base。加节点失去使用者后不再发射。
+typedef struct { TB_Node* n; int64_t off; } A64AddrFold;
+static _Thread_local A64AddrFold* a64_addr_folds;
+static _Thread_local uint32_t a64_addr_fold_n;
+static _Thread_local uint32_t a64_addr_fold_cap;
+
+static int64_t a64_addr_fold_get(TB_Node* n) {
+    for (uint32_t i = 0; i < a64_addr_fold_n; i++) {
+        if (a64_addr_folds[i].n == n) { return a64_addr_folds[i].off; }
     }
+    return 0;
+}
+
+static void a64_addr_fold_put(TB_Node* n, int64_t off) {
+    if (a64_addr_fold_n == a64_addr_fold_cap) {
+        uint32_t nc = a64_addr_fold_cap ? a64_addr_fold_cap * 2 : 64;
+        A64AddrFold* p = cuik_realloc(a64_addr_folds, nc * sizeof(A64AddrFold));
+        if (p == NULL) { return; }
+        a64_addr_folds = p;
+        a64_addr_fold_cap = nc;
+    }
+    a64_addr_folds[a64_addr_fold_n++] = (A64AddrFold){ n, off };
+}
+
+// 只有一条 ldr/str 编码得下的偏移才折。更大的偏移要借 scratch 现算，
+// 和原来的 add_imm 一样长，还会把基址的活区间拉过这条加法，热循环里
+// 会把指针挤出寄存器（forward_cached 的输入向量每步从栈上重载）。
+static bool a64_off_fits_ldst(TB_DataType dt, int64_t off) {
+    if (off == 0) { return true; }
+    if (off >= -256 && off <= 255) { return true; }
+    int scale = a64_size_log2(dt);
+    if (TB_IS_VECTOR_TYPE(dt) && dt.type != TB_TAG_V64) { scale = 4; }
+    return off > 0 && (off & ((1ll << scale) - 1)) == 0 && (off >> scale) <= 0xFFF;
+}
+
+static void a64_fold_addr_one(TB_Function* f, TB_Node* mem, int ptr_i, TB_DataType dt) {
+    TB_Node* p = mem->inputs[ptr_i];
+    if (p == NULL) { return; }
+    TB_Node* base = p;
+    int64_t off = 0;
+    for (int d = 0; d < 8; d++) {
+        // 共享的加法还要留给别的使用者，不能拆掉，否则基址得一路活到这里。
+        if (base->type != TB_a64_add_imm || base->user_count != 1) { break; }
+        if (base->input_count < 2 || base->inputs[1] == NULL) { break; }
+        int64_t imm = TB_NODE_GET_EXTRA_T(base, A64Imm64)->imm;
+        if ((off > 0 && imm > INT64_MAX - off) || (off < 0 && imm < INT64_MIN - off)) { break; }
+        int64_t next = off + imm;
+        if (!a64_off_fits_ldst(dt, next)) { break; }
+        off = next;
+        base = base->inputs[1];
+    }
+    if (base == p) { return; }
+    set_input(f, mem, base, ptr_i);
+    if (off != 0) { a64_addr_fold_put(mem, off); }
+}
+
+static void a64_fold_addr_modes(TB_Function* f) {
+    a64_addr_fold_n = 0;
+    TB_Worklist* ws = f->worklist;
+    worklist_clear(ws);
+    worklist_push(ws, f->root_node);
+    for (size_t i = 0; i < dyn_array_length(ws->items); i++) {
+        TB_Node* n = ws->items[i];
+        if (n->type == TB_NULL || n->user_count == 0) { continue; }
+        if (n->type == TB_LOAD && n->input_count >= 1) {
+            a64_fold_addr_one(f, n, (int)n->input_count - 1, n->dt);
+        } else if (n->type == TB_STORE && n->input_count >= 3 && n->inputs[3]) {
+            a64_fold_addr_one(f, n, 2, n->inputs[3]->dt);
+        }
+        FOR_USERS(u, n) { worklist_push(ws, USERN(u)); }
+    }
+    // 折完后 add_imm 可能已经没有使用者，但还挂在基址的 user 列表里。
+    // renumber 靠 users 走得到它，调度却不会放置 user_count==0 的节点，
+    // RA 再沿 user 列表走到它就会读到空的 scheduled 槽。
+    for (;;) {
+        bool killed = false;
+        size_t nitems = dyn_array_length(ws->items);
+        for (size_t i = 0; i < nitems; i++) {
+            TB_Node* d = ws->items[i];
+            if (d->type == TB_a64_add_imm && d->user_count == 0) {
+                tb_kill_node(f, d);
+                killed = true;
+            }
+        }
+        if (!killed) { break; }
+    }
+    worklist_clear(ws);
 }
 
 // PATCH(odin-tilde): AAPCS 允许 sub-word 值（u8/u16 参数、被 coalesce 的
@@ -1562,6 +1707,7 @@ static void pre_emit(Ctx* restrict ctx, TB_CGEmitter* e, TB_Node* n) {
     a64_fixup_count = 0;
     a64_lit_pool_count = 0;
     a64_lit_fixup_count = 0;
+    a64_br_site_count = 0;
 
     // 帧布局（自 SP 向上）：出参槽 call_usage*8 → spill/local 区 → 16 字节
     // 发射暂存（MEMSET 等破坏性节点保存输入用，A64_EMIT_SCRATCH 起）→
@@ -1659,6 +1805,8 @@ static bool a64_gpr_read(uint32_t insn, int reg, bool* known) {
     return true;
 }
 
+static void a64_point_branch(uint32_t* w, int i, int target);
+
 static int a64_b_target(int at, uint32_t insn, bool cond) {
     int32_t imm;
     if (!cond) {
@@ -1680,7 +1828,10 @@ static int a64_ldur_off(uint32_t insn) {
 
 // 出口上 reg 必须已死。零次循环不会执行体内的 ldur，外提却会在进头之前
 // 写掉它；出口还要读旧值就不许搬。
-static bool a64_reg_dead_from_ex(uint32_t* w, int nins, int pos, int reg, bool call_kills_ip) {
+static int a64_gpr_def2(uint32_t insn, bool* known);
+static bool a64_gpr_read2(uint32_t insn, int reg, bool* known);
+
+static bool a64_reg_dead_from_ex(uint32_t* w, int nins, int pos, int reg, bool call_kills_ip, bool wide) {
     if (pos < 0 || pos >= nins) return false;
     uint8_t* seen = calloc((size_t)nins, 1);
     int* queue = calloc((size_t)nins, sizeof(int));
@@ -1693,11 +1844,14 @@ static bool a64_reg_dead_from_ex(uint32_t* w, int nins, int pos, int reg, bool c
         int i = queue[qh];
         uint32_t insn = w[i];
         bool known = false;
-        if (a64_gpr_read(insn, reg, &known) || !known) { ok = false; break; }
-        int def = a64_gpr_def(insn, &known);
+        bool reads = wide ? a64_gpr_read2(insn, reg, &known) : a64_gpr_read(insn, reg, &known);
+        if (reads || !known) { ok = false; break; }
+        int def = wide ? a64_gpr_def2(insn, &known) : a64_gpr_def(insn, &known);
         if (!known) { ok = false; break; }
         if (def == reg || insn == 0xD65F03C0u) continue;
         if ((insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) {
+            // 宽检查把调用者保存的寄存器也算作被 bl 清掉。窄检查仍只认 x16/x17。
+            if (wide && reg <= 18) continue;
             if (call_kills_ip && (reg == 16 || reg == 17)) continue;
             ok = false; break;
         }
@@ -1724,7 +1878,7 @@ static bool a64_reg_dead_from_ex(uint32_t* w, int nins, int pos, int reg, bool c
 }
 
 static bool a64_reg_dead_from(uint32_t* w, int nins, int pos, int reg) {
-    return a64_reg_dead_from_ex(w, nins, pos, reg, false);
+    return a64_reg_dead_from_ex(w, nins, pos, reg, false, false);
 }
 
 // 源地址往前挪了一格，PC 相对位移要加 1。
@@ -1890,7 +2044,8 @@ static bool a64_fp_read(uint32_t insn, int reg, bool* known) {
     if ((insn & 0xFFC00000u) == 0xBD400000u || (insn & 0x3F000000u) == 0x1C000000u) return false;
     if (bare == 0xBC607800u) return false;                         // ldr S
     if (bare == 0xBC207800u) return ((int)(insn & 31u)) == reg;    // str S
-    if (bare == 0x1E200800u || bare == 0x1E202800u || bare == 0x1E202000u) {
+    if (bare == 0x1E200800u || bare == 0x1E202800u || bare == 0x1E203800u ||
+        bare == 0x1E206800u || bare == 0x1E207800u || bare == 0x1E202000u) {
         return ((int)((insn >> 5) & 31u)) == reg || ((int)((insn >> 16) & 31u)) == reg;
     }
     if ((insn & ~0x001FF3FFu) == 0x1E200C00u) {                    // fcsel
@@ -1921,7 +2076,8 @@ static int a64_fp_def(uint32_t insn, bool* known) {
     if ((insn & 0xFFC00000u) == 0xBD400000u || (insn & 0x3F000000u) == 0x1C000000u ||
         bare == 0xBC607800u) return (int)(insn & 31u);
     if (bare == 0xBC207800u || bare == 0x1E202000u) return -1;
-    if (bare == 0x1E200800u || bare == 0x1E202800u || (insn & ~0x001FF3FFu) == 0x1E200C00u) {
+    if (bare == 0x1E200800u || bare == 0x1E202800u || bare == 0x1E203800u ||
+        bare == 0x1E206800u || bare == 0x1E207800u || (insn & ~0x001FF3FFu) == 0x1E200C00u) {
         return (int)(insn & 31u);
     }
     *known = false;
@@ -2208,7 +2364,8 @@ static void a64_widen_mac_loops(TB_CGEmitter* e) {
         if (t0 >= 0 && t1 >= 0) {
             for (int s = 16; s <= 17; s++) {
                 if (s == idx || s == base || s == other) continue;
-                if (a64_reg_dead_from(w, nins, exit, s)) { scratch = s; break; }
+                // 窄检查不认 stur，也把 bl 当成还活着。x16 在调用处本来就会被清掉。
+                if (a64_reg_dead_from_ex(w, nins, exit, s, true, true)) { scratch = s; break; }
             }
         }
         if (scratch < 0) continue;
@@ -2497,8 +2654,9 @@ static void a64_fold_loop_test(TB_CGEmitter* e) {
             if (a64_is_branch_target(w, nins, k)) mid = true;
         }
         if (mid) continue;
-        if (!a64_reg_dead_from_ex(w, nins, i + 5, td, true)) continue;
-        if (ts != td && !a64_reg_dead_from_ex(w, nins, i + 5, ts, true)) continue;
+        // wide：认 ldur/stur/adrp。只这一处用，fmaxnm 仍走窄的检查。
+        if (!a64_reg_dead_from_ex(w, nins, i + 5, td, true, true)) continue;
+        if (ts != td && !a64_reg_dead_from_ex(w, nins, i + 5, ts, true, true)) continue;
         site[nt] = i;
         cond_field[nt] = field;
         use_fcsel[nt] = fcsel ? 1u : 0u;
@@ -2650,6 +2808,10 @@ static void a64_shift_meta(TB_CGEmitter* e, int at, int delta) {
     for (size_t f = 0; f < a64_lit_fixup_count; f++) {
         int ai = (int)(a64_lit_fixups[f].pos / 4);
         if (ai >= hole) a64_lit_fixups[f].pos = (uint32_t)((int)a64_lit_fixups[f].pos + delta * 4);
+    }
+    for (int s = 0; s < a64_br_site_count; s++) {
+        int ai = (int)(a64_br_sites[s].pos / 4);
+        if (ai >= hole) a64_br_sites[s].pos = (uint32_t)((int)a64_br_sites[s].pos + delta * 4);
     }
     if (e->output) {
         for (TB_SymbolPatch* p = e->output->first_patch; p; p = p->next) {
@@ -3269,14 +3431,3625 @@ static void a64_pair_rows(TB_CGEmitter* e) {
     a64_insert_insns(e, &nins, add_row_at, extra, 2);
 }
 
+// 循环里跨过 bl 的不变栈槽，调用方保存寄存器还空着时，进循环前装进
+// x19–x28，体内的 ldur 改成 mov。帧上没人用的 8 字节洞用来保存原值。
+// 认不出的指令、adrp 落在改写点之后、或者指针可能踩到的范围，整段放弃。
+static int a64_gpr_def2(uint32_t insn, bool* known) {
+    if ((insn & 0xFFFFFC00u) == 0x1E260000u) { *known = true; return (int)(insn & 31u); } // fmov Wd, Sn
+    int d = a64_gpr_def(insn, known);
+    if (*known) return d;
+    if ((insn & 0x9F000000u) == 0x90000000u) { *known = true; return (int)(insn & 31u); } // adrp
+    if ((insn & 0xFC000000u) == 0x94000000u) { *known = true; return -1; }               // bl
+    if ((insn & 0xFFE0FC00u) == 0x4EA01C00u || (insn & 0x3F000000u) == 0x1C000000u) {
+        *known = true; return -1; // mov.16b, ldr S literal
+    }
+    uint32_t u = insn & 0xFFE00C00u;
+    if (u == 0xB8400000u) { *known = true; return (int)(insn & 31u); } // ldur W
+    if (u == 0xF8000000u || u == 0xB8000000u || u == 0xBC000000u || u == 0xBC400000u ||
+        u == 0x3C800000u || u == 0x3CC00000u) {
+        *known = true; return -1; // stur/ldur S,Q and stur W: no GPR def
+    }
+    uint32_t s = insn & 0xFFC00000u;
+    if (s == 0xB9400000u) { *known = true; return (int)(insn & 31u); } // ldr W
+    if (s == 0xF9000000u || s == 0xB9000000u || s == 0xBD000000u) { *known = true; return -1; }
+    if (s == 0x39400000u || s == 0x79400000u || u == 0x38400000u || u == 0x78400000u) {
+        *known = true;
+        int rt = (int)(insn & 31u);
+        return rt == 31 ? -1 : rt;
+    }
+    if (s == 0x39000000u || s == 0x79000000u || u == 0x38000000u || u == 0x78000000u) {
+        *known = true; return -1;
+    }
+    if ((insn & 0x7F800000u) == 0x13000000u) {
+        *known = true;
+        int rt = (int)(insn & 31u);
+        return rt == 31 ? -1 : rt;
+    }
+    if (u == 0xF8600800u || u == 0xB8600800u) {
+        *known = true;
+        int rt = (int)(insn & 31u);
+        return rt == 31 ? -1 : rt;
+    }
+    if (u == 0xF8200800u || u == 0xB8200800u) { *known = true; return -1; }
+    return -1;
+}
+
+static bool a64_gpr_read2(uint32_t insn, int reg, bool* known) {
+    if ((insn & 0xFFFFFC00u) == 0x1E270000u) { // fmov Sd, Wn
+        *known = true; return ((int)((insn >> 5) & 31u)) == reg;
+    }
+    bool r = a64_gpr_read(insn, reg, known);
+    if (*known) return r;
+    if ((insn & 0x9F000000u) == 0x90000000u || (insn & 0xFC000000u) == 0x94000000u ||
+        (insn & 0xFFE0FC00u) == 0x4EA01C00u || (insn & 0x3F000000u) == 0x1C000000u) {
+        *known = true; return false;
+    }
+    uint32_t u = insn & 0xFFE00C00u;
+    int rn = (int)((insn >> 5) & 31u);
+    int rt = (int)(insn & 31u);
+    if (u == 0xF8000000u || u == 0xB8000000u) { *known = true; return rn == reg || rt == reg; }
+    if (u == 0xBC000000u || u == 0xBC400000u || u == 0x3C800000u || u == 0x3CC00000u ||
+        u == 0xB8400000u) {
+        *known = true; return rn == reg;
+    }
+    uint32_t sc = insn & 0xFFC00000u;
+    if (sc == 0xF9000000u || sc == 0xB9000000u) { *known = true; return rn == reg || rt == reg; }
+    if (sc == 0xBD000000u || sc == 0xB9400000u) { *known = true; return rn == reg; }
+    if (sc == 0x39400000u || sc == 0x79400000u || u == 0x38400000u || u == 0x78400000u) {
+        *known = true; return rn == reg;
+    }
+    if (sc == 0x39000000u || sc == 0x79000000u || u == 0x38000000u || u == 0x78000000u) {
+        *known = true; return rn == reg || rt == reg;
+    }
+    if ((insn & 0x7F800000u) == 0x13000000u) { *known = true; return rn == reg; }
+    {
+        int rm = (int)((insn >> 16) & 31u);
+        if (u == 0xF8600800u || u == 0xB8600800u) { *known = true; return rn == reg || rm == reg; }
+        if (u == 0xF8200800u || u == 0xB8200800u) { *known = true; return rn == reg || rm == reg || rt == reg; }
+    }
+    return false;
+}
+
+static void a64_promote_invariant_slots(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    if (nins > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+
+    int frame = -1, frame_at = -1;
+    for (int i = 0; i < nins && i < 4; i++) {
+        if ((w[i] & 0xFFC003FFu) == 0xD10003FFu) {
+            int sh = (int)((w[i] >> 22) & 1u);
+            int imm = (int)((w[i] >> 10) & 0xFFFu);
+            frame = sh ? imm << 12 : imm;
+            frame_at = i;
+            break;
+        }
+    }
+    if (frame < 16 || frame > 4096 || frame_at < 0) return;
+
+    for (int i = 0; i < nins; i++) {
+        bool known = false;
+        a64_gpr_def2(w[i], &known);
+        if (!known) return;
+        a64_gpr_read2(w[i], 0, &known);
+        if (!known) return;
+    }
+
+    uint8_t* used = calloc((size_t)frame, 1);
+    if (!used) return;
+    int sp_off[32];
+    for (int r = 0; r < 32; r++) sp_off[r] = -1;
+
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        int rn = (int)((insn >> 5) & 31u);
+        int rt = (int)(insn & 31u);
+        int off = 0, size = 0, is_store = 0, is_sp = 0;
+        uint32_t u = insn & 0xFFE00C00u;
+        uint32_t sc = insn & 0xFFC00000u;
+        if (u == 0xF8400000u || u == 0xF8000000u) { size = 8; off = a64_ldur_off(insn); is_store = u == 0xF8000000u; }
+        else if (u == 0xB8400000u || u == 0xB8000000u || u == 0xBC400000u || u == 0xBC000000u) {
+            size = 4; off = a64_ldur_off(insn); is_store = u == 0xB8000000u || u == 0xBC000000u;
+        } else if (u == 0x3CC00000u || u == 0x3C800000u) {
+            size = 16; off = a64_ldur_off(insn); is_store = u == 0x3C800000u;
+        } else if (sc == 0xF9400000u || sc == 0xF9000000u) {
+            size = 8; off = (int)(((insn >> 10) & 0xFFFu) * 8u); is_store = sc == 0xF9000000u;
+        } else if (sc == 0xB9400000u || sc == 0xB9000000u || sc == 0xBD400000u || sc == 0xBD000000u) {
+            size = 4; off = (int)(((insn >> 10) & 0xFFFu) * 4u); is_store = sc == 0xB9000000u || sc == 0xBD000000u;
+        }
+        if (size) {
+            if (rn == 31) {
+                is_sp = 1;
+                if (off >= 0 && off + size <= frame) {
+                    for (int b = off; b < off + size; b++) used[b] = 1;
+                } else {
+                    free(used); return;
+                }
+            } else if (is_store && sp_off[rn] >= 0) {
+                int at = sp_off[rn] + off;
+                if (at < 0 || at + size > frame) { free(used); return; }
+                for (int b = at; b < at + size; b++) used[b] = 1;
+            }
+        }
+        if ((insn & 0xFFC00000u) == 0x91000000u && rn == 31 && rt != 31) {
+            int imm = (int)((insn >> 10) & 0xFFFu);
+            int sh = (int)((insn >> 22) & 1u);
+            if (sh) imm <<= 12;
+            sp_off[rt] = imm;
+            int hi = imm + 64;
+            if (hi > frame) hi = frame;
+            for (int b = imm < 0 ? 0 : imm; b < hi; b++) used[b] = 1;
+        } else if ((insn & 0xFFC00000u) == 0x91000000u && rt != 31 && sp_off[rn] >= 0) {
+            int imm = (int)((insn >> 10) & 0xFFFu);
+            sp_off[rt] = sp_off[rn] + imm;
+        } else if (u == 0xF8400000u && rn == 31 && rt != 31) {
+            sp_off[rt] = -1;
+        } else {
+            bool known = false;
+            int def = a64_gpr_def2(insn, &known);
+            if (def >= 0 && def < 31) sp_off[def] = -1;
+        }
+        if ((insn & 0xFC000000u) == 0x94000000u) {
+            for (int r = 0; r <= 18; r++) sp_off[r] = -1;
+        }
+        (void)is_sp;
+    }
+
+    int best_h = -1, best_b = -1, best_n = 0;
+    for (int i = 0; i < nins; i++) {
+        if ((w[i] & 0xFC000000u) != 0x14000000u) continue;
+        int h = a64_b_target(i, w[i], false);
+        if (h < 0 || h >= i || i - h > 96 || i - h < 4) continue;
+        bool call = false;
+        for (int k = h; k < i; k++) if ((w[k] & 0xFC000000u) == 0x94000000u) call = true;
+        if (!call) continue;
+        int nld = 0;
+        for (int k = h; k < i; k++) {
+            uint32_t in = w[k];
+            uint32_t uu = in & 0xFFE00C00u;
+            if ((uu == 0xF8400000u || uu == 0xBC400000u) && ((in >> 5) & 31u) == 31u) nld++;
+        }
+        if (nld > best_n) { best_n = nld; best_h = h; best_b = i; }
+    }
+    if (best_h < 0) { free(used); return; }
+    for (int i = best_h; i < nins; i++) {
+        if ((w[i] & 0x9F000000u) == 0x90000000u) { free(used); return; }
+    }
+    int epi = -1;
+    for (int i = best_b; i < nins; i++) {
+        if ((w[i] & 0xFFC003FFu) != 0x910003FFu) continue;
+        int sh = (int)((w[i] >> 22) & 1u);
+        int imm = (int)((w[i] >> 10) & 0xFFFu);
+        if ((sh ? imm << 12 : imm) != frame) continue;
+        if (epi >= 0) { free(used); return; }
+        epi = i;
+    }
+    if (epi < 0) { free(used); return; }
+
+    enum { MAXP = 6 };
+    struct { int off, size, count; } slot[32];
+    int ns = 0;
+    for (int k = best_h; k < best_b && ns < 32; k++) {
+        uint32_t in = w[k];
+        uint32_t uu = in & 0xFFE00C00u;
+        int size = uu == 0xF8400000u ? 8 : uu == 0xBC400000u ? 4 : 0;
+        if (!size || ((in >> 5) & 31u) != 31u) continue;
+        int off = a64_ldur_off(in);
+        if (off < 0 || off + size > frame) continue;
+        bool hit = false;
+        for (int s = 0; s < ns; s++) if (slot[s].off == off && slot[s].size == size) {
+            slot[s].count++; hit = true; break;
+        }
+        if (!hit) { slot[ns].off = off; slot[ns].size = size; slot[ns].count = 1; ns++; }
+    }
+    for (int s = 0; s < ns; ) {
+        bool bad = false;
+        for (int k = best_h; k < best_b; k++) {
+            uint32_t in = w[k];
+            int so = 0, ss = 0;
+            uint32_t uu = in & 0xFFE00C00u;
+            uint32_t sc2 = in & 0xFFC00000u;
+            int rn = (int)((in >> 5) & 31u);
+            if (rn != 31) continue;
+            if (uu == 0xF8000000u) { ss = 8; so = a64_ldur_off(in); }
+            else if (uu == 0xBC000000u || uu == 0xB8000000u) { ss = 4; so = a64_ldur_off(in); }
+            else if (uu == 0x3C800000u) { ss = 16; so = a64_ldur_off(in); }
+            else if (sc2 == 0xF9000000u) { ss = 8; so = (int)(((in >> 10) & 0xFFFu) * 8u); }
+            else if (sc2 == 0xBD000000u || sc2 == 0xB9000000u) { ss = 4; so = (int)(((in >> 10) & 0xFFFu) * 4u); }
+            if (ss && so < slot[s].off + slot[s].size && so + ss > slot[s].off) bad = true;
+        }
+        // 循环前要有一次支配头的存储。
+        int st = -1;
+        for (int k = 0; k < best_h; k++) {
+            uint32_t in = w[k];
+            if (((in >> 5) & 31u) != 31u) continue;
+            int so = -1, ss = 0;
+            uint32_t uu = in & 0xFFE00C00u;
+            if (uu == 0xF8000000u) { ss = 8; so = a64_ldur_off(in); }
+            else if (uu == 0xBC000000u) { ss = 4; so = a64_ldur_off(in); }
+            if (ss == slot[s].size && so == slot[s].off) st = k;
+        }
+        if (bad || st < 0 || slot[s].off > 255) {
+            slot[s] = slot[ns - 1]; ns--; continue;
+        }
+        s++;
+    }
+    for (int a = 0; a < ns; a++) for (int b = a + 1; b < ns; b++) if (slot[b].count > slot[a].count) {
+        int to = slot[a].off, ts = slot[a].size, tc = slot[a].count;
+        slot[a] = slot[b];
+        slot[b].off = to; slot[b].size = ts; slot[b].count = tc;
+    }
+
+    int csr[MAXP], hole[MAXP], poff[MAXP], psz[MAXP], np = 0;
+    uint32_t taken = 0;
+    for (int s = 0; s < ns && np < MAXP; s++) {
+        int reg = -1;
+        for (int r = 19; r <= 28; r++) {
+            if (taken & (1u << r)) continue;
+            bool free_r = true;
+            for (int i = 0; i < nins; i++) {
+                bool known = false;
+                int def = a64_gpr_def2(w[i], &known);
+                if (def == r || a64_gpr_read2(w[i], r, &known)) { free_r = false; break; }
+            }
+            if (free_r) { reg = r; break; }
+        }
+        if (reg < 0) break;
+        int h = -1;
+        for (int o = (frame & ~7) - 8; o >= 0; o -= 8) {
+            if (o > 255) continue;
+            bool ok = true;
+            for (int b = o; b < o + 8; b++) if (used[b]) ok = false;
+            if (!ok) continue;
+            h = o; break;
+        }
+        if (h < 0) break;
+        for (int b = h; b < h + 8; b++) used[b] = 1;
+        taken |= 1u << reg;
+        csr[np] = reg; hole[np] = h; poff[np] = slot[s].off; psz[np] = slot[s].size; np++;
+    }
+    free(used);
+    if (np == 0) return;
+
+    for (int k = best_h; k < best_b; k++) {
+        uint32_t in = w[k];
+        uint32_t uu = in & 0xFFE00C00u;
+        int size = uu == 0xF8400000u ? 8 : uu == 0xBC400000u ? 4 : 0;
+        if (!size || ((in >> 5) & 31u) != 31u) continue;
+        int off = a64_ldur_off(in);
+        int rt = (int)(in & 31u);
+        if (rt == 31) continue;
+        for (int p = 0; p < np; p++) if (poff[p] == off && psz[p] == size) {
+            if (size == 8) w[k] = 0xAA0003E0u | ((uint32_t)csr[p] << 16) | (uint32_t)rt;
+            else w[k] = 0x1E270000u | ((uint32_t)csr[p] << 5) | (uint32_t)rt;
+            break;
+        }
+    }
+
+    uint32_t neu[MAXP * 2];
+    for (int p = 0; p < np; p++) {
+        int imm9 = hole[p] & 0x1FF;
+        neu[p] = 0xF8400000u | ((uint32_t)imm9 << 12) | (31u << 5) | (uint32_t)csr[p];
+    }
+    a64_insert_insns(e, &nins, epi, neu, np);
+    for (int p = 0; p < np; p++) {
+        int hs = hole[p] & 0x1FF;
+        int vs = poff[p] & 0x1FF;
+        neu[p * 2] = 0xF8000000u | ((uint32_t)hs << 12) | (31u << 5) | (uint32_t)csr[p];
+        if (psz[p] == 8) neu[p * 2 + 1] = 0xF8400000u | ((uint32_t)vs << 12) | (31u << 5) | (uint32_t)csr[p];
+        else neu[p * 2 + 1] = 0xB8400000u | ((uint32_t)vs << 12) | (31u << 5) | (uint32_t)csr[p];
+    }
+    a64_insert_insns(e, &nins, best_h, neu, np * 2);
+}
+
+// 两个浮点比较或在一起：fcmp / cset / … / fcmp / cset / uxtb / cmp #0 / csel 1。
+// 第二条比较改成 fccmp，真值条件沿用第二条 cset。NaN 仍走“比较为假”。
+static int a64_cset_cond(uint32_t insn) {
+    if ((insn & ~(0x1Fu | (0xFu << 12))) != 0x1A9F07E0u) return -1;
+    return (int)(((insn >> 12) & 0xFu) ^ 1u);
+}
+
+static bool a64_is_fcmp_reg(uint32_t insn) {
+    if ((insn & 31u) != 0) return false;
+    return (insn & 0xFF20FC1Fu) == 0x1E202000u || (insn & 0xFF20FC1Fu) == 0x1E602000u;
+}
+
+static bool a64_writes_nzcv(uint32_t insn) {
+    if ((insn & 0xFF20FC1Fu) == 0x1E202000u || (insn & 0xFF20FC1Fu) == 0x1E602000u) return true;
+    if ((insn & 0xFFFFFC1Fu) == 0x1E202008u || (insn & 0xFFFFFC1Fu) == 0x1E602008u) return true;
+    if ((insn & 0xFF200400u) == 0x1E200400u) return true; // fccmp
+    if ((insn & 0x7F80001Fu) == 0x7100001Fu || (insn & 0x7F80001Fu) == 0x3100001Fu) return true;
+    if ((insn & 0x7F80001Fu) == 0xF100001Fu || (insn & 0x7F80001Fu) == 0xB100001Fu) return true;
+    if ((insn & 0x7F20001Fu) == 0x6B00001Fu || (insn & 0x7F20001Fu) == 0x2B00001Fu) return true;
+    if ((insn & 0x7F20001Fu) == 0xEB00001Fu || (insn & 0x7F20001Fu) == 0xAB00001Fu) return true;
+    if (((insn & 0x1F000000u) == 0x11000000u || (insn & 0x1F200000u) == 0x0B000000u) && (insn & 0x20000000u)) return true;
+    if ((insn & 0x7FE00C10u) == 0x3A400000u) return true;
+    return false;
+}
+
+static int a64_nzcv_for(int cond) {
+    switch (cond) {
+    case 0:  return 0x4; // EQ
+    case 1:  return 0x0; // NE
+    case 2:  return 0x2; // HS
+    case 3:  return 0x0; // LO
+    case 4:  return 0x8; // MI
+    case 5:  return 0x0; // PL
+    case 6:  return 0x1; // VS
+    case 7:  return 0x0; // VC
+    case 8:  return 0x2; // HI
+    case 9:  return 0x0; // LS
+    case 10: return 0x0; // GE
+    case 11: return 0x8; // LT
+    case 12: return 0x2; // GT
+    case 13: return 0x4; // LE
+    default: return -1;
+    }
+}
+
+static bool a64_gap_neutral(uint32_t insn, int protect) {
+    if ((insn & 0xFC000000u) == 0x14000000u || (insn & 0xFF000010u) == 0x54000000u) return false;
+    if ((insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return false;
+    if (a64_reads_nzcv(insn) || a64_writes_nzcv(insn)) return false;
+    bool known = false;
+    int def = a64_gpr_def2(insn, &known);
+    if (!known) return false;
+    if (protect >= 0 && def == protect) return false;
+    return true;
+}
+
+static bool a64_is_one(uint32_t* w, int at, int reg) {
+    for (int k = at - 1; k >= 0 && k >= at - 64; k--) {
+        bool known = false;
+        int def = a64_gpr_def2(w[k], &known);
+        if (!known) return false;
+        if (def != reg) continue;
+        return (w[k] & 0xFFE00000u) == 0x52800000u && ((w[k] >> 5) & 0xFFFFu) == 1u;
+    }
+    return false;
+}
+
+static bool a64_in_set(const int* s, int n, int v) {
+    for (int i = 0; i < n; i++) if (s[i] == v) return true;
+    return false;
+}
+
+// skip 里的指令当成还没删。reg 从 pos 起没有读，就是死的。
+static bool a64_dead_skip(uint32_t* w, int nins, int pos, int reg, const int* skip, int nskip) {
+    if (reg < 0 || reg >= 31 || pos < 0 || pos >= nins) return false;
+    uint8_t* seen = calloc((size_t)nins, 1);
+    int* queue = calloc((size_t)nins, sizeof(int));
+    if (!seen || !queue) { free(seen); free(queue); return false; }
+    int qn = 0;
+    queue[qn++] = pos;
+    seen[pos] = 1;
+    bool ok = true;
+    for (int qh = 0; qh < qn && ok; qh++) {
+        int i = queue[qh];
+        uint32_t insn = w[i];
+        int nexts[2];
+        int nn = 0;
+        if (a64_in_set(skip, nskip, i)) {
+            nexts[nn++] = i + 1;
+        } else {
+            bool known = false;
+            if (a64_gpr_read2(insn, reg, &known) || !known) { ok = false; break; }
+            int def = a64_gpr_def2(insn, &known);
+            if (!known) { ok = false; break; }
+            if (def == reg || insn == 0xD65F03C0u) continue;
+            if ((insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) {
+                if (reg <= 18) continue;
+            }
+            if ((insn & 0xFC000000u) == 0x14000000u) {
+                nexts[nn++] = a64_b_target(i, insn, false);
+            } else if ((insn & 0xFF000010u) == 0x54000000u) {
+                nexts[nn++] = i + 1;
+                nexts[nn++] = a64_b_target(i, insn, true);
+            } else {
+                nexts[nn++] = i + 1;
+            }
+        }
+        for (int t = 0; t < nn; t++) {
+            int n = nexts[t];
+            if (n < 0 || n >= nins || seen[n]) continue;
+            seen[n] = 1;
+            queue[qn++] = n;
+        }
+    }
+    free(queue);
+    free(seen);
+    return ok;
+}
+
+static void a64_fold_fccmp(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    if (nins > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    enum { MAXS = 8, MAXD = 8 };
+    struct {
+        int fcmp2, c2, nd, branch, bcond;
+        int del[MAXD];
+        uint32_t fccmp, cset_insn, branch_insn;
+        bool use_cset;
+    } site[MAXS];
+    int ns = 0;
+    for (int i = 0; i + 6 < nins && ns < MAXS; ) {
+        if (!a64_is_fcmp_reg(w[i]) || a64_cset_cond(w[i + 1]) < 0) { i++; continue; }
+        if (a64_is_branch_target(w, nins, i + 1)) { i++; continue; }
+        int c1 = a64_cset_cond(w[i + 1]);
+        int d1 = (int)(w[i + 1] & 31u);
+        int j = i + 2;
+        bool gap = true;
+        for (; j < nins && j < i + 24; j++) {
+            if (a64_is_branch_target(w, nins, j)) { gap = false; break; }
+            if (a64_is_fcmp_reg(w[j]) && j + 1 < nins && a64_cset_cond(w[j + 1]) >= 0) break;
+            if (!a64_gap_neutral(w[j], d1)) { gap = false; break; }
+        }
+        if (!gap || j >= nins || j >= i + 24 || !a64_is_fcmp_reg(w[j])) { i++; continue; }
+        if (((w[i] ^ w[j]) & 0x00C00000u) != 0) { i++; continue; }
+        if (a64_is_branch_target(w, nins, j) || a64_is_branch_target(w, nins, j + 1)) { i++; continue; }
+        int c2 = a64_cset_cond(w[j + 1]);
+        int d2 = (int)(w[j + 1] & 31u);
+        if (c2 < 0 || d1 == d2 || a64_nzcv_for(c2) < 0 || a64_nzcv_for(c1) < 0) { i++; continue; }
+        int k = j + 2;
+        bool mid = true;
+        for (; k < nins && k < j + 10; k++) {
+            if (a64_is_branch_target(w, nins, k)) { mid = false; break; }
+            uint32_t ux = w[k];
+            if ((ux & ~0x3FFu) == 0x53001C00u) break;
+            if (!a64_gap_neutral(ux, d1) || !a64_gap_neutral(ux, d2)) { mid = false; break; }
+        }
+        if (!mid || k + 2 >= nins || (w[k] & ~0x3FFu) != 0x53001C00u) { i++; continue; }
+        int tested = (int)((w[k] >> 5) & 31u);
+        int tmp = (int)(w[k] & 31u);
+        uint32_t cm = w[k + 1];
+        uint32_t sel = w[k + 2];
+        if (a64_is_branch_target(w, nins, k) || a64_is_branch_target(w, nins, k + 1) || a64_is_branch_target(w, nins, k + 2)) {
+            i++; continue;
+        }
+        if ((cm & 0xFFC0001Fu) != 0x7100001Fu || ((cm >> 10) & 0xFFFu) != 0) { i++; continue; }
+        if ((int)((cm >> 5) & 31u) != tmp) { i++; continue; }
+        if ((sel & 0xFFE00C00u) != 0x1A800000u || ((sel >> 12) & 0xFu) != 1u) { i++; continue; }
+        int dst = (int)(sel & 31u);
+        int on_true = (int)((sel >> 5) & 31u);
+        int on_false = (int)((sel >> 16) & 31u);
+        if (on_true == d1 || on_true == d2 || on_true == tmp) { i++; continue; }
+        if (!((tested == d1 && on_false == d2) || (tested == d2 && on_false == d1))) { i++; continue; }
+        if (!a64_is_one(w, k + 2, on_true)) { i++; continue; }
+        bool stray = false;
+        for (int r = i + 2; r < k + 2; r++) {
+            bool known = false;
+            if (r == k || r == k + 1) continue;
+            if (a64_gpr_read2(w[r], d1, &known) || !known) stray = true;
+            known = false;
+            if (a64_gpr_read2(w[r], d2, &known) || !known) stray = true;
+        }
+        if (stray) { i++; continue; }
+        int br = -1, bcond = -1, u2 = -1, c3 = -1;
+        int p = k + 3;
+        bool tail = true;
+        for (; p < nins && p < k + 8; p++) {
+            if (a64_is_branch_target(w, nins, p)) { tail = false; break; }
+            if ((w[p] & ~0x3FFu) == 0x53001C00u && (int)((w[p] >> 5) & 31u) == dst) break;
+            if (!a64_gap_neutral(w[p], dst)) { tail = false; break; }
+        }
+        if (tail && p + 2 < nins && (w[p] & ~0x3FFu) == 0x53001C00u && (int)((w[p] >> 5) & 31u) == dst) {
+            int t2 = (int)(w[p] & 31u);
+            uint32_t cm2 = w[p + 1];
+            uint32_t b = w[p + 2];
+            if (!a64_is_branch_target(w, nins, p) && !a64_is_branch_target(w, nins, p + 1) &&
+                (cm2 & 0xFFC0001Fu) == 0x7100001Fu && ((cm2 >> 10) & 0xFFFu) == 0 &&
+                (int)((cm2 >> 5) & 31u) == t2 && (b & 0xFF000010u) == 0x54000000u) {
+                int bc = (int)(b & 0xFu);
+                int tgt = a64_b_target(p + 2, b, true);
+                bool inside = tgt >= i && tgt <= p + 2;
+                if ((bc == 0 || bc == 1) && !inside) {
+                    u2 = p; c3 = p + 1; br = p + 2; bcond = bc == 0 ? (c2 ^ 1) : c2;
+                }
+            }
+        }
+        int del[MAXD];
+        int nd = 0;
+        del[nd++] = i + 1;
+        del[nd++] = j + 1;
+        del[nd++] = k;
+        del[nd++] = k + 1;
+        bool use_cset = true;
+        if (br >= 0) {
+            del[nd++] = k + 2;
+            del[nd++] = u2;
+            del[nd++] = c3;
+            use_cset = false;
+        }
+        bool live = false;
+        if (d1 != dst || !use_cset) {
+            if (!a64_dead_skip(w, nins, k + 3, d1, del, nd)) live = true;
+        }
+        if (d2 != d1 && (d2 != dst || !use_cset)) {
+            if (!a64_dead_skip(w, nins, k + 3, d2, del, nd)) live = true;
+        }
+        if (!a64_dead_skip(w, nins, k + 3, tmp, del, nd)) live = true;
+        if (!use_cset && !a64_dead_skip(w, nins, br, dst, del, nd)) live = true;
+        if (u2 >= 0 && !a64_dead_skip(w, nins, c3 + 1, (int)(w[u2] & 31u), del, nd)) live = true;
+        if (live) { i++; continue; }
+        int rn = (int)((w[j] >> 5) & 31u);
+        int rm = (int)((w[j] >> 16) & 31u);
+        site[ns].fcmp2 = j;
+        site[ns].c2 = c2;
+        site[ns].nd = nd;
+        for (int d = 0; d < nd; d++) site[ns].del[d] = del[d];
+        site[ns].branch = br;
+        site[ns].bcond = bcond;
+        site[ns].use_cset = use_cset;
+        site[ns].fccmp = 0x1E200400u | (w[j] & 0x00C00000u) | ((uint32_t)rm << 16) |
+                         ((uint32_t)(c1 ^ 1) << 12) | ((uint32_t)rn << 5) | (uint32_t)a64_nzcv_for(c2);
+        site[ns].cset_insn = 0x1A9F07E0u | ((uint32_t)(c2 ^ 1) << 12) | (uint32_t)dst;
+        site[ns].branch_insn = br >= 0 ? (w[br] & ~0xFu) | (uint32_t)bcond : 0;
+        ns++;
+        i = k + 3;
+    }
+    for (int s = ns - 1; s >= 0; s--) {
+        w[site[s].fcmp2] = site[s].fccmp;
+        if (site[s].use_cset) {
+            int csel_at = site[s].del[2] + 2; // uxtb, cmp, csel
+            if ((w[csel_at] & 0xFFE00C00u) == 0x1A800000u) w[csel_at] = site[s].cset_insn;
+        } else if (site[s].branch >= 0) {
+            w[site[s].branch] = site[s].branch_insn;
+        }
+        for (int a = 0; a < site[s].nd; a++) {
+            int best = -1, bi = -1;
+            for (int d = 0; d < site[s].nd; d++) {
+                if (site[s].del[d] > best) { best = site[s].del[d]; bi = d; }
+            }
+            if (best < 0) break;
+            site[s].del[bi] = -1;
+            a64_delete_insns(e, &nins, best, 1);
+            w = (uint32_t*)e->data;
+        }
+    }
+}
+
+// 同一个栈槽刚装进寄存器，后面又原样写回，或者寄存器里还是这个槽的值又去读。
+// 只认 SP 相对的标量 load/store。认不出的指令清空记录。调用、分支和改 SP 另起一段。
+// sN 和 xN 编号相同但是两套寄存器。
+static bool a64_sp_slot(uint32_t w, int* kind, int* rt, int* off, int* sz, int* fpr) {
+    if (((w >> 5) & 31u) != 31u) return false;
+    uint32_t sc = w & 0xFFC00000u;
+    uint32_t u = w & 0xFFE00C00u;
+    *rt = (int)(w & 31u);
+    if (sc == 0xB9000000u || sc == 0xB9400000u || sc == 0xBD000000u || sc == 0xBD400000u) {
+        *kind = (sc == 0xB9400000u || sc == 0xBD400000u) ? 1 : 2;
+        *sz = 4;
+        *off = (int)(((w >> 10) & 0xFFFu) * 4u);
+        *fpr = (sc == 0xBD000000u || sc == 0xBD400000u) ? 1 : 0;
+        return true;
+    }
+    if (sc == 0xF9000000u || sc == 0xF9400000u || sc == 0xFD000000u || sc == 0xFD400000u) {
+        *kind = (sc == 0xF9400000u || sc == 0xFD400000u) ? 1 : 2;
+        *sz = 8;
+        *off = (int)(((w >> 10) & 0xFFFu) * 8u);
+        *fpr = (sc == 0xFD000000u || sc == 0xFD400000u) ? 1 : 0;
+        return true;
+    }
+    if (u == 0xB8000000u || u == 0xB8400000u || u == 0xBC000000u || u == 0xBC400000u ||
+        u == 0xF8000000u || u == 0xF8400000u || u == 0xFC000000u || u == 0xFC400000u) {
+        int imm = (int)((w >> 12) & 0x1FFu);
+        if (imm & 0x100) imm |= ~0x1FF;
+        *kind = (u == 0xB8400000u || u == 0xBC400000u || u == 0xF8400000u || u == 0xFC400000u) ? 1 : 2;
+        *sz = (u == 0xF8000000u || u == 0xF8400000u || u == 0xFC000000u || u == 0xFC400000u) ? 8 : 4;
+        *off = imm;
+        *fpr = (u == 0xBC000000u || u == 0xBC400000u || u == 0xFC000000u || u == 0xFC400000u) ? 1 : 0;
+        return true;
+    }
+    return false;
+}
+
+// -2 认不出，-1 不写寄存器，>=0 写了这一号。
+static int a64_plain_def(uint32_t w, int* fpr) {
+    if (w == 0xD503201Fu) return -1;
+    if ((w & 0x3F000000u) == 0x1C000000u) { *fpr = 1; return (int)(w & 31u); }
+    if ((w & 0x3F000000u) == 0x5C000000u) { *fpr = 1; return (int)(w & 31u); }
+    if ((w >> 24) == 0x1Eu) {
+        *fpr = 1;
+        if ((w & 0xFF20FC1Fu) == 0x1E202000u || (w & 0xFFFFFC1Fu) == 0x1E202008u) return -1;
+        return (int)(w & 31u);
+    }
+    if ((w & 0x1F000000u) == 0x11000000u || (w & 0x1F000000u) == 0x31000000u ||
+        (w & 0x1F000000u) == 0x51000000u || (w & 0x1F000000u) == 0x71000000u ||
+        (w & 0x1F200000u) == 0x0B000000u || (w & 0x1F200000u) == 0x2B000000u ||
+        (w & 0x1F200000u) == 0x4B000000u || (w & 0x1F200000u) == 0x6B000000u) {
+        // add/sub sp, sp, #imm 挪动了后面的槽。从 SP 算出地址不算。
+        // rd 是 xzr 时只改标志，寄存器里的值还在（cmp）。
+        if ((w & 31u) == 31u && ((w >> 5) & 31u) == 31u) return -2;
+        *fpr = 0;
+        return ((w & 31u) == 31u) ? -1 : (int)(w & 31u);
+    }
+    if ((w & 0x7F800000u) == 0x52800000u || (w & 0x7F800000u) == 0x12800000u ||
+        (w & 0x7F800000u) == 0x1A800000u || (w & 0x7F200000u) == 0x2A000000u ||
+        (w & 0x7F800000u) == 0x53000000u || (w & 0x7F800000u) == 0x13000000u) {
+        *fpr = 0;
+        return (int)(w & 31u);
+    }
+    // mul / madd 只写目标。
+    if ((w & 0x7FE00000u) == 0x1B000000u || (w & 0x7FE00000u) == 0x9B000000u) {
+        *fpr = 0;
+        return (int)(w & 31u);
+    }
+    // 非 SP 的加载只写数据寄存器，基址里的指针还在。
+    // 非 SP 的存储可能写到任何一个栈槽，整表作废。
+    {
+        uint32_t sc = w & 0xFFC00000u;
+        uint32_t uu = w & 0xFFE00C00u;
+        int which = 0; // 1 load gpr, 2 load fpr, 3 store
+        if (sc == 0xB9400000u || sc == 0x39400000u || sc == 0x79400000u || sc == 0xF9400000u ||
+            uu == 0xB8400000u || uu == 0x38400000u || uu == 0x78400000u || uu == 0xF8400000u) which = 1;
+        else if (sc == 0xBD400000u || sc == 0xFD400000u || uu == 0xBC400000u || uu == 0xFC400000u) which = 2;
+        else if (sc == 0xB9000000u || sc == 0x39000000u || sc == 0x79000000u || sc == 0xF9000000u ||
+                 sc == 0xBD000000u || sc == 0xFD000000u ||
+                 uu == 0xB8000000u || uu == 0x38000000u || uu == 0x78000000u || uu == 0xF8000000u ||
+                 uu == 0xBC000000u || uu == 0xFC000000u) which = 3;
+        if (which && ((w >> 5) & 31u) != 31u) {
+            if (which == 3) return -2;
+            *fpr = which == 2;
+            int rt = (int)(w & 31u);
+            if (which == 1 && rt == 31) return -1;
+            return rt;
+        }
+    }
+    return -2;
+}
+
+static void a64_drop_stack_copies(TB_CGEmitter* e) {
+    if (e->count < 16 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    if (nins > 8192) return;
+    uint32_t* w = (uint32_t*)e->data;
+    if (getenv("A64_DSC_DUMP") != NULL && nins > 300 && nins < 420) {
+        fprintf(stderr, "[dsc-dump] nins=%d\n", nins);
+        for (int q = 0; q < nins; q++) fprintf(stderr, "[dsc-dump] %4d: %08x\n", q, w[q]);
+    }
+    enum { MAXD = 256 };
+    int del[MAXD];
+    int nd = 0;
+    int i = 0;
+    while (i < nins) {
+        int hold_off[2][32], hold_sz[2][32];
+        uint8_t hold_ok[2][32];
+        memset(hold_ok, 0, sizeof(hold_ok));
+        int j = i;
+        while (j < nins) {
+            uint32_t insn = w[j];
+            if ((insn & 0xFC000000u) == 0x14000000u || (insn & 0xFF000010u) == 0x54000000u ||
+                (insn & 0xFC000000u) == 0x94000000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u ||
+                insn == 0xD65F03C0u) {
+                break;
+            }
+            // PATCH(odin-tilde): a branch can land on this instruction with
+            // arbitrary register contents — the linear "slot still in that
+            // register" records do not describe the arriving path. thread@
+            // _create's return phi hit exactly this: the fail arm wrote
+            // stur x1,[slot] and fell through into the join (the success arm
+            // BRANCHED to the join head), so the join's ldur x1,[slot] looked
+            // like a same-register read-back and got deleted — every path
+            // from the branch then returned garbage. Clear the records at
+            // branch targets.
+            if (a64_is_branch_target(w, nins, j)) {
+                memset(hold_ok, 0, sizeof(hold_ok));
+            }
+            int kind, rt, off, sz, fpr;
+            if (a64_sp_slot(insn, &kind, &rt, &off, &sz, &fpr)) {
+                bool same = hold_ok[fpr][rt] && hold_off[fpr][rt] == off && hold_sz[fpr][rt] == sz;
+                if (same && nd < MAXD && !a64_is_branch_target(w, nins, j)) del[nd++] = j;
+                if (!same) {
+                    for (int f = 0; f < 2; f++) {
+                        for (int r = 0; r < 32; r++) {
+                            if (!hold_ok[f][r]) continue;
+                            int o = hold_off[f][r], s = hold_sz[f][r];
+                            if (!(o + s <= off || off + sz <= o)) hold_ok[f][r] = 0;
+                        }
+                    }
+                    hold_off[fpr][rt] = off;
+                    hold_sz[fpr][rt] = sz;
+                    hold_ok[fpr][rt] = 1;
+                    for (int r = 0; r < 32; r++) {
+                        if (r != rt && hold_ok[fpr][r] && hold_off[fpr][r] == off && hold_sz[fpr][r] == sz) {
+                            hold_ok[fpr][r] = 0;
+                        }
+                    }
+                }
+            } else {
+                int file = 0;
+                int d = a64_plain_def(insn, &file);
+                if (d == -2) {
+                    memset(hold_ok, 0, sizeof(hold_ok));
+                } else if (d >= 0) {
+                    hold_ok[file][d] = 0;
+                }
+            }
+            j++;
+        }
+        i = j + 1;
+    }
+    // 读进寄存器后紧接着被盖掉，中间只有即将删掉的写回：这次读没有人用。
+    w = (uint32_t*)e->data;
+    for (int at = 0; at < nins && nd < MAXD; at++) {
+        bool already = false;
+        for (int d = 0; d < nd; d++) if (del[d] == at) already = true;
+        if (already) continue;
+        int kind, rt, off, sz, fpr;
+        if (!a64_sp_slot(w[at], &kind, &rt, &off, &sz, &fpr) || kind != 1) continue;
+        if (a64_is_branch_target(w, nins, at)) continue;
+        int k = at + 1;
+        while (k < nins) {
+            bool gone = false;
+            for (int d = 0; d < nd; d++) if (del[d] == k) gone = true;
+            if (!gone && w[k] != 0xD503201Fu) break;
+            k++;
+        }
+        if (k >= nins) continue;
+        int kkind, krt, koff, ksz, kfpr;
+        bool pure = false;
+        if (a64_sp_slot(w[k], &kkind, &krt, &koff, &ksz, &kfpr) && kkind == 1 && kfpr == fpr && krt == rt) {
+            pure = true;
+        } else {
+            int file = 0;
+            int d = a64_plain_def(w[k], &file);
+            if (d == rt && file == fpr &&
+                ((w[k] & 0x7F800000u) == 0x52800000u || (w[k] & 0x7F800000u) == 0x12800000u ||
+                 (w[k] & 0x3F000000u) == 0x1C000000u || (w[k] & 0x3F000000u) == 0x5C000000u)) {
+                pure = true;
+            }
+        }
+        if (pure) del[nd++] = at;
+    }
+    for (int a = 0; a < nd; a++) {
+        int best = -1, bi = -1;
+        for (int d = 0; d < nd; d++) if (del[d] > best) { best = del[d]; bi = d; }
+        if (best < 0) break;
+        del[bi] = -1;
+        if (getenv("A64_DSC_AUDIT") != NULL) {
+            fprintf(stderr, "[dsc-audit] del@%d: %08x  ctx:", best, w[best]);
+            for (int q = -2; q <= 2; q++) {
+                int ix = best + q;
+                fprintf(stderr, " %s%08x", q == 0 ? ">" : "", (ix >= 0 && ix < nins) ? w[ix] : 0);
+            }
+            fprintf(stderr, "\n");
+        }
+        a64_delete_insns(e, &nins, best, 1);
+        for (int d = 0; d < nd; d++) if (del[d] > best) del[d]--;
+    }
+}
+
+// 被调用者保存寄存器只在序言里保存、尾声里恢复，函数体没用到。
+// 把反复进出栈的 8 字节溢出槽改成停在这些寄存器里。调用不会弄丢它们。
+static int a64_body_touch(uint32_t insn, int reg, bool* known) {
+    bool kd = false, kr = false;
+    int def = a64_gpr_def2(insn, &kd);
+    bool rd = kd ? a64_gpr_read2(insn, reg, &kr) : false;
+    if (kd && kr) { *known = true; return (def == reg) || rd; }
+    uint32_t sc = insn & 0xFFC00000u;
+    uint32_t u = insn & 0xFFE00C00u;
+    int rt = (int)(insn & 31u);
+    int rn = (int)((insn >> 5) & 31u);
+    int rm = (int)((insn >> 16) & 31u);
+    if (sc == 0x39000000u || sc == 0x39400000u || sc == 0x79000000u || sc == 0x79400000u ||
+        u == 0x38000000u || u == 0x38400000u || u == 0x78000000u || u == 0x78400000u) {
+        *known = true; return rt == reg || rn == reg;
+    }
+    if ((insn & 0xFFFFFC00u) == 0x93407C00u) { *known = true; return rt == reg || rn == reg; }
+    if ((insn & 0x7FE00000u) == 0x8B200000u || (insn & 0x7FE00000u) == 0xCB200000u) {
+        *known = true; return rt == reg || rn == reg || rm == reg;
+    }
+    if (sc == 0x3D800000u || sc == 0x3DC00000u) { *known = true; return rn == reg; }
+    *known = false;
+    if (rt == reg || rn == reg || rm == reg) return 1;
+    return 0;
+}
+
+// 1 用了向量寄存器 v，0 没有，-1 是认不出的向量指令。
+static int a64_fp_touch(uint32_t insn, int v) {
+    int rt = (int)(insn & 31u);
+    int rn = (int)((insn >> 5) & 31u);
+    int rm = (int)((insn >> 16) & 31u);
+    if ((insn >> 24) == 0x1Eu) return rt == v || rn == v || rm == v;
+    if ((insn & 0x3F000000u) == 0x1C000000u || (insn & 0x3F000000u) == 0x5C000000u) return rt == v;
+    uint32_t sc = insn & 0xFFC00000u;
+    if (sc == 0xBD000000u || sc == 0xBD400000u || sc == 0xFD000000u || sc == 0xFD400000u ||
+        sc == 0x3D800000u || sc == 0x3DC00000u) {
+        return rt == v;
+    }
+    uint32_t u = insn & 0xFFE00C00u;
+    if (u == 0xBC000000u || u == 0xBC400000u || u == 0xFC000000u || u == 0xFC400000u ||
+        u == 0x3C800000u || u == 0x3CC00000u) {
+        return rt == v;
+    }
+    if ((insn & 0xFFE0FC00u) == 0x4EA01C00u) return rt == v || rn == v;
+    if ((insn & 0x9F000000u) == 0x0E000000u || (insn & 0x9F000000u) == 0x4E000000u ||
+        (insn & 0xBF000000u) == 0x2E000000u || (insn & 0xBF000000u) == 0x6E000000u) {
+        return -1;
+    }
+    return 0;
+}
+
+static bool a64_sp_q(uint32_t insn, int* rt, int* off, int* is_store) {
+    if (((insn >> 5) & 31u) != 31u) return false;
+    uint32_t sc = insn & 0xFFC00000u;
+    uint32_t u = insn & 0xFFE00C00u;
+    *rt = (int)(insn & 31u);
+    if (sc == 0x3D800000u || sc == 0x3DC00000u) {
+        *is_store = sc == 0x3D800000u;
+        *off = (int)(((insn >> 10) & 0xFFFu) * 16u);
+        return true;
+    }
+    if (u == 0x3C800000u || u == 0x3CC00000u) {
+        int imm = (int)((insn >> 12) & 0x1FFu);
+        if (imm & 0x100) imm |= ~0x1FF;
+        *is_store = u == 0x3C800000u;
+        *off = imm;
+        return true;
+    }
+    return false;
+}
+
+static bool a64_sp_s(uint32_t insn, int* rt, int* off, int* is_store) {
+    if (((insn >> 5) & 31u) != 31u) return false;
+    uint32_t sc = insn & 0xFFC00000u;
+    uint32_t u = insn & 0xFFE00C00u;
+    *rt = (int)(insn & 31u);
+    if (sc == 0xBD000000u || sc == 0xBD400000u) {
+        *is_store = sc == 0xBD000000u;
+        *off = (int)(((insn >> 10) & 0xFFFu) * 4u);
+        return true;
+    }
+    if (u == 0xBC000000u || u == 0xBC400000u) {
+        int imm = (int)((insn >> 12) & 0x1FFu);
+        if (imm & 0x100) imm |= ~0x1FF;
+        *is_store = u == 0xBC000000u;
+        *off = imm;
+        return true;
+    }
+    return false;
+}
+
+static bool a64_sp_x8(uint32_t insn, int* rt, int* off, int* is_store) {
+    if (((insn >> 5) & 31u) != 31u) return false;
+    uint32_t sc = insn & 0xFFC00000u;
+    uint32_t u = insn & 0xFFE00C00u;
+    *rt = (int)(insn & 31u);
+    if (sc == 0xF9000000u || sc == 0xF9400000u) {
+        *is_store = sc == 0xF9000000u;
+        *off = (int)(((insn >> 10) & 0xFFFu) * 8u);
+        return true;
+    }
+    if (u == 0xF8000000u || u == 0xF8400000u) {
+        int imm = (int)((insn >> 12) & 0x1FFu);
+        if (imm & 0x100) imm |= ~0x1FF;
+        *is_store = u == 0xF8000000u;
+        *off = imm;
+        return true;
+    }
+    return false;
+}
+
+static int a64_label_insn(TB_CGEmitter* e, int label) {
+    if (!e || label < 0) return -1;
+    uint32_t v = e->labels[label];
+    if ((v & 0x80000000u) == 0) return -1;
+    return (int)((v & ~0x80000000u) / 4u);
+}
+
+static A64BrSite* a64_br_site_at(int index) {
+    uint32_t pos = (uint32_t)index * 4u;
+    for (int i = 0; i < a64_br_site_count; i++) {
+        if (a64_br_sites[i].pos == pos) return &a64_br_sites[i];
+    }
+    return NULL;
+}
+
+// br 只走向记录下来的标签，不落到下一条。其它指令和原来一样。
+static int a64_edge_to(TB_CGEmitter* e, uint32_t insn, int at, int dest) {
+    if ((insn & 0xFFFFFC1Fu) == 0xD61F0000u) {
+        A64BrSite* s = a64_br_site_at(at);
+        if (!s) return 0;
+        for (int k = 0; k < s->nt; k++) {
+            if (a64_label_insn(e, s->labels[k]) == dest) return 1;
+        }
+        return 0;
+    }
+    if ((insn & 0xFC000000u) == 0x14000000u) return a64_b_target(at, insn, false) == dest;
+    if ((insn & 0xFF000010u) == 0x54000000u) {
+        return a64_b_target(at, insn, true) == dest || at + 1 == dest;
+    }
+    if (insn == 0xD65F03C0u) return 0;
+    return at + 1 == dest;
+}
+
+// mov xR,#imm（恰好两位）后面紧跟 mul xD,xN,xR。xR 在函数里没有别的用处。
+// 乘法改成两次移位加，xR 空出来，接一个“加一”的 8 字节下标槽。
+// 下标的每次读写都在保存和恢复之间，入口的那次存储支配后面的使用。
+static void a64_keep_iv(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int frame = -1;
+    for (int i = 0; i < nall && i < 4; i++) {
+        if ((w[i] & 0xFFC003FFu) == 0xD10003FFu) {
+            int sh = (int)((w[i] >> 22) & 1u);
+            int imm = (int)((w[i] >> 10) & 0xFFFu);
+            frame = sh ? imm << 12 : imm;
+            break;
+        }
+    }
+    if (frame < 32 || frame > 4096) return;
+    int nins = nall;
+    for (int i = 0; i < nall; i++) {
+        if (w[i] != 0xD65F03C0u) continue;
+        bool jumped = false;
+        for (int j = 0; j < i; j++) {
+            uint32_t br = w[j];
+            int tgt = -1;
+            if ((br & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(j, br, false);
+            else if ((br & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(j, br, true);
+            if (tgt > i) jumped = true;
+        }
+        if (!jumped) { nins = i + 1; break; }
+    }
+    if (nins > 1024 || nins < 8) return;
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) {
+            return;
+        }
+    }
+
+    int rv = -1, mov_at = -1, mul_at = -1, save_at = -1, rest_at = -1;
+    int mul_rd = -1, mul_rn = -1, sh1 = -1, sh2 = -1;
+    for (int r = 21; r <= 28 && rv < 0; r++) {
+        int st = -1, ld = -1, mz = -1, mu = -1, extra = 0, extra_i = -1;
+        int rd = -1, rn = -1, imm = -1;
+        for (int i = 0; i < nins; i++) {
+            uint32_t insn = w[i];
+            int rt, off, is_st;
+            if (a64_sp_x8(insn, &rt, &off, &is_st) && rt == r) {
+                if (is_st && st < 0) st = i;
+                else if (!is_st && ld < 0) ld = i;
+                else { extra++; extra_i = i; }
+                continue;
+            }
+            if ((insn & 0xFF80001Fu) == (0xD2800000u | (uint32_t)r) && ((insn >> 21) & 3u) == 0) {
+                if (mz >= 0) { extra++; extra_i = i; }
+                mz = i;
+                imm = (int)((insn >> 5) & 0xFFFFu);
+                continue;
+            }
+            if ((insn & 0xFFE0FC00u) == 0x9B007C00u) {
+                int d = (int)(insn & 31u);
+                int n = (int)((insn >> 5) & 31u);
+                int m = (int)((insn >> 16) & 31u);
+                if (m == r && d != r && n != r) {
+                    if (mu >= 0) { extra++; extra_i = i; }
+                    mu = i; rd = d; rn = n;
+                    continue;
+                }
+            }
+            bool known = false;
+            if (a64_body_touch(insn, r, &known)) { extra++; extra_i = i; }
+        }
+        if (extra || st < 0 || ld < st || mz < 0 || mu != mz + 1 || imm <= 0) continue;
+        int a = -1, b = -1, bits = 0;
+        for (int s = 0; s < 16; s++) if (imm & (1 << s)) {
+            if (bits == 0) a = s;
+            else if (bits == 1) b = s;
+            bits++;
+        }
+        if (bits < 1 || bits > 2) continue;
+        rv = r; mov_at = mz; mul_at = mu; save_at = st; rest_at = ld;
+        mul_rd = rd; mul_rn = rn; sh1 = bits == 2 ? b : a; sh2 = bits == 2 ? a : -1;
+    }
+    if (rv < 0) return;
+
+    enum { MAXB = 128, MAXP = 16, MAXACC = 24 };
+    int bstart[MAXB];
+    int nb = 0;
+    bstart[nb++] = 0;
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        int tgt = -1;
+        bool end = false;
+        if ((insn & 0xFC000000u) == 0x14000000u) { tgt = a64_b_target(i, insn, false); end = true; }
+        else if ((insn & 0xFF000010u) == 0x54000000u) { tgt = a64_b_target(i, insn, true); end = true; }
+        else if (insn == 0xD65F03C0u) end = true;
+        if (tgt >= 0 && tgt < nins) {
+            bool seen = false;
+            for (int b = 0; b < nb; b++) if (bstart[b] == tgt) seen = true;
+            if (!seen) {
+                if (nb >= MAXB) return;
+                bstart[nb++] = tgt;
+            }
+        }
+        if (end && i + 1 < nins) {
+            bool seen = false;
+            for (int b = 0; b < nb; b++) if (bstart[b] == i + 1) seen = true;
+            if (!seen) {
+                if (nb >= MAXB) return;
+                bstart[nb++] = i + 1;
+            }
+        }
+    }
+    for (int a = 0; a < nb; a++) for (int b = a + 1; b < nb; b++) if (bstart[b] < bstart[a]) {
+        int t = bstart[a]; bstart[a] = bstart[b]; bstart[b] = t;
+    }
+    int* bid = calloc((size_t)nins, sizeof(int));
+    if (!bid) return;
+    for (int b = 0; b < nb; b++) {
+        int hi = b + 1 < nb ? bstart[b + 1] : nins;
+        for (int i = bstart[b]; i < hi && i < nins; i++) bid[i] = b;
+    }
+    int preds[MAXB][MAXP];
+    int npd[MAXB];
+    for (int b = 0; b < nb; b++) npd[b] = 0;
+    for (int p = 0; p < nb; p++) {
+        int last = (p + 1 < nb ? bstart[p + 1] : nins) - 1;
+        if (last < bstart[p]) continue;
+        for (int b = 0; b < nb; b++) {
+            if (!a64_edge_to(e, w[last], last, bstart[b])) continue;
+            if (npd[b] >= MAXP) { free(bid); return; }
+            preds[b][npd[b]++] = p;
+        }
+    }
+    uint8_t* dom = calloc((size_t)nb * (size_t)nb, 1);
+    if (!dom) { free(bid); return; }
+    dom[0] = 1;
+    for (int b = 1; b < nb; b++) for (int d = 0; d < nb; d++) dom[b * nb + d] = 1;
+    bool changed = true;
+    for (int it = 0; changed && it < nb + 2; it++) {
+        changed = false;
+        for (int b = 1; b < nb; b++) {
+            if (npd[b] == 0) continue;
+            uint8_t nd[MAXB];
+            for (int d = 0; d < nb; d++) nd[d] = 1;
+            for (int i = 0; i < npd[b]; i++) {
+                int p = preds[b][i];
+                for (int d = 0; d < nb; d++) nd[d] &= dom[p * nb + d];
+            }
+            nd[b] = 1;
+            for (int d = 0; d < nb; d++) if (dom[b * nb + d] != nd[d]) {
+                dom[b * nb + d] = nd[d];
+                changed = true;
+            }
+        }
+    }
+
+    int best_off = -1, best_n = 0;
+    int best_acc[MAXACC], best_na = 0, best_init = -1, best_inc = -1, best_src = -1;
+    for (int off = 0; off + 8 <= frame; off += 8) {
+        int acc[MAXACC], na = 0, overflow = 0;
+        for (int i = 0; i < nins; i++) {
+            int rt, o, is_st;
+            if (!a64_sp_x8(w[i], &rt, &o, &is_st) || o != off) continue;
+            if (na >= MAXACC) { overflow = 1; break; }
+            acc[na++] = i;
+        }
+        if (overflow || na < 4) continue;
+        int inc = -1, init = -1, stores = 0, bad = 0;
+        for (int k = 0; k < na; k++) {
+            int i = acc[k];
+            int rt, o, is_st;
+            a64_sp_x8(w[i], &rt, &o, &is_st);
+            if (i <= save_at || i >= rest_at || rt == 31 || rt == rv) bad = 1;
+            if (!is_st) continue;
+            stores++;
+            if (i >= 2) {
+                uint32_t ld = w[i - 2], ad = w[i - 1];
+                int lrt, lo, lst;
+                int ad_rn = (int)((ad >> 5) & 31u);
+                int ad_rd = (int)(ad & 31u);
+                bool add1 = (ad & 0xFF800000u) == 0x91000000u && ((ad >> 22) & 1u) == 0 &&
+                            ((ad >> 10) & 0xFFFu) == 1u && ad_rn == ad_rd;
+                if (a64_sp_x8(ld, &lrt, &lo, &lst) && !lst && lo == off && lrt == ad_rd && add1 &&
+                    a64_sp_x8(w[i], &rt, &o, &is_st) && is_st && rt == ad_rd) {
+                    if (inc >= 0) bad = 1;
+                    inc = i - 2;
+                } else if (init >= 0) bad = 1;
+                else { init = i; }
+            } else if (init >= 0) bad = 1;
+            else init = i;
+        }
+        if (bad || inc < 0 || init < 0 || init >= inc || stores != 2) continue;
+        int ib = bid[init];
+        for (int k = 0; k < na; k++) {
+            int i = acc[k];
+            if (!dom[bid[i] * nb + ib]) bad = 1;
+            if (bid[i] == ib && i < init) bad = 1;
+        }
+        if (bid[inc] == bid[inc + 1] && bid[inc] == bid[inc + 2]) { }
+        else bad = 1;
+        if (bad || na <= best_n) continue;
+        best_n = na; best_off = off; best_na = na; best_init = init; best_inc = inc;
+        int srt, so, sst;
+        a64_sp_x8(w[init], &srt, &so, &sst);
+        best_src = srt;
+        for (int k = 0; k < na; k++) best_acc[k] = acc[k];
+    }
+    if (best_off < 0) { free(dom); free(bid); return; }
+
+    uint8_t* reach = calloc((size_t)nins, 1);
+    int* queue = calloc((size_t)nins, sizeof(int));
+    if (!reach || !queue) { free(reach); free(queue); free(dom); free(bid); return; }
+    int qn = 0;
+    queue[qn++] = rest_at;
+    reach[rest_at] = 1;
+    for (int qh = 0; qh < qn; qh++) {
+        int at = queue[qh];
+        uint32_t insn = w[at];
+        int nxt[2];
+        int nn = 0;
+        if ((insn & 0xFC000000u) == 0x14000000u) nxt[nn++] = a64_b_target(at, insn, false);
+        else if ((insn & 0xFF000010u) == 0x54000000u) {
+            nxt[nn++] = at + 1;
+            nxt[nn++] = a64_b_target(at, insn, true);
+        } else if (insn != 0xD65F03C0u && at + 1 < nins) nxt[nn++] = at + 1;
+        for (int k = 0; k < nn; k++) {
+            int t = nxt[k];
+            if (t < 0 || t >= nins || reach[t]) continue;
+            reach[t] = 1;
+            queue[qn++] = t;
+        }
+    }
+    bool back = false;
+    for (int k = 0; k < best_na; k++) if (reach[best_acc[k]]) back = true;
+    free(reach); free(queue);
+    if (back) { free(dom); free(bid); return; }
+
+    int inc_rd = (int)(w[best_inc] & 31u);
+    if (sh1 == 0) w[mov_at] = 0xAA0003E0u | ((uint32_t)mul_rn << 16) | (uint32_t)mul_rd;
+    else {
+        int immr = (64 - sh1) & 63;
+        int imms = 63 - sh1;
+        w[mov_at] = 0xD3600000u | ((uint32_t)immr << 16) | ((uint32_t)imms << 10) |
+                    ((uint32_t)mul_rn << 5) | (uint32_t)mul_rd;
+    }
+    if (sh2 >= 0) {
+        w[mul_at] = 0x8B000000u | ((uint32_t)mul_rn << 16) | ((uint32_t)sh2 << 10) |
+                    ((uint32_t)mul_rd << 5) | (uint32_t)mul_rd;
+    } else {
+        w[mul_at] = 0xD503201Fu;
+    }
+    w[best_init] = 0xAA0003E0u | ((uint32_t)best_src << 16) | (uint32_t)rv;
+    w[best_inc] = 0x91000400u | ((uint32_t)rv << 5) | (uint32_t)rv;
+    w[best_inc + 1] = 0xAA0003E0u | ((uint32_t)rv << 16) | (uint32_t)inc_rd;
+    w[best_inc + 2] = 0xD503201Fu;
+    for (int k = 0; k < best_na; k++) {
+        int i = best_acc[k];
+        if (i == best_init || i == best_inc || i == best_inc + 2) continue;
+        int rt, o, is_st;
+        if (!a64_sp_x8(w[i], &rt, &o, &is_st) || is_st) continue;
+        w[i] = 0xAA0003E0u | ((uint32_t)rv << 16) | (uint32_t)rt;
+    }
+    free(dom);
+    free(bid);
+}
+
+static int a64_lit_fixup_at(int insn) {
+    uint32_t pos = (uint32_t)insn * 4u;
+    for (size_t f = 0; f < a64_lit_fixup_count; f++) {
+        if (a64_lit_fixups[f].pos == pos) return (int)f;
+    }
+    return -1;
+}
+
+// 子弹循环头上，边界和基址的栈写在“弹已死”时没人读。
+// 不变的边界提到循环前；循环结束才用的那份放到出口；活弹才用的指针写放到存活判断之后。
+static void a64_defer_dead_spills(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { lim = i + 1; break; }
+    if (lim > 1024) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    int lit = -1, sR = -1, slotS = -1, slotE = -1, slotP = -1;
+    int bge = -1, exit_at = -1, beq = -1, header = -1;
+    uint32_t strS = 0, ldrP = 0, sturE = 0, stPtr = 0, stC = 0;
+    for (int i = 0; i + 6 < lim; i++) {
+        uint32_t ld = w[i];
+        if ((ld & 0xFF000000u) != 0x1C000000u) continue;
+        int rt = (int)(ld & 31u);
+        if ((w[i + 1] & 0xFFE0FFE0u) != 0xAA0003E0u) continue;
+        int xA = (int)(w[i + 1] & 31u);
+        int r2, o2, st2, r3, o3, st3, r4, o4, st4;
+        if (!a64_sp_s(w[i + 2], &r2, &o2, &st2) || !st2 || r2 != rt) continue;
+        if (!a64_sp_x8(w[i + 3], &r3, &o3, &st3) || st3) continue;
+        if (!a64_sp_s(w[i + 4], &r4, &o4, &st4) || !st4 || r4 != rt || o4 == o2) continue;
+        uint32_t cmp = w[i + 5];
+        if ((cmp & 0xFF00001Fu) != 0xF100001Fu || ((cmp >> 22) & 1u) != 0) continue;
+        if (((cmp >> 5) & 31u) != (uint32_t)xA) continue;
+        uint32_t br = w[i + 6];
+        if ((br & 0xFF000010u) != 0x54000000u || (br & 0xFu) != 0xAu) continue;
+        int tgt = a64_b_target(i + 6, br, true);
+        if (tgt <= i + 6 || tgt >= lim) continue;
+        lit = i; sR = rt; slotS = o2; slotE = o4; slotP = o3;
+        bge = i + 6; exit_at = tgt;
+        strS = w[i + 2]; ldrP = w[i + 3]; sturE = w[i + 4];
+        break;
+    }
+    if (lit < 0) return;
+    for (int i = bge + 1; i + 4 < lim && beq < 0; i++) {
+        int r0, o0, st0, r1, o1, st1;
+        if (!a64_sp_x8(w[i], &r0, &o0, &st0) || !st0 || o0 != slotE) continue;
+        if (!a64_sp_x8(w[i + 1], &r1, &o1, &st1) || !st1 || o1 == slotE) continue;
+        uint32_t ux = w[i + 2];
+        if ((ux & 0xFFFFFC00u) != 0x53001C00u) continue;
+        int uxrd = (int)(ux & 31u);
+        uint32_t c0 = w[i + 3];
+        if ((c0 & 0xFF00001Fu) != 0x7100001Fu || ((c0 >> 10) & 0xFFFu) != 0) continue;
+        if (((c0 >> 5) & 31u) != (uint32_t)uxrd) continue;
+        uint32_t b2 = w[i + 4];
+        if ((b2 & 0xFF000010u) != 0x54000000u || (b2 & 0xFu) != 0u) continue;
+        int ht = a64_b_target(i + 4, b2, true);
+        if (ht < 0 || ht >= i) continue;
+        beq = i + 4; header = ht; stPtr = w[i]; stC = w[i + 1];
+    }
+    if (beq < 0) return;
+    int preds = 0;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        int tgt = -1;
+        if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(i, insn, false);
+        else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(i, insn, true);
+        if (tgt == exit_at) preds++;
+    }
+    if (preds != 1) return;
+    int storesS = 0;
+    for (int i = 0; i < lim; i++) {
+        int rt, off, is_st;
+        if (a64_sp_s(w[i], &rt, &off, &is_st) && is_st && off == slotS) storesS++;
+    }
+    if (storesS != 1) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        int tgt = -1;
+        if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(i, insn, false);
+        else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(i, insn, true);
+        if (tgt > lit && tgt <= lit + 6) return;
+        if (tgt > beq - 4 && tgt <= beq) return;
+    }
+
+    int fx = a64_lit_fixup_at(lit);
+    if (fx < 0 || a64_lit_fixup_count + 2 > A64_MAX_LIT_FIXUPS) return;
+
+    // 活弹才用的两记写，挪到存活判断之后。
+    {
+        uint32_t uxt = w[beq - 2], c0 = w[beq - 1], br = w[beq];
+        w[beq - 4] = uxt;
+        w[beq - 3] = c0;
+        w[beq - 2] = br;
+        w[beq - 1] = stPtr;
+        w[beq] = stC;
+        a64_point_branch(w, beq - 2, header);
+    }
+
+    uint32_t entry = a64_lit_fixups[fx].entry_off;
+
+    uint32_t pre[2];
+    pre[0] = 0x1C000000u | (uint32_t)sR;
+    pre[1] = strS;
+    int nins = nall;
+    a64_insert_insns(e, &nins, header, pre, 2);
+    a64_lit_fixups[a64_lit_fixup_count++] = (A64LitFixup){ (uint32_t)header * 4u, entry };
+    w = (uint32_t*)e->data;
+    if (lit >= header) lit += 2;
+    if (bge >= header) bge += 2;
+    if (exit_at >= header) exit_at += 2;
+    if (beq >= header) beq += 2;
+
+    uint32_t ex[3];
+    ex[0] = ldrP;
+    ex[1] = 0x1C000000u | (uint32_t)sR;
+    ex[2] = sturE;
+    int exit_ldr = exit_at + 1;
+    a64_insert_insns(e, &nins, exit_at, ex, 3);
+    a64_lit_fixups[a64_lit_fixup_count++] = (A64LitFixup){ (uint32_t)exit_ldr * 4u, entry };
+    w = (uint32_t*)e->data;
+    if (lit >= exit_at) lit += 3;
+    if (bge >= exit_at) bge += 3;
+    if (beq >= exit_at) beq += 3;
+    a64_point_branch(w, bge, exit_at);
+
+    int gone = a64_lit_fixup_at(lit);
+    if (gone >= 0) {
+        a64_lit_fixups[gone] = a64_lit_fixups[--a64_lit_fixup_count];
+    }
+    int drop[4] = { lit, lit + 2, lit + 3, lit + 4 };
+    for (int a = 0; a < 4; a++) for (int b = a + 1; b < 4; b++) if (drop[b] > drop[a]) {
+        int t = drop[a]; drop[a] = drop[b]; drop[b] = t;
+    }
+    for (int k = 0; k < 4; k++) {
+        int at = drop[k];
+        a64_delete_insns(e, &nins, at, 1);
+        w = (uint32_t*)e->data;
+        if (bge > at) bge--;
+        if (exit_at > at) exit_at--;
+    }
+    a64_point_branch(w, bge, exit_at);
+    (void)beq;
+    (void)slotP;
+}
+
+// 从 `from` 出发，在写到 reg 之前有没有人读它。
+static bool a64_dead_from(uint32_t* w, int lim, int from, int reg) {
+    if (lim > 1024 || from < 0 || from >= lim) return false;
+    uint8_t seen[1024];
+    memset(seen, 0, (size_t)lim);
+    int stack[256];
+    int sp = 0;
+    stack[sp++] = from;
+    while (sp) {
+        int i = stack[--sp];
+        if (i < 0 || i >= lim || seen[i]) continue;
+        seen[i] = 1;
+        if ((w[i] & 0xFC000000u) == 0x94000000u && reg <= 18) return false;
+        bool known = false;
+        bool rd = a64_gpr_read2(w[i], reg, &known);
+        if (!known || rd) return false;
+        int def = a64_gpr_def2(w[i], &known);
+        if (!known) return false;
+        if (def == reg) continue;
+        uint32_t insn = w[i];
+        if (insn == 0xD65F03C0u) continue;
+        if ((insn & 0xFC000000u) == 0x14000000u) {
+            if (sp >= 256) return false;
+            stack[sp++] = a64_b_target(i, insn, false);
+            continue;
+        }
+        if (sp >= 256) return false;
+        stack[sp++] = i + 1;
+        if ((insn & 0xFF000010u) == 0x54000000u) {
+            if (sp >= 256) return false;
+            stack[sp++] = a64_b_target(i, insn, true);
+        }
+    }
+    return true;
+}
+
+// 死弹头上：下标拷了两份、一条 nop，常数在读存活字节之前就写好。
+// 比较直接用下标；常数挪到活弹才执行的那条栈写前面。移位加保持不动。
+static void a64_trim_dead_header(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { lim = i + 1; break; }
+    if (lim > 1024) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    for (int i = 0; i + 8 < lim; i++) {
+        uint32_t add = w[i];
+        if ((add & 0xFF800000u) != 0x91000000u || ((add >> 22) & 1u) || ((add >> 10) & 0xFFFu) != 1u) continue;
+        int xR = (int)(add & 31u);
+        if (((add >> 5) & 31u) != (uint32_t)xR || xR == 31) continue;
+        int xA = 0, sA = 0, xB = 0, sB = 0, xD = 0, sD = 0, xC = 0, imm = 0, cmp_rn = 0;
+        if ((w[i + 1] & 0xFFE0FFE0u) != 0xAA0003E0u) continue;
+        xA = (int)(w[i + 1] & 31u);
+        sA = (int)((w[i + 1] >> 16) & 31u);
+        if (sA != xR || xA == xR) continue;
+        if (w[i + 2] != 0xD503201Fu) continue;
+        if ((w[i + 3] & 0xFFE0FFE0u) != 0xAA0003E0u) continue;
+        xB = (int)(w[i + 3] & 31u);
+        sB = (int)((w[i + 3] >> 16) & 31u);
+        if (sB != xR || xB == xR || xB == xA) continue;
+        if ((w[i + 4] & 0xFF00001Fu) != 0xF100001Fu || ((w[i + 4] >> 22) & 1u)) continue;
+        cmp_rn = (int)((w[i + 4] >> 5) & 31u);
+        if (cmp_rn != xB) continue;
+        uint32_t br = w[i + 5];
+        if ((br & 0xFF000010u) != 0x54000000u) continue;
+        int exit_at = a64_b_target(i + 5, br, true);
+        if (exit_at <= i + 5 || exit_at >= lim) continue;
+        if ((w[i + 6] & 0xFF800000u) != 0xD2800000u || ((w[i + 6] >> 21) & 3u)) continue;
+        xC = (int)(w[i + 6] & 31u);
+        imm = (int)((w[i + 6] >> 5) & 0xFFFFu);
+        if (xC != xB || imm == 0) continue;
+        if ((w[i + 7] & 0xFFE0FFE0u) != 0xAA0003E0u) continue;
+        xD = (int)(w[i + 7] & 31u);
+        sD = (int)((w[i + 7] >> 16) & 31u);
+        if (sD != xR || xD != xA) continue;
+        if (!a64_dead_from(w, lim, exit_at, xA) || !a64_dead_from(w, lim, exit_at, xB)) continue;
+
+        int store = -1;
+        int guard = -1;
+        for (int k = i + 8; k < lim; k++) {
+            bool known = false;
+            int def = a64_gpr_def2(w[k], &known);
+            if (!known) { store = -1; break; }
+            bool rk = false;
+            bool rd = a64_gpr_read2(w[k], xC, &rk);
+            if (!rk) { store = -1; break; }
+            int rt = 0, off = 0, is_st = 0;
+            if (a64_sp_x8(w[k], &rt, &off, &is_st) && is_st && rt == xC) {
+                store = k;
+                break;
+            }
+            if (rd || def == xC) { store = -1; break; }
+            uint32_t bk = w[k];
+            if ((bk & 0xFF000010u) == 0x54000000u && a64_b_target(k, bk, true) == i) guard = k;
+        }
+        if (store < 0 || guard < 0 || guard > store) continue;
+        bool aimed = false;
+        for (int k = 0; k < lim; k++) {
+            uint32_t insn = w[k];
+            int tgt = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(k, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(k, insn, true);
+            if (tgt >= i + 1 && tgt <= i + 3) aimed = true;
+            if (tgt == i + 6) aimed = true;
+            if (tgt == store) aimed = true;
+        }
+        if (aimed) continue;
+
+        w[i + 4] = (w[i + 4] & ~(31u << 5)) | ((uint32_t)xR << 5);
+        uint32_t movz = w[i + 6];
+        int nins = nall;
+        a64_delete_insns(e, &nins, i + 1, 3);
+        w = (uint32_t*)e->data;
+        int movz_at = i + 3;
+        if (store >= i + 1) store -= 3;
+        if (store > movz_at) store -= 1;
+        a64_delete_insns(e, &nins, movz_at, 1);
+        w = (uint32_t*)e->data;
+        a64_insert_insns(e, &nins, store, &movz, 1);
+        (void)imm;
+        return;
+    }
+}
+
+// x8–x18 被调用冲掉，不是参数。用来确认 uxtb 的结果没有人再读。
+static bool a64_byte_dead(uint32_t* w, int lim, int from, int reg) {
+    if (lim > 1024 || from < 0 || from >= lim) return false;
+    uint8_t seen[1024];
+    memset(seen, 0, (size_t)lim);
+    int stack[256];
+    int sp = 0;
+    stack[sp++] = from;
+    while (sp) {
+        int i = stack[--sp];
+        if (i < 0 || i >= lim || seen[i]) continue;
+        seen[i] = 1;
+        if ((w[i] & 0xFC000000u) == 0x94000000u) {
+            if (reg <= 7) return false;
+            if (reg <= 18) continue;
+        }
+        bool known = false;
+        bool rd = a64_gpr_read2(w[i], reg, &known);
+        if (!known || rd) return false;
+        int def = a64_gpr_def2(w[i], &known);
+        if (!known) return false;
+        if (def == reg) continue;
+        uint32_t insn = w[i];
+        if (insn == 0xD65F03C0u) continue;
+        if ((insn & 0xFC000000u) == 0x14000000u) {
+            if (sp >= 256) return false;
+            stack[sp++] = a64_b_target(i, insn, false);
+            continue;
+        }
+        if (sp >= 256) return false;
+        stack[sp++] = i + 1;
+        if ((insn & 0xFF000010u) == 0x54000000u) {
+            if (sp >= 256) return false;
+            stack[sp++] = a64_b_target(i, insn, true);
+        }
+    }
+    return true;
+}
+
+// 死弹用下标寄存器直接做 *24。ldrb 已经把寄存器高位清零，uxtb 是多余的。
+static void a64_trim_dead_addr(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { lim = i + 1; break; }
+    if (lim > 1024) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    for (int i = 0; i + 8 < lim; i++) {
+        uint32_t add = w[i];
+        if ((add & 0xFF800000u) != 0x91000000u || ((add >> 22) & 1u) || ((add >> 10) & 0xFFFu) != 1u) continue;
+        int xR = (int)(add & 31u);
+        if (((add >> 5) & 31u) != (uint32_t)xR || xR == 31) continue;
+        if ((w[i + 1] & 0xFF00001Fu) != 0xF100001Fu || ((w[i + 1] >> 22) & 1u)) continue;
+        if (((w[i + 1] >> 5) & 31u) != (uint32_t)xR) continue;
+        if ((w[i + 2] & 0xFF000010u) != 0x54000000u) continue;
+        int exit_at = a64_b_target(i + 2, w[i + 2], true);
+        if (exit_at <= i + 2 || exit_at >= lim) continue;
+        if ((w[i + 3] & 0xFFE0FFE0u) != 0xAA0003E0u) continue;
+        int xA = (int)(w[i + 3] & 31u);
+        if (((w[i + 3] >> 16) & 31u) != (uint32_t)xR || xA == xR) continue;
+        if ((w[i + 4] & 0xFFC00000u) != 0xD3400000u) continue;
+        if (((w[i + 4] >> 5) & 31u) != (uint32_t)xA) continue;
+        uint32_t sh = w[i + 5];
+        if ((sh & 0xFF200000u) != 0x8B000000u) continue;
+        int srn = (int)((sh >> 5) & 31u);
+        int srm = (int)((sh >> 16) & 31u);
+        if (srn != xA && srm != xA) continue;
+        bool known = false;
+        int def = a64_gpr_def2(w[i + 6], &known);
+        if (!known || def != xA) continue;
+        bool rd = a64_gpr_read2(w[i + 6], xA, &known);
+        if (!known || rd) continue;
+
+        int uxtb_at = -1, wU = -1;
+        for (int k = i + 7; k + 2 < lim && k < i + 28; k++) {
+            if ((w[k] & 0xFC000000u) == 0x94000000u) break;
+            if ((w[k] & 0xFF000010u) != 0x54000000u || a64_b_target(k, w[k], true) != i) continue;
+            uint32_t cmp = w[k - 1];
+            uint32_t ux = w[k - 2];
+            uint32_t lb = w[k - 3];
+            if ((ux & 0xFFFFFC00u) != 0x53001C00u) continue;
+            int uxrd = (int)(ux & 31u);
+            int uxrn = (int)((ux >> 5) & 31u);
+            bool scaled = (lb & 0xFFC00000u) == 0x39400000u;
+            bool unscaled = (lb & 0xFFE00C00u) == 0x38400000u;
+            if (!scaled && !unscaled) continue;
+            if (((lb & 31u) != (uint32_t)uxrn) || uxrd == uxrn) continue;
+            if ((cmp & 0xFF00001Fu) != 0x7100001Fu || ((cmp >> 22) & 1u)) continue;
+            if (((cmp >> 10) & 0xFFFu) != 0 || ((cmp >> 5) & 31u) != (uint32_t)uxrd) continue;
+            if (!a64_byte_dead(w, lim, k, uxrd)) continue;
+            uxtb_at = k - 2;
+            wU = uxrd;
+            break;
+        }
+        bool aimed = false;
+        bool uxtb_aimed = false;
+        for (int k = 0; k < lim; k++) {
+            uint32_t insn = w[k];
+            int tgt = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(k, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(k, insn, true);
+            if (tgt == i + 3 || tgt == i + 4 || tgt == i + 5) aimed = true;
+            if (uxtb_at >= 0 && tgt == uxtb_at) uxtb_aimed = true;
+        }
+        if (aimed) continue;
+        if (uxtb_aimed) uxtb_at = -1;
+        if (uxtb_at >= 0) {
+            w[uxtb_at + 1] = (w[uxtb_at + 1] & ~(31u << 5)) | (w[uxtb_at] & (31u << 5));
+        }
+
+        w[i + 4] = (w[i + 4] & ~(31u << 5)) | ((uint32_t)xR << 5);
+        if (srm == xA) sh = (sh & ~(31u << 16)) | ((uint32_t)xR << 16);
+        if (srn == xA) sh = (sh & ~(31u << 5)) | ((uint32_t)xR << 5);
+        w[i + 5] = sh;
+        int nins = nall;
+        if (uxtb_at > i + 3) {
+            a64_delete_insns(e, &nins, uxtb_at, 1);
+            w = (uint32_t*)e->data;
+        }
+        a64_delete_insns(e, &nins, i + 3, 1);
+        (void)wU;
+        (void)exit_at;
+        return;
+    }
+}
+
+// 紧挨着的两份标量拷贝再相乘，就是源寄存器的平方。第二份拷贝马上被别的指令盖掉。
+static bool a64_fmul_s(uint32_t insn, int* rd, int* rn, int* rm) {
+    uint32_t op = insn & 0xFFE0FC00u;
+    if (op != 0x1E200800u && op != 0x1E201800u && op != 0x1E202800u && op != 0x1E203800u) return false;
+    *rd = (int)(insn & 31u);
+    *rn = (int)((insn >> 5) & 31u);
+    *rm = (int)((insn >> 16) & 31u);
+    return true;
+}
+
+static void a64_fold_sqr(TB_CGEmitter* e) {
+    if (e->count < 16 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { lim = i + 1; break; }
+    if (lim > 1024 || lim < 5) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    for (int i = 0; i + 4 < lim; i++) {
+        uint32_t a = w[i], b = w[i + 1], m = w[i + 2];
+        if ((a & 0xFFFFFC00u) != 0x1E204000u || (b & 0xFFFFFC00u) != 0x1E204000u) continue;
+        int sA = (int)(a & 31u);
+        int sS = (int)((a >> 5) & 31u);
+        int sB = (int)(b & 31u);
+        if (((b >> 5) & 31u) != (uint32_t)sS || sA == sB || sA == sS || sB == sS) continue;
+        int rd, rn, rm;
+        if (!a64_fmul_s(m, &rd, &rn, &rm)) continue;
+        if ((m & 0xFFE0FC00u) != 0x1E200800u) continue;
+        if (rd != sA || rn != sA || rm != sB) continue;
+        bool killed = false;
+        for (int k = i + 3; k < lim && k < i + 7; k++) {
+            uint32_t gap = w[k];
+            if ((gap & 0xFC000000u) == 0x14000000u || (gap & 0xFF000010u) == 0x54000000u ||
+                (gap & 0xFC000000u) == 0x94000000u || gap == 0xD65F03C0u) break;
+            if (!a64_fmul_s(gap, &rd, &rn, &rm)) break;
+            if (rn == sB || rm == sB) break;
+            if (rd == sB) { killed = true; break; }
+        }
+        if (!killed) continue;
+        bool aimed = false;
+        for (int k = 0; k < lim; k++) {
+            uint32_t insn = w[k];
+            int tgt = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(k, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(k, insn, true);
+            if (tgt >= i && tgt <= i + 2) aimed = true;
+        }
+        if (aimed) continue;
+        w[i + 2] = 0x1E200800u | ((uint32_t)sS << 16) | ((uint32_t)sS << 5) | (uint32_t)sA;
+        int nins = nall;
+        a64_delete_insns(e, &nins, i, 2);
+        return;
+    }
+}
+
+// 下标在栈上。先读出来，再左移 4、加左移 3。不能把下标自己再加一遍。
+static void a64_fold_slot24(TB_CGEmitter* e) {
+    if (e->count < 16 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { lim = i + 1; break; }
+    if (lim > 1024 || lim < 4) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    for (int i = 0; i + 2 < lim; i++) {
+        uint32_t mz = w[i];
+        if ((mz & 0xFFE0001Fu) != 0xD2800000u || ((mz >> 5) & 0xFFFFu) != 24u) continue;
+        int xD = (int)(mz & 31u);
+        if (xD == 31) continue;
+        uint32_t ld = w[i + 1];
+        if ((ld & 0xFFE00C00u) != 0xF8400000u || ((ld >> 5) & 31u) != 31u) continue;
+        int xT = (int)(ld & 31u);
+        if (xT == 31 || xT == xD) continue;
+        uint32_t mul = w[i + 2];
+        if ((mul & 0xFFE0FC00u) != 0x9B007C00u || (int)(mul & 31u) != xD) continue;
+        int xn = (int)((mul >> 5) & 31u);
+        int xm = (int)((mul >> 16) & 31u);
+        if (!((xn == xT && xm == xD) || (xn == xD && xm == xT))) continue;
+        bool aimed = false;
+        for (int k = 0; k < lim; k++) {
+            uint32_t insn = w[k];
+            int tgt = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(k, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(k, insn, true);
+            if (tgt >= i && tgt <= i + 2) aimed = true;
+        }
+        if (aimed) continue;
+        w[i] = ld;
+        w[i + 1] = 0xD37CEC00u | ((uint32_t)xT << 5) | (uint32_t)xD;
+        w[i + 2] = 0x8B000C00u | ((uint32_t)xT << 16) | ((uint32_t)xD << 5) | (uint32_t)xD;
+        return;
+    }
+}
+
+// 同一份基址拷了两次，中间只做了存储和加载，第二次是空的。
+static void a64_drop_repeat_mov(TB_CGEmitter* e) {
+    if (e->count < 16 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { lim = i + 1; break; }
+    if (lim > 1024 || lim < 4) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    for (int i = 0; i + 3 < lim; i++) {
+        uint32_t mv = w[i];
+        if ((mv & 0xFFE0FFE0u) != 0xAA0003E0u || w[i + 3] != mv) continue;
+        int xD = (int)(mv & 31u);
+        int xS = (int)((mv >> 16) & 31u);
+        if (xD == 31 || xS == 31 || xD == xS) continue;
+        uint32_t st = w[i + 1];
+        uint32_t stu = st & 0xFFE00C00u;
+        bool store = (st & 0xFFC00000u) == 0xF9000000u || stu == 0xF8000000u;
+        if (!store || (int)((st >> 5) & 31u) != xD) continue;
+        uint32_t ld = w[i + 2];
+        uint32_t ldu = ld & 0xFFE00C00u;
+        bool load = (ld & 0xFFC00000u) == 0xF9400000u || ldu == 0xF8400000u;
+        if (!load || (int)(ld & 31u) == xD) continue;
+        bool aimed = false;
+        for (int k = 0; k < lim; k++) {
+            uint32_t insn = w[k];
+            int tgt = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(k, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(k, insn, true);
+            if (tgt > i && tgt <= i + 3) aimed = true;
+        }
+        if (aimed) continue;
+        int nins = nall;
+        a64_delete_insns(e, &nins, i + 3, 1);
+        return;
+    }
+}
+
+// fmov 的结果立刻存进栈又读进另一个标量。下一条覆盖这个槽之前没有分支。
+static void a64_fold_adj_slot(TB_CGEmitter* e) {
+    if (e->count < 16 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { lim = i + 1; break; }
+    if (lim > 1024 || lim < 6) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    for (int i = 0; i + 5 < lim; i++) {
+        uint32_t mv = w[i];
+        if ((mv & 0xFFFFFC00u) != 0x1E204000u) continue;
+        int sD = (int)(mv & 31u);
+        int sN = (int)((mv >> 5) & 31u);
+        if (sD == sN) continue;
+        uint32_t st = w[i + 1];
+        if ((st & 0xFFE00C00u) != 0xBC000000u) continue;
+        if ((int)(st & 31u) != sD || ((st >> 5) & 31u) != 31u) continue;
+        int off = a64_ldur_off(st);
+        uint32_t ld = w[i + 2];
+        if ((ld & 0xFFE00C00u) != 0xBC400000u) continue;
+        if (((ld >> 5) & 31u) != 31u || a64_ldur_off(ld) != off) continue;
+        int sT = (int)(ld & 31u);
+        if (sT == sD) continue;
+        int kill = -1;
+        for (int j = i + 3; j < lim && j < i + 8; j++) {
+            uint32_t n = w[j];
+            if ((n & 0xFC000000u) == 0x14000000u || (n & 0xFF000010u) == 0x54000000u ||
+                (n & 0xFC000000u) == 0x94000000u) break;
+            if ((n & 0xFFE00C00u) == 0xBC400000u && ((n >> 5) & 31u) == 31u && a64_ldur_off(n) == off) break;
+            if ((n & 0xFFE00C00u) == 0xBC000000u && ((n >> 5) & 31u) == 31u && a64_ldur_off(n) == off) {
+                kill = j;
+                break;
+            }
+        }
+        if (kill < 0) continue;
+        bool aimed = false;
+        for (int k = 0; k < lim; k++) {
+            uint32_t insn = w[k];
+            int tgt = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(k, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(k, insn, true);
+            if (tgt > i && tgt <= i + 2) aimed = true;
+        }
+        if (aimed) continue;
+        w[i + 2] = 0x1E204000u | ((uint32_t)sD << 5) | (uint32_t)sT;
+        int nins = nall;
+        a64_delete_insns(e, &nins, i + 1, 1);
+        return;
+    }
+}
+
+// 调用参数经 s15 倒一手。中间只允许不读它的整数移动，遇到 bl 就停。
+static void a64_fold_dead_copy(TB_CGEmitter* e) {
+    if (e->count < 16 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { lim = i + 1; break; }
+    if (lim > 1024 || lim < 3) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    for (int i = 0; i + 2 < lim; ) {
+        uint32_t prod = w[i];
+        uint32_t mv = w[i + 1];
+        bool fmov = (prod & 0xFFFFFC00u) == 0x1E270000u;
+        bool ldur = (prod & 0xFFE00C00u) == 0xBC400000u;
+        if (!fmov && !ldur) { i++; continue; }
+        int sT = (int)(prod & 31u);
+        if ((mv & 0xFFE0FC00u) != 0x4EA01C00u) { i++; continue; }
+        int vN = (int)((mv >> 5) & 31u);
+        int vM = (int)((mv >> 16) & 31u);
+        int vD = (int)(mv & 31u);
+        if (vN != vM || vN != sT || vD == sT) { i++; continue; }
+        int redef_at = -1;
+        for (int j = i + 2; j < lim && j < i + 6; j++) {
+            uint32_t nxt = w[j];
+            if ((nxt & 0xFC000000u) == 0x94000000u || (nxt & 0xFC000000u) == 0x14000000u ||
+                (nxt & 0xFF000010u) == 0x54000000u) break;
+            bool writes = ((nxt & 0xFFFFFC00u) == 0x1E270000u || (nxt & 0xFFE00C00u) == 0xBC400000u ||
+                           (nxt & 0xFFC00000u) == 0xBD400000u) && (int)(nxt & 31u) == sT;
+            if (writes) { redef_at = j; break; }
+            bool gpr = (nxt & 0xFFC0FC00u) == 0xAA000000u || (nxt & 0xFFE00C00u) == 0xF8400000u ||
+                       (nxt & 0xFFC00000u) == 0xF9400000u || (nxt & 0xFFE00C00u) == 0xF8000000u ||
+                       (nxt & 0xFFC00000u) == 0xF9000000u;
+            if (!gpr) break;
+        }
+        if (redef_at < 0) { i++; continue; }
+        bool aimed = false;
+        for (int k = 0; k < nall; k++) {
+            uint32_t insn = w[k];
+            int at = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) at = a64_b_target(k, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) at = a64_b_target(k, insn, true);
+            if (at == i + 1) aimed = true;
+        }
+        if (aimed) { i++; continue; }
+        if (fmov) {
+            int wn = (int)((prod >> 5) & 31u);
+            w[i] = 0x1E270000u | ((uint32_t)wn << 5) | (uint32_t)vD;
+        } else {
+            w[i] = (prod & ~31u) | (uint32_t)vD;
+        }
+        int nins = nall;
+        a64_delete_insns(e, &nins, i + 1, 1);
+        w = (uint32_t*)e->data;
+        nall = nins;
+        lim--;
+        i++;
+    }
+}
+
+// add xD, xD, #1 之后立刻存进栈，比较、条件跳，落下来又把同一槽读回 xD。槽留下。
+static void a64_drop_live_reload(TB_CGEmitter* e) {
+    if (e->count < 24 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    int end = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { if (lim == nall) lim = i + 1; end = i + 1; }
+    if (lim > 1024 || end > 1024 || lim < 5) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    for (int i = 0; i + 4 < lim; i++) {
+        uint32_t add = w[i];
+        if ((add & 0xFF800000u) != 0x91000000u || ((add >> 22) & 1u) != 0) continue;
+        if (((add >> 10) & 0xFFFu) != 1u) continue;
+        int xD = (int)(add & 31u);
+        if (xD == 31 || ((add >> 5) & 31u) != (uint32_t)xD) continue;
+        uint32_t st = w[i + 1];
+        if ((st & 0xFFE00C00u) != 0xF8000000u || ((st >> 5) & 31u) != 31u) continue;
+        if ((int)(st & 31u) != xD) continue;
+        int off = a64_ldur_off(st);
+        uint32_t cmp = w[i + 2];
+        if ((cmp & 0xFF00001Fu) != 0xF100001Fu || ((cmp >> 22) & 1u) != 0) continue;
+        if (((cmp >> 5) & 31u) != (uint32_t)xD) continue;
+        uint32_t br = w[i + 3];
+        if ((br & 0xFF000010u) != 0x54000000u) continue;
+        if (a64_b_target(i + 3, br, true) == i + 4) continue;
+        uint32_t ld = w[i + 4];
+        if ((ld & 0xFFE00C00u) != 0xF8400000u || ((ld >> 5) & 31u) != 31u) continue;
+        if ((int)(ld & 31u) != xD || a64_ldur_off(ld) != off) continue;
+        bool dk = false;
+        int def = a64_gpr_def2(cmp, &dk);
+        if (!dk || def == xD) continue;
+        dk = false;
+        def = a64_gpr_def2(br, &dk);
+        if (!dk || def == xD) continue;
+        bool aimed = false;
+        for (int k = 0; k < end; k++) {
+            uint32_t insn = w[k];
+            int at = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) at = a64_b_target(k, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) at = a64_b_target(k, insn, true);
+            if (at == i + 4) aimed = true;
+        }
+        if (aimed) continue;
+        int nins = nall;
+        a64_delete_insns(e, &nins, i + 4, 1);
+        return;
+    }
+}
+
+// stur xT, [sp, #imm] 的下一条就是 ldur xU, [sp, #imm]。存储留下，读回收成 mov。
+static void a64_fold_adj_gpr(TB_CGEmitter* e) {
+    if (e->count < 16 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    int end = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { if (lim == nall) lim = i + 1; end = i + 1; }
+    if (lim > 1024 || end > 1024 || lim < 2) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    for (int i = 0; i + 1 < lim; i++) {
+        uint32_t st = w[i];
+        uint32_t ld = w[i + 1];
+        if ((st & 0xFFE00C00u) != 0xF8000000u || (ld & 0xFFE00C00u) != 0xF8400000u) continue;
+        if (((st >> 5) & 31u) != 31u || ((ld >> 5) & 31u) != 31u) continue;
+        if (a64_ldur_off(st) != a64_ldur_off(ld)) continue;
+        int xT = (int)(st & 31u);
+        int xU = (int)(ld & 31u);
+        if (xT == 31 || xU == 31 || xT == xU) continue;
+        bool aimed = false;
+        for (int k = 0; k < end; k++) {
+            uint32_t insn = w[k];
+            int at = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) at = a64_b_target(k, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) at = a64_b_target(k, insn, true);
+            if (at == i + 1) aimed = true;
+        }
+        if (aimed) continue;
+        w[i + 1] = 0xAA0003E0u | ((uint32_t)xT << 16) | (uint32_t)xU;
+        return;
+    }
+}
+
+// 存活字节在子弹指针 +0x14。死弹把这个加放进 ldrb；活弹才补上那份地址。
+static void a64_fold_alive_disp(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int lim = nall;
+    for (int i = 0; i < nall; i++) if (w[i] == 0xD65F03C0u) { lim = i + 1; break; }
+    if (lim > 1024) return;
+    for (int i = 0; i < lim; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    for (int i = 0; i + 5 < lim; i++) {
+        uint32_t addp = w[i];
+        if ((addp & 0xFFE0FC00u) != 0x8B000000u) continue;
+        int xP = (int)(addp & 31u);
+        int xBn = (int)((addp >> 5) & 31u);
+        if (xP == 31 || xP == xBn) continue;
+        uint32_t addi = w[i + 1];
+        if ((addi & 0xFF000000u) != 0x91000000u || ((addi >> 22) & 1u)) continue;
+        if (((addi >> 10) & 0xFFFu) != 0x14u) continue;
+        int xA = (int)(addi & 31u);
+        if (((addi >> 5) & 31u) != (uint32_t)xP || xA == xP || xA == 31) continue;
+        uint32_t lb = w[i + 2];
+        if ((lb & 0xFFC00000u) != 0x39400000u || ((lb >> 10) & 0xFFFu) != 0) continue;
+        if (((lb >> 5) & 31u) != (uint32_t)xA) continue;
+        int wB = (int)(lb & 31u);
+        uint32_t cmp = w[i + 3];
+        if ((cmp & 0xFF00001Fu) != 0x7100001Fu || ((cmp >> 22) & 1u)) continue;
+        if (((cmp >> 10) & 0xFFFu) != 0 || ((cmp >> 5) & 31u) != (uint32_t)wB) continue;
+        uint32_t br = w[i + 4];
+        if ((br & 0xFF000010u) != 0x54000000u) continue;
+        int ht = a64_b_target(i + 4, br, true);
+        if (ht < 0 || ht >= i) continue;
+        uint32_t hd = w[ht];
+        if ((hd & 0xFF800000u) != 0x91000000u || ((hd >> 22) & 1u) || ((hd >> 10) & 0xFFFu) != 1u) continue;
+        if (((hd >> 5) & 31u) != (hd & 31u)) continue;
+        bool aimed = false;
+        for (int k = 0; k < lim; k++) {
+            uint32_t insn = w[k];
+            int tgt = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(k, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(k, insn, true);
+            if (tgt >= i + 1 && tgt <= i + 5) aimed = true;
+        }
+        if (aimed) continue;
+        w[i + 2] = (lb & ~((0xFFFu << 10) | (31u << 5))) | ((uint32_t)0x14u << 10) | ((uint32_t)xP << 5);
+        int nins = nall;
+        a64_delete_insns(e, &nins, i + 1, 1);
+        w = (uint32_t*)e->data;
+        a64_insert_insns(e, &nins, i + 4, &addi, 1);
+        (void)w;
+        return;
+    }
+}
+
+static void a64_park_spills(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nall = (int)(e->count / 4);
+    if (nall > 4096) return;
+    uint32_t* w = (uint32_t*)e->data;
+    int frame = -1;
+    for (int i = 0; i < nall && i < 4; i++) {
+        if ((w[i] & 0xFFC003FFu) == 0xD10003FFu) {
+            int sh = (int)((w[i] >> 22) & 1u);
+            int imm = (int)((w[i] >> 10) & 0xFFFu);
+            frame = sh ? imm << 12 : imm;
+            break;
+        }
+    }
+    if (frame < 32 || frame > 4096) return;
+    int nins = nall;
+    for (int i = 0; i < nall; i++) {
+        if (w[i] != 0xD65F03C0u) continue;
+        bool jumped = false;
+        for (int j = 0; j < i; j++) {
+            uint32_t br = w[j];
+            int tgt = -1;
+            if ((br & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(j, br, false);
+            else if ((br & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(j, br, true);
+            if (tgt > i) jumped = true;
+        }
+        if (!jumped) { nins = i + 1; break; }
+    }
+    if (nins > 1024) return;
+    bool any_br = false;
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD63F0000u) {
+            return;
+        }
+        if ((insn & 0xFFFFFC1Fu) == 0xD61F0000u) return;
+    }
+    if (any_br) {
+        uint8_t* reach = calloc((size_t)nall, 1);
+        int* queue = calloc((size_t)nall, sizeof(int));
+        if (!reach || !queue) { free(reach); free(queue); return; }
+        int qn = 0;
+        queue[qn++] = 0;
+        reach[0] = 1;
+        int far = 0;
+        for (int qh = 0; qh < qn; qh++) {
+            int at = queue[qh];
+            if (at > far) far = at;
+            uint32_t insn = w[at];
+            int nxt[A64_MAX_BR_TGTS + 1];
+            int nn = 0;
+            if ((insn & 0xFFFFFC1Fu) == 0xD61F0000u) {
+                A64BrSite* s = a64_br_site_at(at);
+                for (int k = 0; s && k < s->nt; k++) nxt[nn++] = a64_label_insn(e, s->labels[k]);
+            } else if ((insn & 0xFC000000u) == 0x14000000u) {
+                nxt[nn++] = a64_b_target(at, insn, false);
+            } else if ((insn & 0xFF000010u) == 0x54000000u) {
+                nxt[nn++] = at + 1;
+                nxt[nn++] = a64_b_target(at, insn, true);
+            } else if (insn != 0xD65F03C0u && at + 1 < nall) {
+                nxt[nn++] = at + 1;
+            }
+            for (int k = 0; k < nn; k++) {
+                int t = nxt[k];
+                if (t < 0 || t >= nall || reach[t]) continue;
+                reach[t] = 1;
+                queue[qn++] = t;
+            }
+        }
+        free(reach);
+        free(queue);
+        nins = far + 1;
+        if (nins > 1024) return;
+    }
+
+    int save_at[32], rest_at[32], save_off[32];
+    for (int r = 0; r < 32; r++) { save_at[r] = -1; rest_at[r] = -1; save_off[r] = -1; }
+    int touches[32];
+    for (int r = 0; r < 32; r++) touches[r] = 0;
+    for (int i = 0; i < nins; i++) {
+        for (int r = 19; r <= 28; r++) {
+            bool known = false;
+            if (a64_body_touch(w[i], r, &known)) touches[r]++;
+        }
+    }
+    int park[8], npk = 0;
+    for (int r = 19; r <= 28 && npk < 8; r++) {
+        if (touches[r] != 2) continue;
+        int st = -1, ld = -1, off = -1;
+        for (int i = 0; i < nins; i++) {
+            int rt, o, is_st;
+            if (!a64_sp_x8(w[i], &rt, &o, &is_st) || rt != r) continue;
+            if (is_st && st < 0) { st = i; off = o; }
+            else if (!is_st && ld < 0) ld = i;
+            else { st = -2; break; }
+        }
+        if (st < 0 || ld < st || off < 0) continue;
+        save_at[r] = st; rest_at[r] = ld; save_off[r] = off;
+        park[npk++] = r;
+    }
+
+    uint8_t* ban = calloc((size_t)frame, 1);
+    if (!ban) return;
+    int spb[32], sok[32], cv[32], cok[32];
+    for (int r = 0; r < 32; r++) { sok[r] = 0; cok[r] = 0; }
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        int rt = (int)(insn & 31u);
+        int rn = (int)((insn >> 5) & 31u);
+        int mark_at = -1, mark_sz = 0;
+        if (rn != 31 && sok[rn]) { mark_at = spb[rn]; mark_sz = 16; }
+        if ((insn & 0x7F800000u) == 0x52800000u && ((insn >> 21) & 3u) == 0) {
+            cok[rt] = 1; cv[rt] = (int)((insn >> 5) & 0xFFFF);
+            sok[rt] = 0;
+        } else if ((insn & 0xFFC00000u) == 0x91000000u && rn == 31 && rt != 31) {
+            int imm = (int)((insn >> 10) & 0xFFFu);
+            if ((insn >> 22) & 1u) imm <<= 12;
+            sok[rt] = 1; spb[rt] = imm; cok[rt] = 0;
+        } else if ((insn & 0x7FE00000u) == 0x8B200000u && rn == 31) {
+            int rm = (int)((insn >> 16) & 31u);
+            if (cok[rm]) { sok[rt] = 1; spb[rt] = cv[rm]; cok[rt] = 0; }
+            else { sok[rt] = 0; cok[rt] = 0; }
+        } else if ((insn & 0xFFC00000u) == 0x91000000u && rn != 31 && sok[rn] && rt != 31) {
+            int imm = (int)((insn >> 10) & 0xFFFu);
+            if ((insn >> 22) & 1u) imm <<= 12;
+            sok[rt] = 1; spb[rt] = spb[rn] + imm; cok[rt] = 0;
+        } else {
+            bool known = false;
+            int def = a64_gpr_def2(insn, &known);
+            uint32_t sc = insn & 0xFFC00000u;
+            if (!known && (sc == 0x3D800000u || sc == 0x3DC00000u)) { def = -1; known = true; }
+            if (!known && (sc == 0x39000000u || sc == 0x79000000u ||
+                           (insn & 0xFFE00C00u) == 0x38000000u || (insn & 0xFFE00C00u) == 0x78000000u ||
+                           (insn & 0xFFFFFC00u) == 0x93407C00u)) {
+                def = rt; known = true;
+            }
+            if (known && def >= 0 && def < 31) { sok[def] = 0; cok[def] = 0; }
+            else if (!known) {
+                for (int r = 0; r < 31; r++) { sok[r] = 0; cok[r] = 0; }
+            }
+        }
+        int mrt, moff, mst;
+        if (a64_sp_x8(insn, &mrt, &moff, &mst)) { /* 8 字节槽单独统计 */ }
+        else if (((insn >> 5) & 31u) == 31u) {
+            int off = -1, sz = 0;
+            uint32_t sc = insn & 0xFFC00000u;
+            uint32_t uu = insn & 0xFFE00C00u;
+            if (sc == 0xB9000000u || sc == 0xB9400000u) {
+                off = (int)(((insn >> 10) & 0xFFFu) * 4u); sz = 4;
+            } else if (sc == 0x39000000u || sc == 0x39400000u) {
+                off = (int)((insn >> 10) & 0xFFFu); sz = 1;
+            } else if (sc == 0x79000000u || sc == 0x79400000u) {
+                off = (int)(((insn >> 10) & 0xFFFu) * 2u); sz = 2;
+            } else if (uu == 0x38000000u || uu == 0x38400000u || uu == 0x78000000u || uu == 0x78400000u) {
+                int imm = (int)((insn >> 12) & 0x1FFu);
+                if (imm & 0x100) imm |= ~0x1FF;
+                off = imm; sz = (uu == 0x78000000u || uu == 0x78400000u) ? 2 : 1;
+            } else if (uu == 0xB8000000u || uu == 0xB8400000u) {
+                int imm = (int)((insn >> 12) & 0x1FFu);
+                if (imm & 0x100) imm |= ~0x1FF;
+                off = imm; sz = 4;
+            } else if (sc == 0x3D800000u || sc == 0x3DC00000u) {
+                off = (int)(((insn >> 10) & 0xFFFu) * 16u); sz = 16;
+            } else if (uu == 0x3C800000u || uu == 0x3CC00000u) {
+                int imm = (int)((insn >> 12) & 0x1FFu);
+                if (imm & 0x100) imm |= ~0x1FF;
+                off = imm; sz = 16;
+            }
+            if (sz) { mark_at = off; mark_sz = sz; }
+        }
+        if (mark_sz && mark_at >= 0 && mark_at < frame) {
+            int hi = mark_at + mark_sz;
+            if (hi > frame) hi = frame;
+            for (int b = mark_at; b < hi; b++) ban[b] = 1;
+        }
+    }
+
+    enum { MAXA = 640, MAXS = 32 };
+    struct { int at, off, rt, st; } acc[MAXA];
+    int na = 0;
+    for (int i = 0; i < nins; i++) {
+        int rt, off, st;
+        if (!a64_sp_x8(w[i], &rt, &off, &st)) continue;
+        if (off < 0 || off + 8 > frame || (off & 7)) continue;
+        if (na < MAXA) { acc[na].at = i; acc[na].off = off; acc[na].rt = rt; acc[na].st = st; na++; }
+    }
+    int soff[MAXS], scnt[MAXS], ns = 0;
+    for (int a = 0; a < na; a++) {
+        bool banned = false;
+        for (int b = acc[a].off; b < acc[a].off + 8; b++) if (ban[b]) banned = true;
+        for (int r = 19; r <= 28; r++) if (save_off[r] == acc[a].off) banned = true;
+        if (banned) continue;
+        int s = -1;
+        for (int k = 0; k < ns; k++) if (soff[k] == acc[a].off) s = k;
+        if (s < 0 && ns < MAXS) { soff[ns] = acc[a].off; scnt[ns] = 0; s = ns++; }
+        if (s >= 0) scnt[s]++;
+    }
+
+    int bstart[1024];
+    int nb = 0;
+    bstart[nb++] = 0;
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        int tgt = -1, fall = 0;
+        if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(i, insn, false);
+        else if ((insn & 0xFF000010u) == 0x54000000u) { tgt = a64_b_target(i, insn, true); fall = 1; }
+        else if ((insn & 0xFFFFFC1Fu) == 0xD61F0000u) {
+            A64BrSite* s = a64_br_site_at(i);
+            if (s) {
+                for (int k = 0; k < s->nt; k++) {
+                    int bt = a64_label_insn(e, s->labels[k]);
+                    if (bt < 0 || bt >= nins) continue;
+                    bool seen = false;
+                    for (int b = 0; b < nb; b++) if (bstart[b] == bt) seen = true;
+                    if (!seen && nb < 1024) bstart[nb++] = bt;
+                }
+            }
+        } else if (insn == 0xD65F03C0u) { }
+        else fall = 1;
+        if ((insn & 0xFFFFFC1Fu) == 0xD61F0000u && i + 1 < nins) {
+            bool seen = false;
+            for (int b = 0; b < nb; b++) if (bstart[b] == i + 1) seen = true;
+            if (!seen && nb < 1024) bstart[nb++] = i + 1;
+        }
+        if (tgt >= 0 && tgt < nins) {
+            bool seen = false;
+            for (int b = 0; b < nb; b++) if (bstart[b] == tgt) seen = true;
+            if (!seen && nb < 1024) bstart[nb++] = tgt;
+        }
+        if ((tgt >= 0 || insn == 0xD65F03C0u) && i + 1 < nins) {
+            bool seen = false;
+            for (int b = 0; b < nb; b++) if (bstart[b] == i + 1) seen = true;
+            if (!seen && nb < 1024) bstart[nb++] = i + 1;
+        }
+        (void)fall;
+    }
+    for (int a = 0; a < nb; a++) for (int b = a + 1; b < nb; b++) if (bstart[b] < bstart[a]) {
+        int t = bstart[a]; bstart[a] = bstart[b]; bstart[b] = t;
+    }
+    int* bid = calloc((size_t)nins, sizeof(int));
+    if (!bid) { free(ban); return; }
+    for (int b = 0; b < nb; b++) {
+        int hi = b + 1 < nb ? bstart[b + 1] : nins;
+        for (int i = bstart[b]; i < hi && i < nins; i++) bid[i] = b;
+    }
+
+    int used_park = 0;
+    for (int s = 0; s < ns && used_park < npk; s++) {
+        int best = s;
+        for (int k = s + 1; k < ns; k++) if (scnt[k] > scnt[best]) best = k;
+        int tmp = soff[s]; soff[s] = soff[best]; soff[best] = tmp;
+        tmp = scnt[s]; scnt[s] = scnt[best]; scnt[best] = tmp;
+        if (scnt[s] < 3) break;
+        int off = soff[s];
+        int nst = 0, nld = 0;
+        for (int a = 0; a < na; a++) if (acc[a].off == off) {
+            if (acc[a].st) nst++; else nld++;
+        }
+        if (nst < 1 || nld < 1) continue;
+        uint8_t* gen = calloc((size_t)nb, 1);
+        uint8_t* ent = calloc((size_t)nb, 1);
+        uint8_t* exi = calloc((size_t)nb, 1);
+        if (!gen || !ent || !exi) { free(gen); free(ent); free(exi); continue; }
+        for (int a = 0; a < na; a++) if (acc[a].off == off && acc[a].st) gen[bid[acc[a].at]] = 1;
+        // 从“已经写过”出发往下收。循环回边自己不再存，但值还在寄存器里，
+        // 最小不动点会把这种槽判死。入口块仍然从“没写过”开始。
+        for (int b = 0; b < nb; b++) { ent[b] = b == 0 ? 0 : 1; exi[b] = ent[b] || gen[b]; }
+        for (int it = 0; it < nb; it++) {
+            int changed = 0;
+            for (int b = 0; b < nb; b++) {
+                bool all = true; int np = 0;
+                for (int p = 0; p < nb; p++) {
+                    int ph = p + 1 < nb ? bstart[p + 1] : nins;
+                    int last = ph - 1;
+                    if (last < bstart[p] || last >= nins) continue;
+                    uint32_t insn = w[last];
+                    int goes = a64_edge_to(e, insn, last, bstart[b]);
+                    if (goes) { np++; if (!exi[p]) all = false; }
+                }
+                int en = (b == 0) ? 0 : (np == 0 ? 1 : all);
+                int ex = en || gen[b];
+                if (en != ent[b] || ex != exi[b]) changed = 1;
+                ent[b] = en; exi[b] = ex;
+            }
+            if (!changed) break;
+        }
+        bool ok = true;
+        for (int b = 0; b < nb && ok; b++) {
+            int hi = b + 1 < nb ? bstart[b + 1] : nins;
+            int flag = ent[b];
+            for (int i = bstart[b]; i < hi; i++) {
+                for (int a = 0; a < na; a++) if (acc[a].at == i && acc[a].off == off) {
+                    if (!acc[a].st && !flag) ok = false;
+                    if (acc[a].st) flag = 1;
+                    if (acc[a].rt == 31 && !acc[a].st) ok = false;
+                }
+            }
+        }
+        free(gen); free(ent); free(exi);
+        if (!ok) continue;
+        int r = park[used_park];
+        bool placed = true;
+        for (int a = 0; a < na; a++) if (acc[a].off == off) {
+            if (acc[a].at <= save_at[r] || acc[a].at >= rest_at[r]) placed = false;
+        }
+        if (!placed) continue;
+        for (int a = 0; a < na; a++) if (acc[a].off == off) {
+            if (acc[a].st) w[acc[a].at] = 0xAA0003E0u | ((uint32_t)acc[a].rt << 16) | (uint32_t)r;
+            else w[acc[a].at] = 0xAA0003E0u | ((uint32_t)r << 16) | (uint32_t)acc[a].rt;
+        }
+        used_park++;
+    }
+
+    // 同样的空位，换成只被成对保存/恢复的 q8–q15，装 4 字节浮点槽。
+    int fp_bad = 0;
+    int ftouch[32];
+    for (int r = 0; r < 32; r++) ftouch[r] = 0;
+    for (int i = 0; i < nins && !fp_bad; i++) {
+        for (int v = 8; v <= 15; v++) {
+            int t = a64_fp_touch(w[i], v);
+            if (t < 0) fp_bad = 1;
+            else ftouch[v] += t;
+        }
+    }
+    int fpark[8], nfp = 0;
+    int fsave[32], frest[32];
+    for (int r = 0; r < 32; r++) { fsave[r] = -1; frest[r] = -1; }
+    if (!fp_bad) {
+        for (int v = 8; v <= 15 && nfp < 8; v++) {
+            if (ftouch[v] != 2) continue;
+            int st = -1, ld = -1;
+            for (int i = 0; i < nins; i++) {
+                int rt, off, is_st;
+                if (!a64_sp_q(w[i], &rt, &off, &is_st) || rt != v) continue;
+                if (is_st && st < 0) st = i;
+                else if (!is_st && ld < 0) ld = i;
+                else { st = -2; break; }
+            }
+            if (st >= 0 && ld > st) { fsave[v] = st; frest[v] = ld; fpark[nfp++] = v; }
+        }
+    }
+    if (nfp > 0) {
+        enum { MAXF = 512, MAXFS = 24 };
+        struct { int at, off, rt, st; } facc[MAXF];
+        int nf = 0;
+        for (int i = 0; i < nins; i++) {
+            int rt, off, is_st;
+            if (!a64_sp_s(w[i], &rt, &off, &is_st)) continue;
+            if (off < 0 || off + 4 > frame) continue;
+            int overlap = 0;
+            for (int b = off; b < off + 4 && b < frame; b++) if (ban[b]) overlap = 1;
+            for (int a = 0; a < na; a++) {
+                if (acc[a].off < off + 4 && acc[a].off + 8 > off) overlap = 1;
+            }
+            if (overlap) continue;
+            if (nf < MAXF) { facc[nf].at = i; facc[nf].off = off; facc[nf].rt = rt; facc[nf].st = is_st; nf++; }
+        }
+        int foff[MAXFS], fcnt[MAXFS], nfs = 0;
+        for (int a = 0; a < nf; a++) {
+            int s = -1;
+            for (int k = 0; k < nfs; k++) if (foff[k] == facc[a].off) s = k;
+            if (s < 0 && nfs < MAXFS) { foff[nfs] = facc[a].off; fcnt[nfs] = 0; s = nfs++; }
+            if (s >= 0) fcnt[s]++;
+        }
+        int used_fp = 0;
+        for (int s = 0; s < nfs && used_fp < nfp; s++) {
+            int best = s;
+            for (int k = s + 1; k < nfs; k++) if (fcnt[k] > fcnt[best]) best = k;
+            int tmp = foff[s]; foff[s] = foff[best]; foff[best] = tmp;
+            tmp = fcnt[s]; fcnt[s] = fcnt[best]; fcnt[best] = tmp;
+            if (fcnt[s] < 3) break;
+            int off = foff[s];
+            uint8_t* gen = calloc((size_t)nb, 1);
+            uint8_t* ent = calloc((size_t)nb, 1);
+            uint8_t* exi = calloc((size_t)nb, 1);
+            if (!gen || !ent || !exi) { free(gen); free(ent); free(exi); break; }
+            int nst = 0, nld = 0;
+            for (int a = 0; a < nf; a++) if (facc[a].off == off) {
+                if (facc[a].st) { nst++; gen[bid[facc[a].at]] = 1; }
+                else nld++;
+            }
+            if (nst < 1 || nld < 1) { free(gen); free(ent); free(exi); continue; }
+            for (int b = 0; b < nb; b++) { ent[b] = b == 0 ? 0 : 1; exi[b] = ent[b] || gen[b]; }
+            for (int it = 0; it < nb; it++) {
+                int changed = 0;
+                for (int b = 0; b < nb; b++) {
+                    bool all = true; int np = 0;
+                    for (int p = 0; p < nb; p++) {
+                        int ph = p + 1 < nb ? bstart[p + 1] : nins;
+                        int last = ph - 1;
+                        if (last < bstart[p] || last >= nins) continue;
+                        uint32_t insn = w[last];
+                        int goes = a64_edge_to(e, insn, last, bstart[b]);
+                        if (goes) { np++; if (!exi[p]) all = false; }
+                    }
+                    int en = (b == 0) ? 0 : (np == 0 ? 1 : all);
+                    int ex = en || gen[b];
+                    if (en != ent[b] || ex != exi[b]) changed = 1;
+                    ent[b] = en; exi[b] = ex;
+                }
+                if (!changed) break;
+            }
+            bool ok = true;
+            for (int b = 0; b < nb && ok; b++) {
+                int hi = b + 1 < nb ? bstart[b + 1] : nins;
+                int flag = ent[b];
+                for (int i = bstart[b]; i < hi; i++) {
+                    for (int a = 0; a < nf; a++) if (facc[a].at == i && facc[a].off == off) {
+                        if (!facc[a].st && !flag) ok = false;
+                        if (facc[a].st) flag = 1;
+                    }
+                }
+            }
+            free(gen); free(ent); free(exi);
+            if (!ok) continue;
+            int v = fpark[used_fp];
+            bool placed = true;
+            for (int a = 0; a < nf; a++) if (facc[a].off == off) {
+                if (facc[a].at <= fsave[v] || facc[a].at >= frest[v]) placed = false;
+            }
+            if (!placed) continue;
+            for (int a = 0; a < nf; a++) if (facc[a].off == off) {
+                int src = facc[a].st ? facc[a].rt : v;
+                int dst = facc[a].st ? v : facc[a].rt;
+                w[facc[a].at] = 0x1E204000u | ((uint32_t)src << 5) | (uint32_t)dst;
+            }
+            used_fp++;
+        }
+    }
+
+    // 一个被调用者保存寄存器在整段函数里都没出现。序言里补上保存，
+    // 尾声里补上恢复，中间用它装一个 8 字节溢出槽。保存就写进这个槽：
+    // 槽里的值改由寄存器带着走，调用不会弄丢它。
+    int add_at = -1;
+    for (int i = nins - 1; i >= 0; i--) {
+        uint32_t insn = w[i];
+        if ((insn & 0xFFC003FFu) != 0x910003FFu) continue;
+        int sh = (int)((insn >> 22) & 1u);
+        int imm = (int)((insn >> 10) & 0xFFFu);
+        int bytes = sh ? imm << 12 : imm;
+        if (bytes == frame) { add_at = i; break; }
+    }
+    bool prologue_targeted = false;
+    for (int i = 0; i < nins && !prologue_targeted; i++) {
+        uint32_t insn = w[i];
+        int tgt = -1;
+        if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(i, insn, false);
+        else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(i, insn, true);
+        if (tgt == 1) prologue_targeted = true;
+    }
+    int fresh[4], nfresh = 0;
+    bool gpr_closed = add_at > 1 && !prologue_targeted;
+    for (int i = 0; i < nins && gpr_closed; i++) {
+        bool known = false;
+        a64_gpr_def2(w[i], &known);
+        if (!known) gpr_closed = false;
+        else {
+            a64_gpr_read2(w[i], 0, &known);
+            if (!known) gpr_closed = false;
+        }
+    }
+    if (gpr_closed) {
+        for (int r = 19; r <= 28 && nfresh < 4; r++) {
+            if (touches[r] == 0) fresh[nfresh++] = r;
+        }
+    }
+    if (gpr_closed && nfresh > 0) {
+        int protect[16], nprot = 0;
+        for (int r = 19; r <= 28; r++) if (save_off[r] >= 0 && nprot < 16) protect[nprot++] = save_off[r];
+        for (int i = 0; i < nins; i++) {
+            int rt, off, st;
+            if (!a64_sp_x8(w[i], &rt, &off, &st) || rt != 30) continue;
+            bool seen = false;
+            for (int k = 0; k < nprot; k++) if (protect[k] == off) seen = true;
+            if (!seen && nprot < 16) protect[nprot++] = off;
+        }
+        enum { MAXN = 640, MAXNS = 24 };
+        struct { int at, off, rt, st; } nacc[MAXN];
+        int nna = 0;
+        for (int i = 0; i < nins; i++) {
+            int rt, off, st;
+            if (!a64_sp_x8(w[i], &rt, &off, &st)) continue;
+            if (off < 0 || off + 8 > frame || (off & 7)) continue;
+            if (nna < MAXN) { nacc[nna].at = i; nacc[nna].off = off; nacc[nna].rt = rt; nacc[nna].st = st; nna++; }
+        }
+        int noff[MAXNS], ncnt[MAXNS], nns = 0;
+        for (int a = 0; a < nna; a++) {
+            bool bad = false;
+            for (int b = nacc[a].off; b < nacc[a].off + 8 && b < frame; b++) if (ban[b]) bad = true;
+            for (int k = 0; k < nprot; k++) if (protect[k] == nacc[a].off) bad = true;
+            for (int i = 0; i < nins && !bad; i++) {
+                int rt, off, is_st;
+                if (!a64_sp_s(w[i], &rt, &off, &is_st)) continue;
+                if (off < nacc[a].off + 8 && off + 4 > nacc[a].off) bad = true;
+            }
+            if (bad) continue;
+            int s = -1;
+            for (int k = 0; k < nns; k++) if (noff[k] == nacc[a].off) s = k;
+            if (s < 0 && nns < MAXNS) { noff[nns] = nacc[a].off; ncnt[nns] = 0; s = nns++; }
+            if (s >= 0) ncnt[s]++;
+        }
+        int chosen_off[4], nchosen = 0;
+        int used_fresh = 0;
+        for (int s = 0; s < nns && used_fresh < nfresh; s++) {
+            int best = s;
+            for (int k = s + 1; k < nns; k++) if (ncnt[k] > ncnt[best]) best = k;
+            int tmp = noff[s]; noff[s] = noff[best]; noff[best] = tmp;
+            tmp = ncnt[s]; ncnt[s] = ncnt[best]; ncnt[best] = tmp;
+            if (ncnt[s] < 4) break;
+            int off = noff[s];
+            int nst = 0, nld = 0;
+            for (int a = 0; a < nna; a++) if (nacc[a].off == off) {
+                if (nacc[a].st) nst++; else nld++;
+            }
+            if (nst < 1 || nld < 1) continue;
+            uint8_t* gen = calloc((size_t)nb, 1);
+            uint8_t* ent = calloc((size_t)nb, 1);
+            uint8_t* exi = calloc((size_t)nb, 1);
+            if (!gen || !ent || !exi) { free(gen); free(ent); free(exi); break; }
+            for (int a = 0; a < nna; a++) if (nacc[a].off == off && nacc[a].st) gen[bid[nacc[a].at]] = 1;
+            for (int b = 0; b < nb; b++) { ent[b] = b == 0 ? 0 : 1; exi[b] = ent[b] || gen[b]; }
+            for (int it = 0; it < nb; it++) {
+                int changed = 0;
+                for (int b = 0; b < nb; b++) {
+                    bool all = true; int np = 0;
+                    for (int p = 0; p < nb; p++) {
+                        int ph = p + 1 < nb ? bstart[p + 1] : nins;
+                        int last = ph - 1;
+                        if (last < bstart[p] || last >= nins) continue;
+                        uint32_t insn = w[last];
+                        int goes = a64_edge_to(e, insn, last, bstart[b]);
+                        if (goes) { np++; if (!exi[p]) all = false; }
+                    }
+                    int en = (b == 0) ? 0 : (np == 0 ? 1 : all);
+                    int ex = en || gen[b];
+                    if (en != ent[b] || ex != exi[b]) changed = 1;
+                    ent[b] = en; exi[b] = ex;
+                }
+                if (!changed) break;
+            }
+            bool ok = true;
+            for (int b = 0; b < nb && ok; b++) {
+                int hi = b + 1 < nb ? bstart[b + 1] : nins;
+                int flag = ent[b];
+                for (int i = bstart[b]; i < hi; i++) {
+                    for (int a = 0; a < nna; a++) if (nacc[a].at == i && nacc[a].off == off) {
+                        if (!nacc[a].st && !flag) ok = false;
+                        if (nacc[a].st) flag = 1;
+                        if (nacc[a].rt == 31 && !nacc[a].st) ok = false;
+                    }
+                }
+            }
+            free(gen); free(ent); free(exi);
+            if (!ok) continue;
+            int r = fresh[used_fresh];
+            for (int a = 0; a < nna; a++) if (nacc[a].off == off) {
+                if (nacc[a].st) w[nacc[a].at] = 0xAA0003E0u | ((uint32_t)nacc[a].rt << 16) | (uint32_t)r;
+                else w[nacc[a].at] = 0xAA0003E0u | ((uint32_t)r << 16) | (uint32_t)nacc[a].rt;
+            }
+            chosen_off[nchosen++] = off;
+            used_fresh++;
+        }
+        if (nchosen > 0) {
+            uint32_t saves[4], rests[4];
+            for (int k = 0; k < nchosen; k++) {
+                uint32_t imm = (uint32_t)(chosen_off[k] / 8) << 10;
+                uint32_t reg = (uint32_t)fresh[k];
+                saves[k] = 0xF9000000u | imm | (31u << 5) | reg;
+                rests[k] = 0xF9400000u | imm | (31u << 5) | reg;
+            }
+            int nall = (int)(e->count / 4);
+            a64_insert_insns(e, &nall, add_at, rests, nchosen);
+            // 保存写在序言里，每条回到 add sp 的路径都得先恢复。
+            // 插入默认让原本跳到 add 的分支绕过新指令，这里把它们拉回恢复。
+            w = (uint32_t*)e->data;
+            int rest_at = add_at;
+            int add_now = add_at + nchosen;
+            for (int i = 0; i < nall; i++) {
+                if (i >= rest_at && i < add_now) continue;
+                uint32_t br = w[i];
+                int imm = 0;
+                bool cond = false;
+                if ((br & 0xFC000000u) == 0x14000000u) {
+                    imm = (int)(br & 0x3FFFFFFu);
+                    if (imm & 0x2000000) imm |= ~0x3FFFFFF;
+                } else if ((br & 0xFF000010u) == 0x54000000u) {
+                    cond = true;
+                    imm = (int)((br >> 5) & 0x7FFFFu);
+                    if (imm & 0x40000) imm |= ~0x7FFFF;
+                } else continue;
+                if (i + imm != add_now) continue;
+                int d = rest_at - i;
+                if (cond) w[i] = (br & 0xFF00001Fu) | ((uint32_t)(d & 0x7FFFF) << 5);
+                else w[i] = 0x14000000u | ((uint32_t)d & 0x03FFFFFFu);
+            }
+            a64_insert_insns(e, &nall, 1, saves, nchosen);
+            nins = nall;
+            w = (uint32_t*)e->data;
+            (void)w;
+            (void)nins;
+        }
+    }
+
+    // q8–q15 一次都没用时，补上 16 字节的保存，把纯 4 字节浮点槽改成 fmov。
+    // 保存放在序言，所以跳到 add sp 的分支要先执行恢复。
+    if (!fp_bad) {
+        w = (uint32_t*)e->data;
+        int qn = (int)(e->count / 4);
+        for (int i = 0; i < qn; i++) {
+            if (w[i] != 0xD65F03C0u) continue;
+            bool jumped = false;
+            for (int j = 0; j < i; j++) {
+                uint32_t br = w[j];
+                int tgt = -1;
+                if ((br & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(j, br, false);
+                else if ((br & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(j, br, true);
+                if (tgt > i) jumped = true;
+            }
+            if (!jumped) { qn = i + 1; break; }
+        }
+        int qadd = -1;
+        for (int i = qn - 1; i >= 0; i--) {
+            if ((w[i] & 0xFFC003FFu) != 0x910003FFu) continue;
+            int sh = (int)((w[i] >> 22) & 1u);
+            int imm = (int)((w[i] >> 10) & 0xFFFu);
+            if ((sh ? imm << 12 : imm) == frame) { qadd = i; break; }
+        }
+        bool qprolog = false;
+        for (int i = 0; i < qn && !qprolog; i++) {
+            uint32_t insn = w[i];
+            int tgt = -1;
+            if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(i, insn, false);
+            else if ((insn & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(i, insn, true);
+            if (tgt == 1) qprolog = true;
+        }
+        int freshq[4], nfreshq = 0;
+        if (any_br) qadd = -1;
+        if (qadd > 1 && !qprolog) {
+            for (int v = 8; v <= 15 && nfreshq < 4; v++) {
+                if (ftouch[v] == 0) freshq[nfreshq++] = v;
+            }
+        }
+        if (nfreshq > 0 && qn <= 1024) {
+            int qb[1024];
+            int nqb = 0;
+            qb[nqb++] = 0;
+            for (int i = 0; i < qn; i++) {
+                uint32_t insn = w[i];
+                int tgt = -1;
+                if ((insn & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(i, insn, false);
+                else if ((insn & 0xFF000010u) == 0x54000000u) { tgt = a64_b_target(i, insn, true); }
+                if (tgt >= 0 && tgt < qn) {
+                    bool seen = false;
+                    for (int b = 0; b < nqb; b++) if (qb[b] == tgt) seen = true;
+                    if (!seen && nqb < 1024) qb[nqb++] = tgt;
+                }
+                if ((tgt >= 0 || insn == 0xD65F03C0u) && i + 1 < qn) {
+                    bool seen = false;
+                    for (int b = 0; b < nqb; b++) if (qb[b] == i + 1) seen = true;
+                    if (!seen && nqb < 1024) qb[nqb++] = i + 1;
+                }
+            }
+            for (int a = 0; a < nqb; a++) for (int b = a + 1; b < nqb; b++) if (qb[b] < qb[a]) {
+                int t = qb[a]; qb[a] = qb[b]; qb[b] = t;
+            }
+            int qbid[1024];
+            for (int b = 0; b < nqb; b++) {
+                int hi = b + 1 < nqb ? qb[b + 1] : qn;
+                for (int i = qb[b]; i < hi && i < qn; i++) qbid[i] = b;
+            }
+            enum { QMAX = 512, QSLOTS = 16 };
+            struct { int at, off, rt, st; } qacc[QMAX];
+            int nqa = 0;
+            for (int i = 0; i < qn; i++) {
+                int rt, off, is_st;
+                if (!a64_sp_s(w[i], &rt, &off, &is_st)) continue;
+                if (off < 0 || off + 4 > frame || rt == 31) continue;
+                int overlap = 0;
+                for (int b = off; b < off + 4 && b < frame; b++) if (ban[b]) overlap = 1;
+                for (int a = 0; a < na; a++) {
+                    if (acc[a].off < off + 4 && acc[a].off + 8 > off) overlap = 1;
+                }
+                if (overlap) continue;
+                if (nqa < QMAX) { qacc[nqa].at = i; qacc[nqa].off = off; qacc[nqa].rt = rt; qacc[nqa].st = is_st; nqa++; }
+            }
+            int qoff[QSLOTS], qcnt[QSLOTS], nqs = 0;
+            for (int a = 0; a < nqa; a++) {
+                int s = -1;
+                for (int k = 0; k < nqs; k++) if (qoff[k] == qacc[a].off) s = k;
+                if (s < 0 && nqs < QSLOTS) { qoff[nqs] = qacc[a].off; qcnt[nqs] = 0; s = nqs++; }
+                if (s >= 0) qcnt[s]++;
+            }
+            int qhole[4], qused = 0;
+            for (int s = 0; s < nqs && qused < nfreshq; s++) {
+                int best = s;
+                for (int k = s + 1; k < nqs; k++) if (qcnt[k] > qcnt[best]) best = k;
+                int tmp = qoff[s]; qoff[s] = qoff[best]; qoff[best] = tmp;
+                tmp = qcnt[s]; qcnt[s] = qcnt[best]; qcnt[best] = tmp;
+                if (qcnt[s] < 4) break;
+                int off = qoff[s];
+                int nst = 0, nld = 0;
+                for (int a = 0; a < nqa; a++) if (qacc[a].off == off) {
+                    if (qacc[a].st) nst++; else nld++;
+                }
+                if (nst < 1 || nld < 1) continue;
+                uint8_t* gen = calloc((size_t)nqb, 1);
+                uint8_t* ent = calloc((size_t)nqb, 1);
+                uint8_t* exi = calloc((size_t)nqb, 1);
+                if (!gen || !ent || !exi) { free(gen); free(ent); free(exi); break; }
+                for (int a = 0; a < nqa; a++) if (qacc[a].off == off && qacc[a].st) gen[qbid[qacc[a].at]] = 1;
+                for (int b = 0; b < nqb; b++) { ent[b] = b == 0 ? 0 : 1; exi[b] = ent[b] || gen[b]; }
+                for (int it = 0; it < nqb; it++) {
+                    int changed = 0;
+                    for (int b = 0; b < nqb; b++) {
+                        bool all = true; int np = 0;
+                        for (int p = 0; p < nqb; p++) {
+                            int ph = p + 1 < nqb ? qb[p + 1] : qn;
+                            int last = ph - 1;
+                            if (last < qb[p] || last >= qn) continue;
+                            uint32_t insn = w[last];
+                            int goes = 0;
+                            if ((insn & 0xFC000000u) == 0x14000000u) {
+                                if (a64_b_target(last, insn, false) == qb[b]) goes = 1;
+                            } else if ((insn & 0xFF000010u) == 0x54000000u) {
+                                if (a64_b_target(last, insn, true) == qb[b] || last + 1 == qb[b]) goes = 1;
+                            } else if (insn != 0xD65F03C0u && last + 1 == qb[b]) goes = 1;
+                            if (goes) { np++; if (!exi[p]) all = false; }
+                        }
+                        int en = (b == 0) ? 0 : (np == 0 ? 1 : all);
+                        int ex = en || gen[b];
+                        if (en != ent[b] || ex != exi[b]) changed = 1;
+                        ent[b] = en; exi[b] = ex;
+                    }
+                    if (!changed) break;
+                }
+                bool ok = true;
+                for (int b = 0; b < nqb && ok; b++) {
+                    int hi = b + 1 < nqb ? qb[b + 1] : qn;
+                    int flag = ent[b];
+                    for (int i = qb[b]; i < hi; i++) {
+                        for (int a = 0; a < nqa; a++) if (qacc[a].at == i && qacc[a].off == off) {
+                            if (!qacc[a].st && !flag) ok = false;
+                            if (qacc[a].st) flag = 1;
+                        }
+                    }
+                }
+                free(gen); free(ent); free(exi);
+                if (!ok) continue;
+                bool placed = true;
+                for (int a = 0; a < nqa; a++) if (qacc[a].off == off) {
+                    if (qacc[a].at <= 1 || qacc[a].at >= qadd) placed = false;
+                }
+                if (!placed) continue;
+                int hole = -1;
+                for (int o = 0; o + 16 <= frame; o += 16) {
+                    bool free_h = true;
+                    for (int b = o; b < o + 16; b++) if (ban[b]) free_h = false;
+                    for (int a = 0; a < na && free_h; a++) {
+                        if (acc[a].off < o + 16 && acc[a].off + 8 > o) free_h = false;
+                    }
+                    for (int i = 0; i < qn && free_h; i++) {
+                        int rt, soff, is_st;
+                        if (a64_sp_s(w[i], &rt, &soff, &is_st) && soff < o + 16 && soff + 4 > o) free_h = false;
+                        if (a64_sp_q(w[i], &rt, &soff, &is_st) && soff < o + 16 && soff + 16 > o) free_h = false;
+                    }
+                    if (!free_h) continue;
+                    hole = o;
+                    break;
+                }
+                if (hole < 0) continue;
+                int v = freshq[qused];
+                for (int a = 0; a < nqa; a++) if (qacc[a].off == off) {
+                    int src = qacc[a].st ? qacc[a].rt : v;
+                    int dst = qacc[a].st ? v : qacc[a].rt;
+                    w[qacc[a].at] = 0x1E204000u | ((uint32_t)src << 5) | (uint32_t)dst;
+                }
+                for (int b = hole; b < hole + 16 && b < frame; b++) ban[b] = 1;
+                qhole[qused++] = hole;
+            }
+            if (qused > 0) {
+                uint32_t qs[4], qr[4];
+                for (int k = 0; k < qused; k++) {
+                    uint32_t imm = (uint32_t)(qhole[k] / 16) << 10;
+                    uint32_t reg = (uint32_t)freshq[k];
+                    qs[k] = 0x3D800000u | imm | (31u << 5) | reg;
+                    qr[k] = 0x3DC00000u | imm | (31u << 5) | reg;
+                }
+                int nall = (int)(e->count / 4);
+                a64_insert_insns(e, &nall, qadd, qr, qused);
+                w = (uint32_t*)e->data;
+                int rest_at = qadd;
+                int add_now = qadd + qused;
+                for (int i = 0; i < nall; i++) {
+                    if (i >= rest_at && i < add_now) continue;
+                    uint32_t br = w[i];
+                    int imm = 0;
+                    bool cond = false;
+                    if ((br & 0xFC000000u) == 0x14000000u) {
+                        imm = (int)(br & 0x3FFFFFFu);
+                        if (imm & 0x2000000) imm |= ~0x3FFFFFF;
+                    } else if ((br & 0xFF000010u) == 0x54000000u) {
+                        cond = true;
+                        imm = (int)((br >> 5) & 0x7FFFFu);
+                        if (imm & 0x40000) imm |= ~0x7FFFF;
+                    } else continue;
+                    if (i + imm != add_now) continue;
+                    int d = rest_at - i;
+                    if (cond) w[i] = (br & 0xFF00001Fu) | ((uint32_t)(d & 0x7FFFF) << 5);
+                    else w[i] = 0x14000000u | ((uint32_t)d & 0x03FFFFFFu);
+                }
+                a64_insert_insns(e, &nall, 1, qs, qused);
+                (void)nall;
+            }
+        }
+    }
+    free(bid);
+    free(ban);
+}
+
+static void a64_point_branch(uint32_t* w, int i, int target) {
+    int d = target - i;
+    uint32_t br = w[i];
+    if ((br & 0xFC000000u) == 0x14000000u) w[i] = 0x14000000u | ((uint32_t)d & 0x03FFFFFFu);
+    else if ((br & 0xFF000010u) == 0x54000000u) w[i] = (br & 0xFF00001Fu) | ((uint32_t)(d & 0x7FFFF) << 5);
+}
+
+static bool a64_is_div(uint32_t insn) {
+    uint32_t op = insn & 0x7FE0FC00u;
+    return op == 0x1AC00C00u || op == 0x9AC00C00u || op == 0x1AC00800u || op == 0x9AC00800u;
+}
+
+static bool a64_is_ext_add(uint32_t insn) {
+    uint32_t op = insn & 0x7FE00000u;
+    return op == 0x0B200000u || op == 0x4B200000u || op == 0x8B200000u || op == 0xCB200000u;
+}
+
+// 按比例的 str/ldr q。Rt 是向量寄存器，基址才是通用寄存器。
+static bool a64_is_qmem(uint32_t insn) {
+    uint32_t s = insn & 0xFFC00000u;
+    return s == 0x3D800000u || s == 0x3DC00000u;
+}
+
+static bool a64_insn_known_gpr(uint32_t insn) {
+    if (a64_is_div(insn) || a64_is_ext_add(insn) || a64_is_qmem(insn)) return true;
+    bool known = false;
+    a64_gpr_def2(insn, &known);
+    if (!known) return false;
+    a64_gpr_read2(insn, 0, &known);
+    return known;
+}
+
+static bool a64_gpr_r(uint32_t insn, int reg) {
+    if (insn == 0xD65F03C0u) return reg == 30;
+    if (a64_is_qmem(insn)) return ((int)((insn >> 5) & 31u)) == reg;
+    if (a64_is_div(insn) || a64_is_ext_add(insn)) {
+        return ((int)((insn >> 5) & 31u)) == reg || ((int)((insn >> 16) & 31u)) == reg;
+    }
+    bool known = false;
+    return a64_gpr_read2(insn, reg, &known);
+}
+
+static int a64_gpr_d(uint32_t insn) {
+    if ((insn & 0xFC000000u) == 0x94000000u) return 30;
+    if (a64_is_qmem(insn)) return -1;
+    if (a64_is_div(insn) || a64_is_ext_add(insn)) return (int)(insn & 31u);
+    bool known = false;
+    int d = a64_gpr_def2(insn, &known);
+    return known ? d : -2;
+}
+
+// 删掉一条之前，把打到它的分支改到下一条。删除时那些分支会跟着下一条滑到原位置。
+static void a64_delete_one(TB_CGEmitter* e, int* nins, int at) {
+    uint32_t* w = (uint32_t*)e->data;
+    for (int i = 0; i < *nins; i++) {
+        uint32_t br = w[i];
+        int tgt = -1;
+        if ((br & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(i, br, false);
+        else if ((br & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(i, br, true);
+        if (tgt == at) a64_point_branch(w, i, at + 1);
+    }
+    a64_delete_insns(e, nins, at, 1);
+}
+
+// x19–x30 的栈读，如果每条路上都先被写掉再被用到，就是死的。写完再没人读的槽也删。
+static void a64_drop_dead_csr_reloads(TB_CGEmitter* e) {
+    if (e->count < 16 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    if (nins > 1024) return;
+    uint32_t* w = (uint32_t*)e->data;
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    uint8_t* seen = calloc((size_t)nins, 1);
+    if (!seen) return;
+    for (int pass = 0; pass < nins; pass++) {
+        w = (uint32_t*)e->data;
+        int kill = -1;
+        for (int i = 0; i < nins && kill < 0; i++) {
+            int rt, off, st;
+            if (!a64_sp_x8(w[i], &rt, &off, &st) || st || rt < 19) continue;
+            memset(seen, 0, (size_t)nins);
+            int stack[1024], sp = 0, dead = 1, started = 0;
+            stack[sp++] = i;
+            while (sp && dead) {
+                int at = stack[--sp];
+                if (at < 0 || at >= nins || seen[at]) continue;
+                seen[at] = 1;
+                if (!started) { started = 1; goto succ; }
+                if (!a64_insn_known_gpr(w[at])) { dead = 0; break; }
+                if (a64_gpr_r(w[at], rt)) { dead = 0; break; }
+                if (a64_gpr_d(w[at]) == rt) continue;
+                if (w[at] == 0xD65F03C0u) { dead = 0; break; }
+                succ: ;
+                uint32_t br = w[at];
+                if ((br & 0xFC000000u) == 0x94000000u) {
+                    if (rt == 30) continue;
+                    if (at + 1 < nins) stack[sp++] = at + 1;
+                } else if ((br & 0xFC000000u) == 0x14000000u) {
+                    stack[sp++] = a64_b_target(at, br, false);
+                } else if ((br & 0xFF000010u) == 0x54000000u) {
+                    stack[sp++] = a64_b_target(at, br, true);
+                    if (at + 1 < nins) stack[sp++] = at + 1;
+                } else if (br != 0xD65F03C0u && at + 1 < nins) {
+                    stack[sp++] = at + 1;
+                }
+            }
+            if (dead) kill = i;
+        }
+        if (kill >= 0) { a64_delete_one(e, &nins, kill); continue; }
+        for (int i = 0; i < nins && kill < 0; i++) {
+            int rt, off, st;
+            if (!a64_sp_x8(w[i], &rt, &off, &st) || !st || rt < 19) continue;
+            memset(seen, 0, (size_t)nins);
+            int stack[1024], sp = 0, dead = 1;
+            if (i + 1 < nins) stack[sp++] = i + 1;
+            while (sp && dead) {
+                int at = stack[--sp];
+                if (at < 0 || at >= nins || seen[at]) continue;
+                seen[at] = 1;
+                if (!a64_insn_known_gpr(w[at])) { dead = 0; break; }
+                int lrt, loff, lst;
+                if (a64_sp_x8(w[at], &lrt, &loff, &lst) && !lst && loff == off) { dead = 0; break; }
+                if (a64_sp_x8(w[at], &lrt, &loff, &lst) && lst && loff == off) continue;
+                if (w[at] == 0xD65F03C0u) continue;
+                uint32_t br = w[at];
+                if ((br & 0xFC000000u) == 0x14000000u) stack[sp++] = a64_b_target(at, br, false);
+                else if ((br & 0xFF000010u) == 0x54000000u) {
+                    stack[sp++] = a64_b_target(at, br, true);
+                    if (at + 1 < nins) stack[sp++] = at + 1;
+                } else if ((br & 0xFC000000u) != 0x94000000u && at + 1 < nins) stack[sp++] = at + 1;
+                else if ((br & 0xFC000000u) == 0x94000000u && at + 1 < nins) stack[sp++] = at + 1;
+            }
+            if (dead) kill = i;
+        }
+        if (kill < 0) break;
+        a64_delete_one(e, &nins, kill);
+    }
+    free(seen);
+}
+
+// 没有调用也能返回时，快路径不会碰的被调用者寄存器改到调用那边再保存。
+static void a64_shrink_nocall_saves(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    if (nins > 1024) return;
+    uint32_t* w = (uint32_t*)e->data;
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+    }
+    uint8_t* fast = calloc((size_t)nins, 1);
+    if (!fast) return;
+    int stack[1024], sp = 0;
+    fast[0] = 1; stack[sp++] = 0;
+    int ret_at = -1;
+    while (sp) {
+        int at = stack[--sp];
+        uint32_t br = w[at];
+        if ((br & 0xFC000000u) == 0x94000000u || br == 0xD65F03C0u) {
+            if (br == 0xD65F03C0u) ret_at = at;
+            continue;
+        }
+        if ((br & 0xFC000000u) == 0x14000000u) {
+            int t = a64_b_target(at, br, false);
+            if (t >= 0 && t < nins && !fast[t]) { fast[t] = 1; stack[sp++] = t; }
+        } else {
+            if ((br & 0xFF000010u) == 0x54000000u) {
+                int t = a64_b_target(at, br, true);
+                if (t >= 0 && t < nins && !fast[t]) { fast[t] = 1; stack[sp++] = t; }
+            }
+            if (at + 1 < nins && !fast[at + 1]) { fast[at + 1] = 1; stack[sp++] = at + 1; }
+        }
+    }
+    if (ret_at < 0 || !fast[ret_at]) { free(fast); return; }
+    uint8_t* ex = calloc((size_t)nins, 1);
+    if (!ex) { free(fast); return; }
+    int estk[1024], esp = 0;
+    ex[ret_at] = 1; estk[esp++] = ret_at;
+    while (esp) {
+        int at = estk[--esp];
+        if (at > 0) {
+            uint32_t prev = w[at - 1];
+            if ((prev & 0xFC000000u) != 0x14000000u && (prev & 0xFC000000u) != 0x94000000u && !ex[at - 1]) {
+                ex[at - 1] = 1; estk[esp++] = at - 1;
+            }
+        }
+        for (int j = 0; j < nins; j++) {
+            uint32_t br = w[j];
+            int t = -1;
+            if ((br & 0xFC000000u) == 0x14000000u) t = a64_b_target(j, br, false);
+            else if ((br & 0xFF000010u) == 0x54000000u) t = a64_b_target(j, br, true);
+            if (t == at && !ex[j]) { ex[j] = 1; estk[esp++] = j; }
+        }
+    }
+    for (int i = 0; i < nins; i++) if (!ex[i]) fast[i] = 0;
+    free(ex);
+    if (!fast[ret_at]) { free(fast); return; }
+    for (int i = 0; i < nins; i++) if (fast[i] && !a64_insn_known_gpr(w[i])) { free(fast); return; }
+
+    int front[4], nf = 0;
+    for (int i = 0; i < nins; i++) {
+        if (fast[i]) continue;
+        int pred = 0;
+        if (i > 0 && fast[i - 1]) {
+            uint32_t p = w[i - 1];
+            if ((p & 0xFC000000u) != 0x14000000u) pred = 1;
+        }
+        for (int j = 0; j < nins && !pred; j++) if (fast[j]) {
+            uint32_t br = w[j];
+            int t = -1;
+            if ((br & 0xFC000000u) == 0x14000000u) t = a64_b_target(j, br, false);
+            else if ((br & 0xFF000010u) == 0x54000000u) t = a64_b_target(j, br, true);
+            if (t == i) pred = 1;
+        }
+        if (!pred) continue;
+        if (nf == 4) { free(fast); return; }
+        front[nf++] = i;
+    }
+    if (nf != 1) { free(fast); return; }
+    int F = front[0];
+    for (int i = 0; i < nins; i++) if (fast[i] && i > F) {
+        uint32_t br = w[i];
+        if ((br & 0xFC000000u) == 0x14000000u || (br & 0xFF000010u) == 0x54000000u) { free(fast); return; }
+    }
+    for (int i = F; i < nins; i++) {
+        uint32_t br = w[i];
+        int t = -1;
+        if ((br & 0xFC000000u) == 0x14000000u) t = a64_b_target(i, br, false);
+        else if ((br & 0xFF000010u) == 0x54000000u) t = a64_b_target(i, br, true);
+        if (t >= 0 && t <= F) { free(fast); return; }
+    }
+
+    int epi = -1;
+    for (int i = 0; i < nins; i++) {
+        if ((w[i] & 0xFFC003FFu) == 0x910003FFu && fast[i]) {
+            epi = i;
+            while (epi > 0 && !a64_is_branch_target(w, nins, epi) && fast[epi - 1]) epi--;
+            break;
+        }
+    }
+    if (epi < 0 || epi <= F) { free(fast); return; }
+    for (int i = F; i < epi; i++) if (fast[i] || !a64_insn_known_gpr(w[i])) { free(fast); return; }
+    if (epi > 0 && fast[epi - 1]) {
+        uint32_t p = w[epi - 1];
+        if ((p & 0xFC000000u) != 0x14000000u) { free(fast); return; }
+    }
+
+    int cand[8], ncand = 0;
+    uint8_t csink[8];
+    for (int i = 0; i < F; i++) {
+        if (!fast[i]) continue;
+        uint32_t insn = w[i];
+        int rd = (int)(insn & 31u);
+        int rn = (int)((insn >> 5) & 31u);
+        int kind = 0;
+        if ((insn & 0x7FE0FFE0u) == 0x2A0003E0u && rd >= 19 && rd <= 28) kind = 1;
+        if ((insn & 0xFFC003E0u) == 0x910003E0u && rd >= 19 && rd <= 28 && rn == 31) kind = 2;
+        if (!kind) continue;
+        if (ncand == 8) { free(fast); return; }
+        cand[ncand] = i;
+        csink[ncand] = 1;
+        ncand++;
+    }
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int c = 0; c < ncand; c++) {
+            if (!csink[c]) continue;
+            int rd = (int)(w[cand[c]] & 31u);
+            for (int j = 0; j < nins; j++) {
+                if (!fast[j] || j == cand[c]) continue;
+                int rt, off, ist;
+                if (a64_sp_x8(w[j], &rt, &off, &ist) && rt == rd) continue;
+                if (!a64_gpr_r(w[j], rd)) continue;
+                int ok = 0;
+                for (int k = 0; k < ncand; k++) if (csink[k] && cand[k] == j) ok = 1;
+                if (!ok) { csink[c] = 0; changed = 1; break; }
+            }
+        }
+    }
+    int sink_at[8], sink_rd[8], nsink = 0;
+    int temp_for[32];
+    for (int r = 0; r < 32; r++) temp_for[r] = -1;
+    uint8_t used_tmp = 0;
+    for (int c = 0; c < ncand; c++) {
+        if (!csink[c]) continue;
+        int i = cand[c];
+        uint32_t insn = w[i];
+        int rd = (int)(insn & 31u);
+        int rm = (int)((insn >> 16) & 31u);
+        int kind = ((insn & 0x7FE0FFE0u) == 0x2A0003E0u) ? 1 : 2;
+        if (kind == 1) {
+            int killed = 0;
+            for (int j = i + 1; j < F; j++) if (fast[j] && a64_gpr_d(w[j]) == rm) killed = 1;
+            if (killed) {
+                int tmp = -1;
+                for (int t = 9; t <= 15; t++) {
+                    if (used_tmp & (1u << t)) continue;
+                    int hit = 0;
+                    for (int j = 0; j < nins; j++) if (fast[j] && (a64_gpr_d(w[j]) == t || a64_gpr_r(w[j], t))) hit = 1;
+                    if (!hit) { tmp = t; break; }
+                }
+                if (tmp < 0) continue;
+                used_tmp |= 1u << tmp;
+                temp_for[rd] = tmp;
+            }
+        }
+        sink_at[nsink] = i;
+        sink_rd[nsink] = rd;
+        nsink++;
+    }
+
+    int save_at[32], rest_at[32], move[32], nmove = 0;
+    for (int r = 0; r < 32; r++) { save_at[r] = -1; rest_at[r] = -1; }
+    for (int reg = 19; reg <= 30; reg++) {
+        int extra = 0, st = -1, ld = -1;
+        for (int i = 0; i < nins; i++) if (fast[i]) {
+            int sunk = 0;
+            for (int s = 0; s < nsink; s++) if (sink_at[s] == i) sunk = 1;
+            if (sunk) continue;
+            int rt, off, ist;
+            if (a64_sp_x8(w[i], &rt, &off, &ist) && rt == reg) {
+                if (ist && st < 0) st = i;
+                else if (!ist && ld < 0) ld = i;
+                else extra = 1;
+                continue;
+            }
+            if (reg == 30 && w[i] == 0xD65F03C0u) continue;
+            if (a64_gpr_d(w[i]) == reg || a64_gpr_r(w[i], reg)) extra = 1;
+        }
+        if (extra || st < 0 || ld < 0 || st >= F || ld < epi) continue;
+        int cold_def = reg == 30;
+        for (int i = F; i < nins && !cold_def; i++) {
+            if ((w[i] & 0xFC000000u) == 0x94000000u && reg == 30) cold_def = 1;
+            if (a64_gpr_d(w[i]) == reg) cold_def = 1;
+        }
+        for (int s = 0; s < nsink; s++) if (sink_rd[s] == reg) cold_def = 1;
+        save_at[reg] = st; rest_at[reg] = ld;
+        move[nmove++] = reg;
+    }
+    if (nmove == 0 && nsink == 0) { free(fast); return; }
+
+    uint32_t pay[24];
+    int np = 0;
+    for (int k = 0; k < nmove && np < 24; k++) {
+        int reg = move[k];
+        int cold_def = 0;
+        for (int i = F; i < nins && !cold_def; i++) if (a64_gpr_d(w[i]) == reg) cold_def = 1;
+        for (int s = 0; s < nsink; s++) if (sink_rd[s] == reg) cold_def = 1;
+        if (reg == 30) cold_def = 1;
+        if (!cold_def) continue;
+        pay[np++] = w[save_at[reg]];
+    }
+    for (int k = 0; k < nmove && np < 24; k++) {
+        int reg = move[k];
+        if (temp_for[reg] < 0) continue;
+        pay[np++] = 0xAA0003E0u | ((uint32_t)temp_for[reg] << 16) | (uint32_t)reg;
+    }
+    for (int s = 0; s < nsink && np < 24; s++) {
+        if (temp_for[sink_rd[s]] >= 0) continue;
+        pay[np++] = w[sink_at[s]];
+    }
+    uint32_t rests[16];
+    int nr = 0;
+    for (int k = 0; k < nmove && nr < 16; k++) {
+        int reg = move[k];
+        int cold_def = reg == 30;
+        for (int i = F; i < nins && !cold_def; i++) if (a64_gpr_d(w[i]) == reg) cold_def = 1;
+        for (int s = 0; s < nsink; s++) if (sink_rd[s] == reg) cold_def = 1;
+        if (!cold_def) continue;
+        rests[nr++] = w[rest_at[reg]];
+    }
+
+    for (int s = 0; s < nsink; s++) {
+        int at = sink_at[s];
+        if (temp_for[sink_rd[s]] >= 0) w[at] = (w[at] & ~31u) | (uint32_t)temp_for[sink_rd[s]];
+    }
+    int del[40], nd = 0;
+    for (int s = 0; s < nsink; s++) {
+        if (temp_for[sink_rd[s]] < 0 && nd < 40) del[nd++] = sink_at[s];
+    }
+    for (int k = 0; k < nmove; k++) {
+        if (nd < 40) del[nd++] = save_at[move[k]];
+        if (nd < 40) del[nd++] = rest_at[move[k]];
+    }
+    for (int a = 0; a < nd; a++) {
+        int best = -1, bi = -1;
+        for (int d = 0; d < nd; d++) if (del[d] > best) { best = del[d]; bi = d; }
+        if (best < 0) break;
+        del[bi] = -1;
+        a64_delete_one(e, &nins, best);
+        if (best < F) F--;
+        if (best < epi) epi--;
+    }
+    if (nr) {
+        a64_insert_insns(e, &nins, epi, rests, nr);
+    }
+    int rest_at0 = epi;
+    if (np) {
+        a64_insert_insns(e, &nins, F, pay, np);
+        rest_at0 += np;
+    }
+    w = (uint32_t*)e->data;
+    int skip = rest_at0 + nr;
+    int old_f = F + np;
+    for (int i = 0; i < nins; i++) {
+        uint32_t br = w[i];
+        int tgt = -1;
+        if ((br & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(i, br, false);
+        else if ((br & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(i, br, true);
+        if (tgt < 0) continue;
+        if (i >= old_f && tgt == skip) a64_point_branch(w, i, rest_at0);
+        else if (np && tgt == old_f) a64_point_branch(w, i, F);
+    }
+    free(fast);
+}
+
+// 标量浮点或 q 存取碰到的寄存器。认不出返回 false。
+// dst 写在位 0–4；src_lo 从位 0–4 读；rn 位 5–9；rm 位 16–20。qreg 是整段 q 的存取。
+static bool a64_fp_acc(uint32_t insn, int* dst, int* src_lo, int* rn, int* rm, int* qreg, int* qstore) {
+    *dst = *src_lo = *rn = *rm = *qreg = -1;
+    *qstore = -1;
+    uint32_t sc = insn & 0xFFC00000u;
+    uint32_t u = insn & 0xFFE00C00u;
+    if (sc == 0x3D800000u || sc == 0x3DC00000u) {
+        *qreg = (int)(insn & 31u);
+        *qstore = sc == 0x3D800000u;
+        return true;
+    }
+    if (u == 0x3C800000u || u == 0x3CC00000u) {
+        *qreg = (int)(insn & 31u);
+        *qstore = u == 0x3C800000u;
+        return true;
+    }
+    if (sc == 0xFD000000u || sc == 0xFD400000u || u == 0xFC000000u || u == 0xFC400000u) return false;
+    if ((insn & 0x3F000000u) == 0x5C000000u) return false;
+    if ((insn & 0xFFFFFC00u) == 0x1E260000u || (insn & 0xFFFFFC00u) == 0x1E270000u) return false;
+    if (sc == 0xBD000000u) { *src_lo = (int)(insn & 31u); return true; }
+    if (sc == 0xBD400000u) { *dst = (int)(insn & 31u); return true; }
+    if (u == 0xBC000000u) { *src_lo = (int)(insn & 31u); return true; }
+    if (u == 0xBC400000u) { *dst = (int)(insn & 31u); return true; }
+    if ((insn & 0x3F000000u) == 0x1C000000u) { *dst = (int)(insn & 31u); return true; }
+    if ((insn & 0xFF20FC1Fu) == 0x1E202000u) {
+        *rn = (int)((insn >> 5) & 31u);
+        *rm = (int)((insn >> 16) & 31u);
+        return true;
+    }
+    if ((insn & 0xFFFFFC1Fu) == 0x1E202008u) { *rn = (int)((insn >> 5) & 31u); return true; }
+    uint32_t op = insn & 0xFFE0FC00u;
+    if (op == 0x1E204000u) {
+        *dst = (int)(insn & 31u);
+        *rn = (int)((insn >> 5) & 31u);
+        return true;
+    }
+    if (op == 0x1E200800u || op == 0x1E202800u || op == 0x1E203800u || op == 0x1E201800u ||
+        op == 0x1E206800u || op == 0x1E207800u) {
+        *dst = (int)(insn & 31u);
+        *rn = (int)((insn >> 5) & 31u);
+        *rm = (int)((insn >> 16) & 31u);
+        return true;
+    }
+    if ((insn >> 24) == 0x1Eu) return false;
+    if (op == 0x4EA01C00u) {
+        *dst = (int)(insn & 31u);
+        *rm = (int)((insn >> 16) & 31u);
+        return true;
+    }
+    if (a64_insn_known_gpr(insn)) return true;
+    return false;
+}
+
+static uint32_t a64_fp_rename(uint32_t insn, int from, int to) {
+    int dst, src_lo, rn, rm, qreg, qstore;
+    if (!a64_fp_acc(insn, &dst, &src_lo, &rn, &rm, &qreg, &qstore)) return insn;
+    if (dst == from) insn = (insn & ~31u) | (uint32_t)to;
+    if (src_lo == from) insn = (insn & ~31u) | (uint32_t)to;
+    if (rn == from) insn = (insn & ~(31u << 5)) | ((uint32_t)to << 5);
+    if (rm == from) insn = (insn & ~(31u << 16)) | ((uint32_t)to << 16);
+    return insn;
+}
+
+// 快路径把被调用者保存的浮点寄存器当临时值用。调用不在这条路上，就改用
+// 调用者保存的 s16–s31，把 q 的保存挪到真正会跨调用的入口。
+static void a64_fast_fp_temps(TB_CGEmitter* e) {
+    if (e->count < 32 || (e->count & 3u)) return;
+    int nins = (int)(e->count / 4);
+    if (nins > 1024) return;
+    uint32_t* w = (uint32_t*)e->data;
+    for (int i = 0; i < nins; i++) {
+        uint32_t insn = w[i];
+        if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
+            (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
+        int dst, src_lo, rn, rm, qreg, qstore;
+        if (!a64_fp_acc(insn, &dst, &src_lo, &rn, &rm, &qreg, &qstore)) return;
+    }
+    uint8_t* fast = calloc((size_t)nins, 1);
+    if (!fast) return;
+    int stack[1024], sp = 0;
+    fast[0] = 1;
+    stack[sp++] = 0;
+    int ret_at = -1;
+    while (sp) {
+        int at = stack[--sp];
+        uint32_t br = w[at];
+        if ((br & 0xFC000000u) == 0x94000000u || br == 0xD65F03C0u) {
+            if (br == 0xD65F03C0u) ret_at = at;
+            continue;
+        }
+        if ((br & 0xFC000000u) == 0x14000000u) {
+            int t = a64_b_target(at, br, false);
+            if (t >= 0 && t < nins && !fast[t]) { fast[t] = 1; stack[sp++] = t; }
+        } else {
+            if ((br & 0xFF000010u) == 0x54000000u) {
+                int t = a64_b_target(at, br, true);
+                if (t >= 0 && t < nins && !fast[t]) { fast[t] = 1; stack[sp++] = t; }
+            }
+            if (at + 1 < nins && !fast[at + 1]) { fast[at + 1] = 1; stack[sp++] = at + 1; }
+        }
+    }
+    if (ret_at < 0 || !fast[ret_at]) { free(fast); return; }
+    uint8_t* ex = calloc((size_t)nins, 1);
+    if (!ex) { free(fast); return; }
+    int estk[1024], esp = 0;
+    ex[ret_at] = 1;
+    estk[esp++] = ret_at;
+    while (esp) {
+        int at = estk[--esp];
+        if (at > 0) {
+            uint32_t prev = w[at - 1];
+            if ((prev & 0xFC000000u) != 0x14000000u && (prev & 0xFC000000u) != 0x94000000u && !ex[at - 1]) {
+                ex[at - 1] = 1;
+                estk[esp++] = at - 1;
+            }
+        }
+        for (int j = 0; j < nins; j++) {
+            uint32_t br = w[j];
+            int t = -1;
+            if ((br & 0xFC000000u) == 0x14000000u) t = a64_b_target(j, br, false);
+            else if ((br & 0xFF000010u) == 0x54000000u) t = a64_b_target(j, br, true);
+            if (t == at && !ex[j]) { ex[j] = 1; estk[esp++] = j; }
+        }
+    }
+    for (int i = 0; i < nins; i++) if (!ex[i]) fast[i] = 0;
+    free(ex);
+    if (!fast[ret_at]) { free(fast); return; }
+
+    int front[4], nf = 0;
+    for (int i = 0; i < nins; i++) {
+        if (fast[i]) continue;
+        int pred = 0;
+        if (i > 0 && fast[i - 1] && (w[i - 1] & 0xFC000000u) != 0x14000000u) pred = 1;
+        for (int j = 0; j < nins && !pred; j++) if (fast[j]) {
+            uint32_t br = w[j];
+            int t = -1;
+            if ((br & 0xFC000000u) == 0x14000000u) t = a64_b_target(j, br, false);
+            else if ((br & 0xFF000010u) == 0x54000000u) t = a64_b_target(j, br, true);
+            if (t == i) pred = 1;
+        }
+        if (!pred) continue;
+        if (nf == 4) { free(fast); return; }
+        front[nf++] = i;
+    }
+    if (nf != 1) { free(fast); return; }
+    int F = front[0];
+    int epi = -1;
+    for (int i = 0; i < nins; i++) {
+        if ((w[i] & 0xFFC003FFu) == 0x910003FFu && fast[i]) {
+            epi = i;
+            while (epi > 0 && !a64_is_branch_target(w, nins, epi) && fast[epi - 1]) epi--;
+            break;
+        }
+    }
+    if (epi < 0 || epi <= F) { free(fast); return; }
+    for (int i = F; i < epi; i++) if (fast[i]) { free(fast); return; }
+
+    int regs[4], temps[4], save_at[4], rest_at[4], need_copy[4], nr = 0;
+    uint32_t save_w[4], rest_w[4];
+    uint32_t used_tmp = 0;
+    for (int reg = 8; reg <= 15 && nr < 4; reg++) {
+        int st = -1, ld = -1, extra_q = 0, scalar = 0, wide = 0;
+        for (int i = 0; i < nins; i++) if (fast[i]) {
+            int dst, src_lo, rn, rm, qreg, qstore;
+            a64_fp_acc(w[i], &dst, &src_lo, &rn, &rm, &qreg, &qstore);
+            if (qreg == reg) {
+                if (((w[i] >> 5) & 31u) != 31u) { extra_q = 1; break; }
+                if (qstore && st < 0 && i < F) st = i;
+                else if (!qstore && ld < 0 && i >= epi) ld = i;
+                else extra_q = 1;
+                continue;
+            }
+            if ((w[i] & 0xFFE0FC00u) == 0x4EA01C00u && (dst == reg || rm == reg)) { wide = 1; break; }
+            if (dst == reg || src_lo == reg || rn == reg || rm == reg) scalar = 1;
+        }
+        if (extra_q || wide || st < 0 || ld < 0 || !scalar) continue;
+        int tmp = -1;
+        for (int t = 16; t <= 31; t++) {
+            if (used_tmp & (1u << (t - 16))) continue;
+            int hit = 0;
+            for (int i = 0; i < nins && !hit; i++) {
+                int dst, src_lo, rn, rm, qreg, qstore;
+                a64_fp_acc(w[i], &dst, &src_lo, &rn, &rm, &qreg, &qstore);
+                if (dst == t || src_lo == t || rn == t || rm == t || qreg == t) hit = 1;
+            }
+            if (!hit) { tmp = t; break; }
+        }
+        if (tmp < 0) continue;
+        int copy = 0;
+        uint8_t seen[1024];
+        memset(seen, 0, (size_t)nins);
+        int cstk[1024], csp = 0;
+        cstk[csp++] = F;
+        while (csp && !copy) {
+            int at = cstk[--csp];
+            if (at < 0 || at >= nins || seen[at] || at >= epi) continue;
+            seen[at] = 1;
+            int dst, src_lo, rn, rm, qreg, qstore;
+            a64_fp_acc(w[at], &dst, &src_lo, &rn, &rm, &qreg, &qstore);
+            int reads = src_lo == reg || rn == reg || rm == reg || (qreg == reg && qstore == 1);
+            int defs = dst == reg || (qreg == reg && qstore == 0);
+            if (reads) { copy = 1; break; }
+            if (defs) continue;
+            uint32_t br = w[at];
+            if ((br & 0xFC000000u) == 0x94000000u) {
+                if (at + 1 < nins) cstk[csp++] = at + 1;
+            } else if ((br & 0xFC000000u) == 0x14000000u) {
+                cstk[csp++] = a64_b_target(at, br, false);
+            } else if ((br & 0xFF000010u) == 0x54000000u) {
+                cstk[csp++] = a64_b_target(at, br, true);
+                if (at + 1 < nins) cstk[csp++] = at + 1;
+            } else if (br != 0xD65F03C0u && at + 1 < nins) {
+                cstk[csp++] = at + 1;
+            }
+        }
+        if (copy) {
+            uint8_t reach[1024];
+            memset(reach, 0, (size_t)nins);
+            int rstk[1024], rsp = 0;
+            rstk[rsp++] = 0;
+            int escaped = 0;
+            while (rsp) {
+                int at = rstk[--rsp];
+                if (at < 0 || at >= nins || reach[at]) continue;
+                if (at == F) { escaped = 1; break; }
+                reach[at] = 1;
+                if (!fast[at]) continue;
+                int dst, src_lo, rn, rm, qreg, qstore;
+                a64_fp_acc(w[at], &dst, &src_lo, &rn, &rm, &qreg, &qstore);
+                if (dst == reg) continue;
+                uint32_t br = w[at];
+                if ((br & 0xFC000000u) == 0x94000000u || br == 0xD65F03C0u) continue;
+                if ((br & 0xFC000000u) == 0x14000000u) rstk[rsp++] = a64_b_target(at, br, false);
+                else {
+                    if ((br & 0xFF000010u) == 0x54000000u) rstk[rsp++] = a64_b_target(at, br, true);
+                    if (at + 1 < nins) rstk[rsp++] = at + 1;
+                }
+            }
+            if (escaped) continue;
+        }
+        used_tmp |= 1u << (tmp - 16);
+        regs[nr] = reg;
+        temps[nr] = tmp;
+        save_at[nr] = st;
+        rest_at[nr] = ld;
+        need_copy[nr] = copy;
+        save_w[nr] = w[st];
+        rest_w[nr] = w[ld];
+        nr++;
+    }
+    if (nr == 0) { free(fast); return; }
+
+    for (int k = 0; k < nr; k++) {
+        for (int i = 0; i < nins; i++) if (fast[i] && i != save_at[k] && i != rest_at[k]) {
+            w[i] = a64_fp_rename(w[i], regs[k], temps[k]);
+        }
+    }
+    int del[8], nd = 0;
+    for (int k = 0; k < nr; k++) {
+        del[nd++] = save_at[k];
+        del[nd++] = rest_at[k];
+    }
+    for (int a = 0; a < nd; a++) {
+        int best = -1, bi = -1;
+        for (int d = 0; d < nd; d++) if (del[d] > best) { best = del[d]; bi = d; }
+        del[bi] = -1;
+        a64_delete_one(e, &nins, best);
+        if (best < F) F--;
+        if (best < epi) epi--;
+    }
+    uint32_t rests[4];
+    for (int k = 0; k < nr; k++) rests[k] = rest_w[k];
+    a64_insert_insns(e, &nins, epi, rests, nr);
+    uint32_t pay[8];
+    int np = 0;
+    for (int k = 0; k < nr; k++) pay[np++] = save_w[k];
+    for (int k = 0; k < nr; k++) if (need_copy[k]) {
+        pay[np++] = 0x1E204000u | ((uint32_t)temps[k] << 5) | (uint32_t)regs[k];
+    }
+    int F0 = F;
+    a64_insert_insns(e, &nins, F, pay, np);
+    w = (uint32_t*)e->data;
+    int skipped = F0 + np;
+    for (int i = 0; i < nins; i++) {
+        uint32_t br = w[i];
+        int tgt = -1;
+        if ((br & 0xFC000000u) == 0x14000000u) tgt = a64_b_target(i, br, false);
+        else if ((br & 0xFF000010u) == 0x54000000u) tgt = a64_b_target(i, br, true);
+        if (tgt == skipped) a64_point_branch(w, i, F0);
+    }
+    free(fast);
+}
+
+
 static void post_emit(Ctx* restrict ctx, TB_CGEmitter* e) {
     (void)ctx;
-    a64_hoist_sp_reloads(e);
-    a64_widen_mac_loops(e);
-    a64_fold_fmaxnm(e);
-    a64_fold_loop_test(e);
-    a64_bump_row_ptrs(e);
-    a64_pair_rows(e);
+    // BISECT-PROBE: A64_KNIFE_CUTOFF=N runs only the first N knives
+    // (unset = all). Finding the one that mangles _create's spill chain.
+    static const struct { const char* name; void (*fn)(TB_CGEmitter*); } knives[] = {
+        {"hoist_sp_reloads", a64_hoist_sp_reloads},
+        {"widen_mac_loops", a64_widen_mac_loops},
+        {"fold_fmaxnm", a64_fold_fmaxnm},
+        {"fold_loop_test", a64_fold_loop_test},
+        {"fold_fccmp", a64_fold_fccmp},
+        {"bump_row_ptrs", a64_bump_row_ptrs},
+        {"pair_rows", a64_pair_rows},
+        // PATCH(odin-tilde): promote_invariant_slots remains disabled —
+        // with all other knives on (incl. the fixed drop_stack_copies),
+        // re-enabling it still fails slice+container 3/3 each (2026-11-23
+        // retest). Loop-invariant slot promotion needs a CFG-aware rewrite.
+        // {"promote_invariant_slots", a64_promote_invariant_slots},
+        // PATCH(odin-tilde): drop_stack_copies re-enabled 2026-11-23. The
+        // branch-joined-reload bug (thread@_create's return phi) is fixed by
+        // clearing the hold records at branch-target instructions (see the
+        // PATCH inside the pass). The slice infinite-loop originally
+        // attributed to it was actually park_spills (still disabled); with
+        // park_spills/promote_invariant_slots/shrink_nocall_saves off, this
+        // pass passed slice/container/math (multi-roll) + 47/47 regression.
+        {"drop_stack_copies", a64_drop_stack_copies},
+        {"park_spills", a64_park_spills},
+        {"drop_dead_csr_reloads", a64_drop_dead_csr_reloads},
+        {"keep_iv", a64_keep_iv},
+        {"defer_dead_spills", a64_defer_dead_spills},
+        {"trim_dead_header", a64_trim_dead_header},
+        {"trim_dead_addr", a64_trim_dead_addr},
+        {"fold_alive_disp", a64_fold_alive_disp},
+        {"shrink_nocall_saves", a64_shrink_nocall_saves},
+        {"fast_fp_temps", a64_fast_fp_temps},
+        {"fold_sqr", a64_fold_sqr},
+        {"slot24", a64_fold_slot24},
+        {"drop_repeat_mov", a64_drop_repeat_mov},
+        {"fold_adj_slot", a64_fold_adj_slot},
+        {"fold_dead_copy", a64_fold_dead_copy},
+        {"drop_live_reload", a64_drop_live_reload},
+        {"fold_adj_gpr", a64_fold_adj_gpr},
+    };
+    int knife_count = (int)(sizeof(knives) / sizeof(knives[0]));
+    int cutoff = knife_count;
+    if (getenv("A64_KNIFE_CUTOFF") != NULL) { cutoff = atoi(getenv("A64_KNIFE_CUTOFF")); }
+    for (int i = 0; i < knife_count && i < cutoff; i++) {
+        knives[i].fn(e);
+    }
     TB_ASSERT(a64_fixup_count == 0 && "存在未解析的分支目标");
     if (a64_lit_fixup_count > 0) {
         // pool 紧随最后一条指令（ret 之后不可达）。16 字节对齐（≥ 访问
@@ -3306,12 +7079,30 @@ static void post_emit(Ctx* restrict ctx, TB_CGEmitter* e) {
 static void a64_emit_jcc_branches(Ctx* restrict ctx, TB_CGEmitter* e, TB_Node* n, Condition cc) {
     int succ[2] = { -1, -1 };
     FOR_USERS(u, n) {
-        if (USERN(u)->type == TB_PROJ) {
-            int index = TB_NODE_GET_EXTRA_T(USERN(u), TB_NodeProj)->index;
-            TB_Node* succ_n = USERN(u);
-            TB_BasicBlock* succ_bb = nl_map_get_checked(ctx->cfg.node_to_block, succ_n);
-            succ[index] = succ_bb->fwd;
+        TB_Node* un = USERN(u);
+        // Constant-folded arms leave a control projection with no users.
+        // CFG construction skips those, so they are not blocks. Value
+        // projections of the tuple are not blocks either. Looking either
+        // up in node_to_block fails the map check and, with asserts off,
+        // dereferences whatever sits in front of the map.
+        if (un->type != TB_PROJ || un->dt.type != TB_TAG_CONTROL || un->user_count == 0) {
+            continue;
         }
+        int index = TB_NODE_GET_EXTRA_T(un, TB_NodeProj)->index;
+        if (index < 0 || index > 1) {
+            continue;
+        }
+        TB_BasicBlock* succ_bb = nl_map_get_checked(ctx->cfg.node_to_block, un);
+        succ[index] = succ_bb->fwd;
+    }
+
+    // One arm is unreachable. Branch only to the live successor.
+    if (succ[0] < 0 || succ[1] < 0) {
+        int live = succ[0] < 0 ? succ[1] : succ[0];
+        if (live >= 0 && ctx->fallthrough != live) {
+            a64_emit_branch(e, 0x14000000, live, A64_FIX_B26);
+        }
+        return;
     }
 
     if (ctx->fallthrough == succ[0]) {
@@ -3535,13 +7326,13 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         case TB_LOAD: {           // (Control?, Memory, Ptr)      -> Data
             int dst = op_reg_at(ctx, n, TB_IS_FLOAT_TYPE(n->dt) || TB_IS_VECTOR_TYPE(n->dt) ? REG_CLASS_FPR : REG_CLASS_GPR);
             int ptr = op_reg_at(ctx, n->inputs[n->input_count - 1], REG_CLASS_GPR);
-            a64_ldst(e, false, n->dt, dst, ptr, 0);
+            a64_ldst(e, false, n->dt, dst, ptr, a64_addr_fold_get(n));
             break;
         }
         case TB_STORE: {          // (Control, Memory, Ptr, Data) -> Memory
             int val = op_reg_at(ctx, n->inputs[3], TB_IS_FLOAT_TYPE(n->inputs[3]->dt) || TB_IS_VECTOR_TYPE(n->inputs[3]->dt) ? REG_CLASS_FPR : REG_CLASS_GPR);
             int ptr = op_reg_at(ctx, n->inputs[2], REG_CLASS_GPR);
-            a64_ldst(e, true, n->inputs[3]->dt, val, ptr, 0);
+            a64_ldst(e, true, n->inputs[3]->dt, val, ptr, a64_addr_fold_get(n));
             break;
         }
         case TB_a64_ld_idx:
@@ -4043,11 +7834,13 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         // Unary operations
         ////////////////////////////////
         case TB_FNEG:
+        case TB_FABS:
         case TB_FSQRT: {
             int type = n->dt.type == TB_TAG_F32 ? Single : Double;
             int  dst = op_reg_at(ctx, n,            REG_CLASS_FPR);
             int  src = op_reg_at(ctx, n->inputs[1], REG_CLASS_FPR);
-            simd_dp_floatdp1(e, type, n->type == TB_FNEG ? FNEG : FSQRT, dst, src);
+            FPDP1op op = n->type == TB_FNEG ? FNEG : n->type == TB_FABS ? FABS : FSQRT;
+            simd_dp_floatdp1(e, type, op, dst, src);
             break;
         }
 
@@ -4129,14 +7922,28 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             TB_User* hi_u = proj_with_index(n, 1);
             TB_Node* lo = lo_u && ctx->vreg_map[USERN(lo_u)->gvn] > 0 ? USERN(lo_u) : NULL;
             TB_Node* hi = hi_u && ctx->vreg_map[USERN(hi_u)->gvn] > 0 ? USERN(hi_u) : NULL;
-            if (hi) {
-                dpreg_dp_3src(e, true, n->type == TB_UMULPAIR ? UMULH : SMULH, A64_SCRATCH, lhs, rhs, ZR);
+            // 没有使用者的那一半不要发。`_, lo := mul_u64` 的高半投影没有
+            // 使用者，寄存器分配仍可能把它和低半涂成同一个寄存器；后面的
+            // `orr hi, umulh` 会把低半覆盖成高半（标量域的蒙哥马利约简）。
+            if (lo && lo->user_count == 0) lo = NULL;
+            if (hi && hi->user_count == 0) hi = NULL;
+            // 两半被涂成同一寄存器时，最后那条 orr 会留下高半。低半还活着
+            // 就丢掉这次搬运。真正两半都要的情况由 interfere_in_block 拆开。
+            if (hi && lo && op_reg_at(ctx, hi, REG_CLASS_GPR) == op_reg_at(ctx, lo, REG_CLASS_GPR)) {
+                hi = NULL;
             }
-            if (lo) {
-                dpreg_dp_3src(e, true, MADD, op_reg_at(ctx, lo, REG_CLASS_GPR), lhs, rhs, ZR);
-            }
-            if (hi) {
-                dpreg_log_shift(e, true, ORR, op_reg_at(ctx, hi, REG_CLASS_GPR), A64_SCRATCH, ZR, 0, 0);
+            if (hi && lo == NULL) {
+                dpreg_dp_3src(e, true, n->type == TB_UMULPAIR ? UMULH : SMULH, op_reg_at(ctx, hi, REG_CLASS_GPR), lhs, rhs, ZR);
+            } else {
+                if (hi) {
+                    dpreg_dp_3src(e, true, n->type == TB_UMULPAIR ? UMULH : SMULH, A64_SCRATCH, lhs, rhs, ZR);
+                }
+                if (lo) {
+                    dpreg_dp_3src(e, true, MADD, op_reg_at(ctx, lo, REG_CLASS_GPR), lhs, rhs, ZR);
+                }
+                if (hi) {
+                    dpreg_log_shift(e, true, ORR, op_reg_at(ctx, hi, REG_CLASS_GPR), A64_SCRATCH, ZR, 0, 0);
+                }
             }
             break;
         }
@@ -4170,9 +7977,24 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 EMIT4(e, base | sz | ((uint32_t)rhs<<16) | ((uint32_t)lhs<<5) | (uint32_t)dst);
             } else {
                 FPtype type = n->dt.type == TB_TAG_F64 ? Double : Single;
-                FPDP2op  op = (FPDP2op[]){FADD, FSUB, FMUL, FDIV, FMIN, FMAX}[n->type - TB_FADD];
+                // Scalar min/max are the number-preferring forms, matching
+                // LLVM's llvm.minnum / llvm.maxnum. The vector forms stay
+                // the NaN-propagating NEON ops above.
+                FPDP2op  op = (FPDP2op[]){FADD, FSUB, FMUL, FDIV, FMINNM, FMAXNM}[n->type - TB_FADD];
                 simd_dp_floatdp2(e, type, op, dst, lhs, rhs);
             }
+            break;
+        }
+
+        case TB_FMA: {
+            // Scalar only. #simd[N] is split into lanes before this node exists.
+            TB_ASSERT(n->dt.type == TB_TAG_F32 || n->dt.type == TB_TAG_F64);
+            int dst = op_reg_at(ctx, n, REG_CLASS_FPR);
+            int a = op_reg_at(ctx, n->inputs[1], REG_CLASS_FPR);
+            int b = op_reg_at(ctx, n->inputs[2], REG_CLASS_FPR);
+            int c = op_reg_at(ctx, n->inputs[3], REG_CLASS_FPR);
+            FPtype type = n->dt.type == TB_TAG_F64 ? Double : Single;
+            simd_dp_floatdp3(e, type, 0, 0, dst, a, b, c);
             break;
         }
 
@@ -4203,6 +8025,16 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             TB_Node* src = n->inputs[1];
             VReg* vdst = node_vreg(ctx, dst);
             VReg* vsrc = node_vreg(ctx, src);
+            // TEMP(debug): MACH_COPY emission audit for the _create slot-chain bug.
+            if (getenv("A64_COPY_AUDIT") != NULL) {
+                const char* fn = (const char*)ctx->f->super.name;
+                size_t fl = 0; while (fn[fl] && fl < 64) fl++;
+                if (fl >= 14 && memcmp(fn, "thread@_create", 14) == 0) {
+                    fprintf(stderr, "[copyaudit] _create gvn=%u dst cls=%d reg=%d | src gvn=%u cls=%d reg=%d\n",
+                        dst->gvn, vdst ? vdst->class : -1, vdst ? vdst->assigned : -1,
+                        src->gvn, vsrc ? vsrc->class : -1, vsrc ? vsrc->assigned : -1);
+                }
+            }
             bool dst_stk = vdst->class == REG_CLASS_STK;
             bool src_stk = vsrc->class == REG_CLASS_STK;
             if (dst_stk || src_stk) {
@@ -4399,12 +8231,19 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
         // 二分叉：cmp/cmp_imm（内联）+ b.cond + 可选 b
         case TB_a64_jcc: {
             A64Cond* op = TB_NODE_GET_EXTRA(n);
-            int lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
-            int rhs = op_reg_at(ctx, n->inputs[2], REG_CLASS_GPR);
-            bool wide = tb_data_type_bit_size(ctx->module, op->extra_dt.type) == 64;
-            lhs = a64_mask_cmp_op(e, lhs, op->extra_dt, A64_SCRATCH, op->cond);
-            rhs = a64_mask_cmp_op(e, rhs, op->extra_dt, A64_SCRATCH2, op->cond);
-            dpreg_addsub_shift(e, wide, SUB, ZR, lhs, rhs, 0, 0, true);
+            if (TB_IS_FLOAT_TYPE(op->extra_dt)) {
+                int lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_FPR);
+                int rhs = op_reg_at(ctx, n->inputs[2], REG_CLASS_FPR);
+                FPtype type = op->extra_dt.type == TB_TAG_F64 ? Double : Single;
+                simd_dp_fcmp(e, type, lhs, rhs);
+            } else {
+                int lhs = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
+                int rhs = op_reg_at(ctx, n->inputs[2], REG_CLASS_GPR);
+                bool wide = tb_data_type_bit_size(ctx->module, op->extra_dt.type) == 64;
+                lhs = a64_mask_cmp_op(e, lhs, op->extra_dt, A64_SCRATCH, op->cond);
+                rhs = a64_mask_cmp_op(e, rhs, op->extra_dt, A64_SCRATCH2, op->cond);
+                dpreg_addsub_shift(e, wide, SUB, ZR, lhs, rhs, 0, 0, true);
+            }
             a64_emit_jcc_branches(ctx, e, n, (Condition)(op->cond & 0xF));
             break;
         }
@@ -4435,6 +8274,7 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             int* targets = tb_arena_alloc(&f->tmp_arena, succ_count * sizeof(int));
 
             int def_succ = -1;
+            for (int k = 0; k < succ_count; k++) targets[k] = -1;
             FOR_USERS(u, n) {
                 if (USERN(u)->type == TB_BRANCH_PROJ) {
                     TB_NodeBranchProj* p = TB_NODE_GET_EXTRA(USERN(u));
@@ -4462,6 +8302,25 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
                 | ((uint32_t) base << 5) | (uint32_t) A64_SCRATCH;
             EMIT4(e, inst);
             control_branch_reg(e, BR, A64_SCRATCH);
+            if (a64_br_site_count < A64_MAX_BR_SITES && succ_count > 0 && succ_count <= A64_MAX_BR_TGTS) {
+                bool complete = true;
+                for (size_t ei = 0; ei < entry_count; ei++) {
+                    int ix = entries[ei];
+                    if (ix < 0 || ix >= succ_count || targets[ix] < 0) complete = false;
+                }
+                if (complete) {
+                    A64BrSite* s = &a64_br_sites[a64_br_site_count];
+                    s->pos = e->count - 4;
+                    s->nt = 0;
+                    for (int k = 0; k < succ_count; k++) {
+                        if (targets[k] < 0) continue;
+                        bool dup = false;
+                        for (int j = 0; j < s->nt; j++) if (s->labels[j] == targets[k]) dup = true;
+                        if (!dup && s->nt < A64_MAX_BR_TGTS) s->labels[s->nt++] = targets[k];
+                    }
+                    if (s->nt > 0) a64_br_site_count++;
+                }
+            }
 
             tb_arena_restore(&f->tmp_arena, sp);
             break;
@@ -4475,7 +8334,13 @@ static void bundle_emit(Ctx* restrict ctx, TB_CGEmitter* e, Bundle* bundle) {
             // PATCH(odin-tilde): pred 高位可能是垃圾，先掩到 8 位（与 TB_SELECT 同因）。
             int pred = op_reg_at(ctx, n->inputs[1], REG_CLASS_GPR);
             pred = a64_mask_cmp_op(e, pred, n->inputs[1]->dt, A64_SCRATCH, -1);
-            dpimm_addsub_imm(e, false, SUB, ZR, pred, 0, false, true);
+            // The predicate is compared, not the selected value. An i64
+            // condition (select(hi, ...) after cmp_ne(hi, 0) folds away)
+            // is zero in the low 32 bits when the set bit is 32..63.
+            // A 32-bit cmp then takes the false arm. i8/i16 are masked
+            // above; i32 already lives in the low half.
+            bool pred_wide = n->inputs[1]->dt.type == TB_TAG_I64 || TB_IS_POINTER_TYPE(n->inputs[1]->dt);
+            dpimm_addsub_imm(e, pred_wide, SUB, ZR, pred, 0, false, true);
             int dst = op_reg_at(ctx, n,            flt ? REG_CLASS_FPR : REG_CLASS_GPR);
             int lhs = op_reg_at(ctx, n->inputs[2], flt ? REG_CLASS_FPR : REG_CLASS_GPR);
             int rhs = op_reg_at(ctx, n->inputs[3], flt ? REG_CLASS_FPR : REG_CLASS_GPR);

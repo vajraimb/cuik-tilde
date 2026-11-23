@@ -279,8 +279,12 @@ struct TB_Node {
     uint16_t input_cap;
     uint16_t input_count;
 
-    uint16_t user_cap;
-    uint16_t user_count;
+    // Users outgrow 16 bits on the generated XML entity switch: every
+    // case keeps a use of the frame pointer, and indexed loads that
+    // cannot be forwarded add more. 16 bits topped out at 65535 and
+    // aborted core:encoding/xml.
+    uint32_t user_cap;
+    uint32_t user_count;
 
     // makes it easier to track in graph walks
     uint32_t gvn;
@@ -293,6 +297,10 @@ struct TB_Node {
     //   stuff it's either gonna be like trad compiler stuff, Cnile, LLVM or Cliff that's
     //   just how i learned :p
     TB_Node** inputs;
+    // index of this edge in inputs[i]->users. UINT32_MAX if the input is null.
+    // Removing a user of a node with millions of edges (the entity-switch phis)
+    // has to be O(1); a linear scan never finishes.
+    uint32_t* use_pos;
 
     char extra[];
 };
@@ -965,6 +973,7 @@ TB_API TB_Node* tb_builder_binop_int(TB_GraphBuilder* g, int type, TB_Node* a, T
 // Returns the low half (proj 0) and stores the high half (proj 1) into *out_hi.
 TB_API TB_Node* tb_builder_umulpair(TB_GraphBuilder* g, TB_Node* a, TB_Node* b, TB_Node** out_hi);
 TB_API TB_Node* tb_builder_binop_float(TB_GraphBuilder* g, int type, TB_Node* a, TB_Node* b);
+TB_API TB_Node* tb_builder_fma(TB_GraphBuilder* g, TB_Node* a, TB_Node* b, TB_Node* c);
 
 TB_API TB_Node* tb_builder_select(TB_GraphBuilder* g, TB_Node* cond, TB_Node* a, TB_Node* b);
 TB_API TB_Node* tb_builder_cast(TB_GraphBuilder* g, TB_DataType dt, int type, TB_Node* src);

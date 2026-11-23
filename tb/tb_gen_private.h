@@ -326,6 +326,8 @@ const char* tb_node_get_name(TB_NodeTypeEnum n_type) {
         case TB_FDIV: return "fdiv";
         case TB_FMIN: return "fmin";
         case TB_FMAX: return "fmax";
+        case TB_FMA: return "fma";
+        case TB_FABS: return "fabs";
         case TB_CMP_EQ: return "cmp_eq";
         case TB_CMP_NE: return "cmp_ne";
         case TB_CMP_ULT: return "cmp_ult";
@@ -499,6 +501,8 @@ size_t tb_node_extra_bytes(TB_NodeTypeEnum n_type) {
         case TB_FDIV: return 0;
         case TB_FMIN: return 0;
         case TB_FMAX: return 0;
+        case TB_FMA: return 0;
+        case TB_FABS: return 0;
         case TB_CMP_EQ: return sizeof(TB_NodeCompare);
         case TB_CMP_NE: return sizeof(TB_NodeCompare);
         case TB_CMP_ULT: return sizeof(TB_NodeCompare);

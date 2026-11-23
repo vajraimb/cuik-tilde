@@ -99,6 +99,24 @@ static void kill_offset_stores(TB_Worklist* ws, TB_Node* ptr) {
     }
 }
 
+// The pointer's bits are used as a value (a field address stored into an any,
+// a call argument), not only as the address of a load or store. Killing the
+// local then leaves PTR_OFFSET with a null base and bundle_emit faults.
+static bool addr_value_escapes(TB_Node* p) {
+    FOR_USERS(u, p) {
+        TB_Node* un = USERN(u);
+        int ui = USERI(u);
+        if (un->type == TB_PTR_OFFSET && ui == 1) {
+            if (addr_value_escapes(un)) return true;
+        } else if ((un->type == TB_LOAD || un->type == TB_STORE || un->type == TB_DEAD_STORE) && ui == 2) {
+            continue;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int find_local_idx(LocalSplitter* restrict ctx, TB_Node* n) {
     // PATCH(odin-tilde): offsets nest (off(off(local, i), CON)); a missed level puts
     // the access on the wrong memory chain once the local got its own alias class
@@ -128,20 +146,11 @@ static SimpleMemRef find_simple_mem_ref(TB_Function* f, LocalSplitter* ctx, TB_N
     TB_Node* index = NULL;
 
     int64_t offset = 0;
-    if (base->type == TB_PTR_OFFSET) {
-        TB_Node* curr = base->inputs[2];
-        if (curr->type == TB_ICONST) {
-            offset = TB_NODE_GET_EXTRA_T(curr, TB_NodeInt)->value;
-            base   = base->inputs[1];
-        }
-        /* if (curr->type == TB_ADD && curr->inputs[2]->type == TB_ICONST) {
-            offset = TB_NODE_GET_EXTRA_T(curr->inputs[2], TB_NodeInt)->value;
-            index  = curr->inputs[1];
-            base   = base->inputs[1];
-        } else {
-            index  = base->inputs[2];
-            base   = base->inputs[1];
-        } */
+    // Peel every constant displacement. One level used to leave
+    // off(off(local, 4), 8) looking like a variable-indexed address.
+    while (base->type == TB_PTR_OFFSET && base->inputs[2]->type == TB_ICONST) {
+        offset += TB_NODE_GET_EXTRA_T(base->inputs[2], TB_NodeInt)->value;
+        base = base->inputs[1];
     }
 
     int64_t size;
@@ -564,6 +573,23 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                 TB_Node* base;
                 SimpleMemRef ref = find_simple_mem_ref(f, ctx, curr, &base);
 
+                // An index still in the base is not one slot. off(off(r, i*16), 8)
+                // and off(r, i*16+8) are the same element and must not be
+                // forwarded from whichever spelling was recorded first
+                // (polyz_unpack kept only the first byte of coeffs 2 and 3,
+                // so ML-DSA's z never passed the norm check).
+                if (base->type == TB_PTR_OFFSET) {
+                    TB_Node* root = base;
+                    while (root->type == TB_PTR_OFFSET) root = root->inputs[1];
+                    nl_table_for(e, non_aliasing) {
+                        MemorySet* old = e->v;
+                        TB_Node* old_root = old->base;
+                        while (old_root->type == TB_PTR_OFFSET) old_root = old_root->inputs[1];
+                        if (old_root == root) {
+                            nl_table_remove(non_aliasing, e->k);
+                        }
+                    }
+                } else {
                 MemorySet* set = memory_set_find_or_create(f, non_aliasing, base);
                 if (set->cnt == 0) {
                     TB_OPTLOG(MEMORY, printf("  INVALIDATE ALL!\n"));
@@ -578,15 +604,40 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                 } else {
                     // check if we clobbered any stores
                     int idx = find_aliasing_store(ctx, set, ref.offset);
+                    // Only the overwriting store may be the previous store's
+                    // user. A load of the value (xxhash process_1's
+                    // rotl*PRIME32_1) or an earlier field store that a later
+                    // load still observes (XXH3_len_9to16_128b's low half of
+                    // the widening multiply, hung off the high-half store)
+                    // is not dead: identity_dead_store would hand that load
+                    // the previous memory, the memset zero.
+                    bool sole_user_is_overwrite = false;
+                    if (idx >= 0 && idx < set->cnt && set->stores[idx].mem->user_count == 1) {
+                        TB_User only = set->stores[idx].mem->users[0];
+                        sole_user_is_overwrite = USERN(&only) == curr && USERI(&only) == 1;
+                    }
+                    TB_Node* covered = NULL;
                     if (
                         idx >= 0 && idx < set->cnt &&
                         !state->walked_once &&
-                        set->stores[idx].mem->user_count == 1 &&
+                        sole_user_is_overwrite &&
                         ref.index == set->stores[idx].index &&
                         ref.offset >= set->stores[idx].offset &&
                         set->stores[idx].offset + set->stores[idx].size <= ref.offset + ref.size
                     ) {
-                        TB_Node* st_mem = set->stores[idx].mem;
+                        covered = set->stores[idx].mem;
+                    }
+                    // PATCH(odin-tilde): a full overwrite only kills the previous
+                    // store when that store dominates this one. The alias set at
+                    // a merge is the union of every predecessor, so a later store
+                    // (the named-result copy-back) was deleting a store from one
+                    // arm. The load in the merge cannot be forwarded — that store
+                    // does not dominate it — and then read the zeroing memset.
+                    // mem_tlsf@block_locate_free lost the block pointer and every
+                    // TLSF allocation failed.
+                    TB_Node* covered_ctrl = covered ? covered->inputs[0] : NULL;
+                    if (covered && covered_ctrl != NULL && curr->inputs[0] != NULL && fast_dommy(covered_ctrl, curr->inputs[0])) {
+                        TB_Node* st_mem = covered;
 
                         // the entire previous write is eaten up by this write
                         TB_OPTLOG(MEMORY, printf("    DEAD-STORE %%%u\n", st_mem->gvn));
@@ -622,6 +673,7 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                             memory_set_insert(f, non_aliasing, set, 0, ref);
                         }
                     }
+                }
                 }
             }
 
@@ -710,7 +762,10 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                 TB_OPTLOG(MEMORY, printf("      REF [%%%u + %"PRId64"]\n", base->gvn, ref.offset));
 
                 MemorySet* set = nl_table_get(non_aliasing, base);
-                if (set) {
+                // Same gate as the store: a variable index is not a slot we
+                // can forward. The recorded store may be an earlier spelling
+                // of this address, or a different element entirely.
+                if (set && base->type != TB_PTR_OFFSET) {
                     int idx = find_aliasing_store(ctx, set, ref.offset);
                     if (idx < set->cnt && set->stores[idx].index == ref.index && set->stores[idx].offset == ref.offset && set->stores[idx].size == ref.size) {
                         TB_Node* st = set->stores[idx].mem;
@@ -934,6 +989,15 @@ int tb_opt_locals(TB_Function* f) {
                     dt = USERN(mem)->inputs[3]->dt;
                 }
             }
+        }
+
+        // PATCH(odin-tilde): a field address stored into an any is a value use
+        // of the pointer. Splitting that local onto its own memory chain lets
+        // fmt.println run before the store and read an uninitialized slot
+        // (len(s) compared as 16, but the printed number changes every run).
+        // Leave the local on the main chain.
+        if (mode != RENAME_NONE && addr_value_escapes(addr)) {
+            mode = RENAME_NONE;
         }
 
         done:
@@ -1195,6 +1259,9 @@ int tb_opt_locals(TB_Function* f) {
 
         CUIK_TIMED_BLOCK("kill nodes") {
             FOR_N(i, 0, ctx.local_count) if (!ctx.renames[i].is_alive) {
+                if (addr_value_escapes(ctx.renames[i].addr)) {
+                    continue;
+                }
                 // discover all dead stores and addresses
                 worklist_push(&sese_worklist, ctx.renames[i].addr);
 

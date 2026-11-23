@@ -88,6 +88,10 @@ enum {
     BUNDLE_INST_MAX = 1,
 };
 
+// sequentialize_reg_copies 拆并行拷贝环时，把被覆盖的值暂存到
+// 帧内 16 字节发射暂存（A64_EMIT_SCRATCH）。只对 a64 开启。
+#define TB_HAS_EMIT_SCRATCH 1
+
 #include "../codegen_impl.h"
 
 static void mach_dsl_init(Ctx* restrict ctx, TB_ABI abi) {
@@ -388,6 +392,11 @@ static TB_Node* mach_dfa_accept_12(Ctx* ctx, TB_Function* f, TB_Node* n) {
     TB_Node* $x = n->inputs[1];
     TB_DataType $dt = n->dt;
     float $prob = TB_NODE_GET_EXTRA_T(n, TB_NodeIf)->prob;
+
+    // 普通 if 以前一律 cmp 布尔值, #0。比较本身先 cset 再 uxtb。
+    // 融合失败（谓词不是比较，或浮点条件对不上）再走原来的 jcc_imm。
+    TB_Node* fused = a64_isel_if_branch(ctx, f, n);
+    if (fused) return fused;
 
     size_t k0_i = 0;
     TB_Node* k0 = tb_alloc_node(f, TB_a64_jcc_imm, TB_TYPE_TUPLE, 2, sizeof(A64Cond));

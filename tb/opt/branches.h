@@ -763,6 +763,7 @@ static TB_Node* ideal_if(TB_Function* f, TB_Node* n) {
                 }
 
                 if (match) {
+
                     // PATCH(odin-tilde): the merge below kills pred_branch
                     // assuming PROJ-only users. Odin's builder path can leave
                     // a stale TB_SYMBOL_TABLE attached to the branch (its

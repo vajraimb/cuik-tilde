@@ -70,6 +70,14 @@ static TB_BasicBlock* sched_into_good_block(TB_Function* f, TB_GetLatency get_la
 
 // schedule nodes such that they appear the least common
 // ancestor to all their users
+static bool bb_dominates(TB_BasicBlock* dom, TB_BasicBlock* bb) {
+    while (bb != dom) {
+        if (bb->dom == bb) { return false; }
+        bb = bb->dom;
+    }
+    return true;
+}
+
 static TB_BasicBlock* find_lca(TB_BasicBlock* a, TB_BasicBlock* b) {
     if (a == NULL) return b;
 
@@ -143,9 +151,16 @@ static bool node_true_dep_reaches(TB_Function* f, TB_Node* from, TB_Node* to) {
         TB_Node* n = aarray_pop(stack);
         if (set_get(&visited, n->gvn)) { continue; }
         set_put(&visited, n->gvn);
-        // phi/region inputs come from earlier iterations or predecessor blocks,
-        // walking them makes everything in a loop "reach" everything else
-        if (n->type == TB_PHI || NODE_ISA(n, REGION)) { continue; }
+        // phi/region inputs come from earlier iterations or predecessor blocks.
+        // root and the callgraph list every call, and constants are anchored
+        // on the root, so walking either makes every constant user "depend"
+        // on every store in the function. The pos load in asn1 then sinks
+        // past read_any and the slice length is zero.
+        if (n->type == TB_PHI || NODE_ISA(n, REGION) || n->type == TB_ROOT
+            || n->type == TB_CALLGRAPH || n->type == TB_ICONST
+            || n->type == TB_F32CONST || n->type == TB_F64CONST) {
+            continue;
+        }
         FOR_N(i, 0, n->input_count) {
             TB_Node* in = n->inputs[i];
             if (in == NULL) { continue; }
@@ -177,8 +192,29 @@ static void add_anti_deps_rec(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node*
                 // writes memory after un (sha3 rho-pi: ld's ctrl is past a
                 // call, the aliasing store hangs off the call's mem out)
                 if (node_true_dep_reaches(f, ld, un)) {
-                    anti_dep_walk_mem_out(f, cfg, ld, un, depth);
-                    continue;
+                    // Same address: the load reads the pre-store value.
+                    // node_true_dep_reaches is a false positive here (the
+                    // load does not use the store) and skipping the anti-dep
+                    // reloads after the store. internal_int_swap then writes
+                    // b.used back from the value it just stored into a.used.
+                    // a64 isel folds the pointer into ld_idx/st_idx before
+                    // this schedule, so the address node is gone. base+index
+                    // is the address (slice.swap: both slots get array[b]).
+                    bool same_addr = false;
+                    if (ld->type == TB_LOAD && un->type == TB_STORE
+                        && ld->input_count >= 3 && un->input_count >= 3
+                        && ld->inputs[ld->input_count - 1] == un->inputs[2]) {
+                        same_addr = true;
+                    } else if (ld->type == TB_a64_ld_idx && un->type == TB_a64_st_idx
+                        && ld->input_count >= 4 && un->input_count >= 4
+                        && ld->inputs[2] == un->inputs[2]
+                        && ld->inputs[3] == un->inputs[3]) {
+                        same_addr = true;
+                    }
+                    if (!same_addr) {
+                        anti_dep_walk_mem_out(f, cfg, ld, un, depth);
+                        continue;
+                    }
                 }
                 tb_node_add_extra(f, un, ld);
             }
@@ -202,6 +238,48 @@ static void anti_dep_walk_mem_out(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_N
 
 static void add_anti_deps(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* mem, TB_BasicBlock* early) {
     add_anti_deps_rec(f, cfg, ld, mem, 0);
+}
+
+// A load of `mem` sees that state. A memory phi that consumes `mem` is a
+// loop or a join; the body can store through the same address. Sinking the
+// load into the phi block (or anywhere the phi dominates) reloads the
+// post-store value. scan_identifier captured t.offset before the rune loop
+// and then reloaded it after advance_rune, so the slice length was 0 and
+// `package` stayed an identifier.
+static bool sinks_past_mem_phi(TB_Function* f, TB_Node* mem, TB_BasicBlock* dest) {
+    if (mem == NULL || dest == NULL) { return false; }
+    FOR_USERS(u, mem) {
+        TB_Node* un = USERN(u);
+        if (un->type != TB_PHI || un->dt.type != TB_TAG_MEMORY) { continue; }
+        TB_BasicBlock* phi_bb = f->scheduled[un->gvn];
+        if (phi_bb != NULL && bb_dominates(phi_bb, dest)) { return true; }
+    }
+    return false;
+}
+
+// A store to a global has no data dependence on a loop that reads a different
+// global, so late sched sinks it to the loop exit. name_test stores
+// main_wait = false and then spins on child_wait; the other thread does the
+// opposite. Moving the store below the spin leaves both threads waiting.
+// Locals still sink. A store whose memory input is the loop's own memory is
+// already scheduled after the loop by early sched, so this does not pull it
+// back out.
+static bool addr_is_global(TB_Node* addr) {
+    while (addr && addr->type == TB_PTR_OFFSET) { addr = addr->inputs[1]; }
+    return addr && addr->type == TB_SYMBOL;
+}
+
+static bool sinks_global_store_past_loop(TB_CFG* cfg, TB_Node* n, TB_BasicBlock* curr, TB_BasicBlock* dest) {
+    if (n->type != TB_STORE || n->input_count < 3 || curr == NULL || dest == NULL) { return false; }
+    if (!addr_is_global(n->inputs[2])) { return false; }
+    size_t count = aarray_length(cfg->blocks);
+    for (size_t i = 0; i < count; i++) {
+        TB_BasicBlock* h = &cfg->blocks[i];
+        if (h->start == NULL) { continue; }
+        if (h->start->type != TB_NATURAL_LOOP && h->start->type != TB_AFFINE_LOOP) { continue; }
+        if (bb_dominates(h, dest) && !bb_dominates(h, curr)) { return true; }
+    }
+    return false;
 }
 
 // the anti-dep edges only order things within a block, a load also can't sink
@@ -496,10 +574,44 @@ void tb_global_schedule(TB_Function* f, TB_Worklist* ws, TB_CFG cfg, bool early_
                         if (lca != NULL) {
                             TB_ASSERT_MSG(curr, "we made it to late sched without an early sched?");
 
+                            // Early placement can already be below a writer of this
+                            // memory state (the use block of r.pos is after read_any).
+                            // Late sched only walks downward, so the load stays there
+                            // and both slices of the cursor see the post-call value.
+                            // Hoist back to the anti-dep LCA when every input is ready.
+                            if (curr != lca && lca->dom_depth < curr->dom_depth && bb_dominates(lca, curr)) {
+                                bool inputs_ready = true;
+                                FOR_N(i, 0, n->input_count) {
+                                    TB_Node* in = n->inputs[i];
+                                    if (in == NULL) { continue; }
+                                    TB_BasicBlock* ib = f->scheduled[in->gvn];
+                                    if (ib != NULL && !bb_dominates(ib, lca)) {
+                                        inputs_ready = false;
+                                        break;
+                                    }
+                                }
+                                if (inputs_ready) {
+                                    f->scheduled[n->gvn] = lca;
+                                    FOR_USERS(u, n) {
+                                        TB_Node* un = USERN(u);
+                                        if (IS_PROJ(un) && USERI(u) == 0) {
+                                            f->scheduled[un->gvn] = lca;
+                                        }
+                                    }
+                                    curr = lca;
+                                }
+                            }
+
                             // replace old BB entry, also if old is a natural loop we might
                             // be better off hoisting the values if possible.
                             if (curr != lca && lca->dom_depth > curr->dom_depth) {
                                 TB_BasicBlock* better = sched_into_good_block(f, get_lat, n, curr, lca);
+                                if (anti_mem != NULL && sinks_past_mem_phi(f, anti_mem, better)) {
+                                    better = curr;
+                                }
+                                if (sinks_global_store_past_loop(&cfg, n, curr, better)) {
+                                    better = curr;
+                                }
                                 if (curr != better) {
                                     TB_OPTDEBUG(GCM)(
                                         printf("  LATE  %%%u into .bb%zu: ", n->gvn, better - cfg.blocks),
