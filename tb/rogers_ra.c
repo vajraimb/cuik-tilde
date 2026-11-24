@@ -118,6 +118,7 @@ static void insert_op_at_end(Ctx* ctx, Rogers* ra, TB_BasicBlock* bb, TB_Node* n
 static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* arena);
 static void compute_ordinals(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* arena);
 static bool interfere(Ctx* restrict ctx, Rogers* restrict ra, TB_Node* lhs, TB_Node* rhs);
+static void rogers_renumber_block(TB_BasicBlock* bb, Rogers* restrict ra);
 
 static void rogers_remat(Ctx* ctx, Rogers* ra, TB_Node* n, bool kill_node);
 static void better_spill_range(Ctx* ctx, Rogers* restrict ra, TB_Node* to_spill, size_t old_node_count);
@@ -866,6 +867,10 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                         // pin and the emitter would assert on shl-by-non-CL.
                         set_input(f, n, copy, shared_edge);
                         tb__insert_before(ctx, ctx->f, copy, n);
+                        // PATCH(odin-tilde): the copy now sits in n's block —
+                        // give it (and its shifted neighbours) true ordinals
+                        // (see rogers_renumber_block).
+                        rogers_renumber_block(f->scheduled[n->gvn], &ra);
 
                         if (in->user_count == 0) {
                             // delete the original def
@@ -939,6 +944,9 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
 
                     // place at the end of the pred BB to the phi, basically the latest point
                     insert_op_at_end(ctx, NULL, pred_bb, move);
+                    // PATCH(odin-tilde): edge copy landed in pred_bb — true
+                    // ordinals for it and its neighbours (see rogers_renumber_block).
+                    rogers_renumber_block(pred_bb, &ra);
                     changes = true;
                 } else {
                     rm = new_mask;
@@ -2492,6 +2500,25 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
 
     cuikperf_region_end();
     return true;
+}
+
+// PATCH(odin-tilde): renumber one block's ordinals after a node was
+// inserted into it during the CISC/phi resolution loops. compute_ordinals
+// ran before those loops; copies created inside them were scheduled
+// (f->scheduled set by tb__insert) but never numbered, so every
+// interfere()/order_after()/last_use_in_bb() query against them read
+// arena garbage — the verdict flipped run-to-run (identical IR, different
+// machine code; 873 functions / 490 such reads in one small program).
+// A zero fill is NOT a fix: 0 reads as "before everything" and relaxes
+// interference (tank miscompiled). The copy's true position is what the
+// interference semantics need, so rebuild the block timeline in place.
+static void rogers_renumber_block(TB_BasicBlock* bb, Rogers* restrict ra) {
+    int timeline = 1;
+    aarray_for(j, bb->items) {
+        TB_Node* n = bb->items[j];
+        ra->gvn2node[n->gvn] = n;
+        ra->order[n->gvn] = timeline++;
+    }
 }
 
 static void compute_ordinals(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* arena) {
