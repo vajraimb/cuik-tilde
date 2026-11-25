@@ -367,7 +367,9 @@ static Lattice* value_proj(TB_Function* f, TB_Node* n) {
     } else {
         TB_ASSERT(l->tag == LATTICE_TUPLE);
         int index = TB_NODE_GET_EXTRA_T(n, TB_NodeProj)->index;
-        return l->elems[index];
+        // PATCH(odin-tilde): a call's return / a callee's parameter lattice is
+        // in the prototype's family; the projection may pun it (see lattice_as_dt)
+        return lattice_as_dt(f, n->dt, l->elems[index]);
     }
 }
 
@@ -546,7 +548,8 @@ static Lattice* value_phi(TB_Function* f, TB_Node* n) {
     FOR_N(i, 1, n->input_count) {
         Lattice* ctrl = latuni_get(f, r->inputs[i - 1]);
         if (ctrl == &LIVE_IN_THE_SKY) {
-            Lattice* edge = latuni_get(f, n->inputs[i]);
+            // PATCH(odin-tilde): a ptr/int punned edge must not meet to BOT (see lattice_as_dt)
+            Lattice* edge = lattice_as_dt(f, n->dt, latuni_get(f, n->inputs[i]));
             l = lattice_meet(f, l, edge);
         }
     }
@@ -602,8 +605,9 @@ static Lattice* value_poison(TB_Function* f, TB_Node* n) {
 
 static Lattice* value_select(TB_Function* f, TB_Node* n) {
     Lattice* pred = lattice_truthy(latuni_get(f, n->inputs[1]));
-    Lattice* a = latuni_get(f, n->inputs[2]);
-    Lattice* b = latuni_get(f, n->inputs[3]);
+    // PATCH(odin-tilde): meet the arms in the select's own family (ptr/int punning, see lattice_as_dt)
+    Lattice* a = lattice_as_dt(f, n->dt, latuni_get(f, n->inputs[2]));
+    Lattice* b = lattice_as_dt(f, n->dt, latuni_get(f, n->inputs[3]));
     if (pred == &TOP_IN_THE_SKY || a == &TOP_IN_THE_SKY || b == &TOP_IN_THE_SKY) {
         return &TOP_IN_THE_SKY;
     }

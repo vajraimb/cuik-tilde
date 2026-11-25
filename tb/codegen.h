@@ -82,7 +82,14 @@ struct VReg {
     TB_Node* n;
 
     int16_t class;
-    int16_t assigned;
+    // PATCH(odin-tilde): was int16_t. Stack slots are handed out without
+    // reuse, one per spilled vreg, so a big function can need more than
+    // 32767 of them (core/rexcode/isa/x86/tests run_arithmetic_tests: 379
+    // source lines of #force_inline'd cases, ~97k instructions, LLVM gives
+    // it a 560 KiB frame). The slot number wrapped negative and the RA
+    // indexed its active table out of bounds (SIGBUS, no diagnostics).
+    // int keeps sizeof(VReg) unchanged (the padding was already there).
+    int assigned;
 
     RegMask* mask;
 

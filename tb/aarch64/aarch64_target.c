@@ -3772,14 +3772,25 @@ static void a64_promote_invariant_slots(TB_CGEmitter* e) {
         neu[p] = 0xF8400000u | ((uint32_t)imm9 << 12) | (31u << 5) | (uint32_t)csr[p];
     }
     a64_insert_insns(e, &nins, epi, neu, np);
+    // 循环入口只留装载：回边仍跳过它，第一次迭代靠顺序执行到达。
+    for (int p = 0; p < np; p++) {
+        int vs = poff[p] & 0x1FF;
+        if (psz[p] == 8) neu[p] = 0xF8400000u | ((uint32_t)vs << 12) | (31u << 5) | (uint32_t)csr[p];
+        else neu[p] = 0xB8400000u | ((uint32_t)vs << 12) | (31u << 5) | (uint32_t)csr[p];
+    }
+    a64_insert_insns(e, &nins, best_h, neu, np);
+    // PATCH(odin-tilde): the callee-saved register's save goes in the
+    // PROLOGUE, not next to the loop. The restore above sits in the single
+    // epilogue, which every return path reaches — a path that returns
+    // before the loop (core/crypto/x509 _ascii_eq_fold's `len(a) != len(b)`
+    // early exit) never executed a save placed at the loop entry and
+    // restored the caller's register from an unwritten frame hole
+    // (_dns_in_constraint then read its `name` pointer from it: SIGSEGV).
     for (int p = 0; p < np; p++) {
         int hs = hole[p] & 0x1FF;
-        int vs = poff[p] & 0x1FF;
-        neu[p * 2] = 0xF8000000u | ((uint32_t)hs << 12) | (31u << 5) | (uint32_t)csr[p];
-        if (psz[p] == 8) neu[p * 2 + 1] = 0xF8400000u | ((uint32_t)vs << 12) | (31u << 5) | (uint32_t)csr[p];
-        else neu[p * 2 + 1] = 0xB8400000u | ((uint32_t)vs << 12) | (31u << 5) | (uint32_t)csr[p];
+        neu[p] = 0xF8000000u | ((uint32_t)hs << 12) | (31u << 5) | (uint32_t)csr[p];
     }
-    a64_insert_insns(e, &nins, best_h, neu, np * 2);
+    a64_insert_insns(e, &nins, frame_at + 1, neu, np);
 }
 
 // 两个浮点比较或在一起：fcmp / cset / … / fcmp / cset / uxtb / cmp #0 / csel 1。
@@ -6469,7 +6480,58 @@ static void a64_drop_dead_csr_reloads(TB_CGEmitter* e) {
 }
 
 // 没有调用也能返回时，快路径不会碰的被调用者寄存器改到调用那边再保存。
+static const char* a64_post_fn_name; // post_emit 当前函数名（审计/调试用）
+// 调试开关（PATCH odin-tilde）：A64_SHRINK_SKIP=<文件> 逐行读函数名，名单内的函数
+// 本刀不动（用来二分出被改坏的函数）；A64_SHRINK_AUDIT=1 打印每次改动的概况；
+// A64_SHRINK_DUMP=<目录> 落盘改动前后的机器码字。
+static FILE* a64_shrink_skip_file;
+static char (*a64_shrink_skip_names)[256];
+static int a64_shrink_skip_count, a64_shrink_skip_cap;
+static bool a64_shrink_audit, a64_shrink_audit_init;
+static const char* a64_shrink_dump_dir;
+static bool a64_shrink_skip(const char* name) {
+    if (!name) return false;
+    for (int i = 0; i < a64_shrink_skip_count; i++) {
+        const char* a = a64_shrink_skip_names[i], *b = name;
+        while (*a && *a == *b) { a++; b++; }
+        if (*a == 0 && (*b == 0 || *b == '.' || *b == '-')) return true;
+    }
+    return false;
+}
+static void a64_shrink_load_skip(void) {
+    char line[512];
+    while (fgets(line, sizeof line, a64_shrink_skip_file)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r' || line[n - 1] == ' ')) line[--n] = 0;
+        if (!n) continue;
+        if (a64_shrink_skip_count == a64_shrink_skip_cap) {
+            a64_shrink_skip_cap = a64_shrink_skip_cap ? a64_shrink_skip_cap * 2 : 256;
+            a64_shrink_skip_names = (char(*)[256])realloc(a64_shrink_skip_names, (size_t)a64_shrink_skip_cap * 256);
+        }
+        snprintf(a64_shrink_skip_names[a64_shrink_skip_count++], 256, "%s", line);
+    }
+}
+static void a64_shrink_dump(const char* tag, const uint32_t* w, int n) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/shrink_%s.txt", a64_shrink_dump_dir, tag);
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+    fprintf(f, "== %s n=%d\n", a64_post_fn_name ? a64_post_fn_name : "?", n);
+    for (int i = 0; i < n; i++) fprintf(f, "%08x\n", w[i]);
+    fclose(f);
+}
 static void a64_shrink_nocall_saves(TB_CGEmitter* e) {
+    if (!a64_shrink_audit_init) {
+        a64_shrink_audit_init = true;
+        a64_shrink_audit = getenv("A64_SHRINK_AUDIT") != NULL;
+        a64_shrink_dump_dir = getenv("A64_SHRINK_DUMP");
+        const char* skip = getenv("A64_SHRINK_SKIP");
+        if (skip != NULL) {
+            a64_shrink_skip_file = fopen(skip, "r");
+            a64_shrink_load_skip();
+        }
+    }
+    if (a64_shrink_skip(a64_post_fn_name)) return;
     if (e->count < 32 || (e->count & 3u)) return;
     int nins = (int)(e->count / 4);
     if (nins > 1024) return;
@@ -6479,6 +6541,14 @@ static void a64_shrink_nocall_saves(TB_CGEmitter* e) {
         if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u ||
             (insn & 0xFFFFFC1Fu) == 0xD61F0000u || (insn & 0xFFFFFC1Fu) == 0xD63F0000u) return;
     }
+    // PATCH(odin-tilde): every GPR effect in the function must be
+    // decodable. The a64_gpr_r / a64_gpr_d queries below are the narrow
+    // decoders and answer "doesn't touch it" for an instruction they don't
+    // know, so a use of a callee-saved register by such an instruction
+    // would be invisible: its fast-path definition would look sinkable and
+    // be deleted. Same gate as a64_park_spills / a64_fast_fp_temps:
+    // unknown => leave the function.
+    for (int i = 0; i < nins; i++) if (!a64_insn_known_gpr(w[i])) return;
     uint8_t* fast = calloc((size_t)nins, 1);
     if (!fast) return;
     int stack[1024], sp = 0;
@@ -6600,6 +6670,12 @@ static void a64_shrink_nocall_saves(TB_CGEmitter* e) {
             int rd = (int)(w[cand[c]] & 31u);
             for (int j = 0; j < nins; j++) {
                 if (!fast[j] || j == cand[c]) continue;
+                // PATCH(odin-tilde): the sunk definition must be the register's
+                // only fast-path definition. With a second one (another sink or
+                // an ordinary def) a dependent sink such as `mov x20, x19` reads
+                // whichever value came last at the cold entry, not the one it
+                // read at its own position.
+                if (a64_gpr_d(w[j]) == rd) { csink[c] = 0; changed = 1; break; }
                 int rt, off, ist;
                 if (a64_sp_x8(w[j], &rt, &off, &ist) && rt == rd) continue;
                 if (!a64_gpr_r(w[j], rd)) continue;
@@ -6612,7 +6688,11 @@ static void a64_shrink_nocall_saves(TB_CGEmitter* e) {
     int sink_at[8], sink_rd[8], nsink = 0;
     int temp_for[32];
     for (int r = 0; r < 32; r++) temp_for[r] = -1;
-    uint8_t used_tmp = 0;
+    // PATCH(odin-tilde): was uint8_t, so `1u << t` for t = 9..15 truncated to
+    // zero and every sink got the same x9 — the second `mov x9, …` overwrote
+    // the first (core/crypto ed25519@verify / public_key_set_bytes verified
+    // every signature as invalid).
+    uint32_t used_tmp = 0;
     for (int c = 0; c < ncand; c++) {
         if (!csink[c]) continue;
         int i = cand[c];
@@ -6670,6 +6750,13 @@ static void a64_shrink_nocall_saves(TB_CGEmitter* e) {
         move[nmove++] = reg;
     }
     if (nmove == 0 && nsink == 0) { free(fast); return; }
+    if (a64_shrink_audit) {
+        fprintf(stderr, "[shrink] %s nins=%d F=%d epi=%d nmove=%d nsink=%d:", a64_post_fn_name ? a64_post_fn_name : "?", nins, F, epi, nmove, nsink);
+        for (int k = 0; k < nmove; k++) fprintf(stderr, " m%d@%d/%d", move[k], save_at[move[k]], rest_at[move[k]]);
+        for (int s = 0; s < nsink; s++) fprintf(stderr, " s%d@%d(tmp%d)", sink_rd[s], sink_at[s], temp_for[sink_rd[s]]);
+        fprintf(stderr, "\n");
+    }
+    if (a64_shrink_dump_dir) a64_shrink_dump("before", w, nins);
 
     uint32_t pay[24];
     int np = 0;
@@ -6743,6 +6830,7 @@ static void a64_shrink_nocall_saves(TB_CGEmitter* e) {
         if (i >= old_f && tgt == skip) a64_point_branch(w, i, rest_at0);
         else if (np && tgt == old_f) a64_point_branch(w, i, F);
     }
+    if (a64_shrink_dump_dir) a64_shrink_dump("after", w, nins);
     free(fast);
 }
 
@@ -7042,7 +7130,7 @@ static void a64_fast_fp_temps(TB_CGEmitter* e) {
 
 
 static void post_emit(Ctx* restrict ctx, TB_CGEmitter* e) {
-    (void)ctx;
+    a64_post_fn_name = ctx && ctx->f ? (const char*)ctx->f->super.name : NULL;
     // BISECT-PROBE: A64_KNIFE_CUTOFF=N runs only the first N knives
     // (unset = all). Finding the one that mangles _create's spill chain.
     static const struct { const char* name; void (*fn)(TB_CGEmitter*); } knives[] = {

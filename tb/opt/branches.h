@@ -626,7 +626,10 @@ static Lattice* value_call(TB_Function* f, TB_Node* n) {
         args->elems[1] = latuni_get(f, n->inputs[1]);
         args->elems[2] = &XNULL_IN_THE_SKY; // RPC is at least not NULL
         FOR_N(i, 3, elem_count) {
-            args->elems[i] = latuni_get(f, n->inputs[i]);
+            // PATCH(odin-tilde): argument lattices are met across call sites in the
+            // callee; a ptr/int punned argument must arrive in the parameter's family
+            // or two such call sites meet to BOT (see lattice_as_dt)
+            args->elems[i] = lattice_as_dt(f, callee->prototype->params[i - 3].dt, latuni_get(f, n->inputs[i]));
         }
 
         // intern & free

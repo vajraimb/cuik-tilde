@@ -251,6 +251,51 @@ static Lattice* lattice_from_dt(TB_Function* f, TB_DataType dt) {
     }
 }
 
+static bool lattice_is_ptrfam(Lattice* l) { return l->tag >= LATTICE_ALLPTR && l->tag <= LATTICE_PTRCON; }
+
+// 诊断开关：TB_LATTICE_AUDIT=1 把每次重定型打到 stderr（函数名 + 原格值 tag），
+// 用来量一个程序里指针/整数混用有多广（x509 测试：fmt 四个函数、slice、mem 都有）。
+static bool lattice_as_audit(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("TB_LATTICE_AUDIT") != NULL;
+    return on;
+}
+
+// PATCH(odin-tilde): the Odin backend puns pointers through integer-typed
+// nodes and integers through pointer-typed nodes without a conversion node, so
+// a value's lattice can belong to another family than the node that consumes
+// it. lattice_meet answers BOT for cross-family pairs, and the BOT then poisons
+// every phi / select / arith upstream: upstream asserts in value_arith
+// (fmt@fmt_soa_struct_internal), and an NDEBUG build reads the BOT's zeroed
+// union as the constant 0. A punned lattice carries no usable facts about the
+// target family, so model it as the top of that family.
+static Lattice* lattice_as_dt(TB_Function* f, TB_DataType dt, Lattice* l) {
+    // no facts to carry (bot/top), or not a scalar value family (tuple/memory/control)
+    if (l->tag <= LATTICE_TUPLE || l->tag >= LATTICE_MEMORY) return l;
+    bool same_family;
+    switch (dt.type) {
+        case TB_TAG_F32: same_family = l->tag >= LATTICE_FLT32 && l->tag <= LATTICE_FLTCON32 && (l->tag & 1u) == 0; break;
+        case TB_TAG_F64: same_family = l->tag >= LATTICE_FLT32 && l->tag <= LATTICE_FLTCON64 && (l->tag & 1u) == 1; break;
+        case TB_TAG_PTR: same_family = lattice_is_ptrfam(l); break;
+        case TB_TAG_BOOL: case TB_TAG_I8: case TB_TAG_I16: case TB_TAG_I32: case TB_TAG_I64:
+        same_family = l->tag == LATTICE_INT;
+        break;
+        default: return l;
+    }
+    if (same_family) return l;
+    if (lattice_as_audit()) fprintf(stderr, "[lat-as] %s: as_dt tag=%d -> dt=%d\n", f->super.name, l->tag, dt.type);
+    return lattice_from_dt(f, dt);
+}
+
+// Integer arithmetic only understands LATTICE_INT. Anything else (a punned
+// pointer or float, or a BOT that came out of a cross-family meet) is an
+// unknown integer: the full range of the operation's type.
+static Lattice* lattice_as_int(TB_Function* f, TB_DataType dt, Lattice* l) {
+    if (l->tag == LATTICE_INT) return l;
+    if (lattice_as_audit()) fprintf(stderr, "[lat-as] %s: as_int tag=%d (dt=%d)\n", f->super.name, l->tag, dt.type);
+    return TB_IS_INTEGER_TYPE(dt) ? lattice_from_dt(f, dt) : &I64_IN_THE_SKY;
+}
+
 static Lattice* lattice_branch_none(TB_Function* f, int succ_count) {
     TB_Arena* arena = get_permanent_arena(f->super.module);
 

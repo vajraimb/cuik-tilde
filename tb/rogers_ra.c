@@ -42,6 +42,16 @@ typedef struct {
     RegMask* clobber;
 } SplitDecision;
 
+// per-round index width for precolor_conflicts (see the PATCH there)
+enum { PC_MAX_REGS = 64 };
+
+// one candidate in a block's table: key = kind | class << 8 | register
+enum { PC_SLEEPER = 0, PC_FIXEDV = 1u << 16 };
+typedef struct {
+    uint32_t key;
+    uint32_t id; // sleeper: gvn; fixed-mask vreg: vreg index
+} PCEnty;
+
 typedef struct {
     Ctx* ctx;
     TB_Arena* arena;
@@ -67,6 +77,25 @@ typedef struct {
     Set been_spilled;
     SparseSet future_active[MAX_REG_CLASSES];
     Set live;
+
+    // PATCH(odin-tilde): precolor_conflicts indexes, rebuilt every round in
+    // allocate_loop (the arrays live in the round arena).
+    size_t pc_upto[MAX_REG_CLASSES];
+    bool pc_scan[MAX_REG_CLASSES];
+    uint32_t* pc_bkt[MAX_REG_CLASSES][PC_MAX_REGS];
+    uint32_t pc_bkt_len[MAX_REG_CLASSES][PC_MAX_REGS];
+    uint32_t pc_bkt_cap[MAX_REG_CLASSES][PC_MAX_REGS];
+    uint32_t* pc_fixed[MAX_REG_CLASSES][PC_MAX_REGS];
+    uint32_t pc_fixed_len[MAX_REG_CLASSES][PC_MAX_REGS];
+    uint32_t pc_fixed_cap[MAX_REG_CLASSES][PC_MAX_REGS];
+    // the block table: every sleeper / fixed-mask vreg live in pc_bb or defined in it
+    TB_BasicBlock* pc_bb;
+    size_t pc_seen[MAX_REG_CLASSES];
+    PCEnty* pc_ent;
+    uint32_t pc_ent_len, pc_ent_cap;
+    // PATCH(odin-tilde): TB_LATTICE-style self-check for the two indexes —
+    // TB_PC_AUDIT=1 runs the original scans as well and reports any disagreement.
+    unsigned long pc_audit_checked, pc_audit_bad;
 
     HRPRegion* hrp;
 
@@ -1428,6 +1457,9 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
 
             ctx->num_spills += ra.num_spills - starting_spills;
             // printf("ROUNDS ON %s: %d\n", f->super.name, rounds);
+            if (ra.pc_audit_checked) {
+                fprintf(stderr, "[pc-audit] %s: rounds=%d vregs=%zu checked=%lu bad=%lu\n", f->super.name, rounds, aarray_length(ctx->vregs), ra.pc_audit_checked, ra.pc_audit_bad);
+            }
             return;
         }
 
@@ -1821,9 +1853,10 @@ static void sweep_dead_actives(Ctx* restrict ctx, Rogers* restrict ra, int class
 static void mark_active(Ctx* restrict ctx, Rogers* restrict ra, int gvn) {
     VReg* vreg = &ctx->vregs[ctx->vreg_map[gvn]];
     if (vreg->class == REG_CLASS_STK) {
-        TB_ASSERT(vreg->assigned < ra->stack_reg_count);
+        TB_ASSERT_MSG(vreg->assigned >= 0 && vreg->assigned < ra->stack_reg_count, "mark_active: stack slot %d out of range (count %d) in %s", vreg->assigned, (int)ra->stack_reg_count, ctx->f->super.name);
     } else {
-        TB_ASSERT(vreg->assigned < ctx->num_regs[vreg->class]);
+        TB_ASSERT_MSG(vreg->class >= 0 && (size_t)vreg->class < ctx->num_classes && vreg->assigned >= 0 && (size_t)vreg->assigned < ctx->num_regs[vreg->class],
+            "mark_active: reg %d out of range for class %d in %s", vreg->assigned, (int)vreg->class, ctx->f->super.name);
     }
 
     // if there's a value already in the active slot and it's
@@ -2192,48 +2225,350 @@ static bool sets_interfere(Ctx* ctx, Rogers* ra, size_t cnt, TB_Node** set, TB_N
 // i64 `i`) or on a register some fixed-mask vreg needs (tank@observe: a split
 // copy kept R0 across the x0 param; priority coloring evicts it, the next
 // round's copy inherits R0 again, and the split loop never converges).
-static bool precolor_conflicts(Ctx* ctx, Rogers* ra, int vreg_id, size_t cnt, TB_Node** set, VReg** out_other) {
-    VReg* vreg = &ctx->vregs[vreg_id];
-    int class = vreg->class;
-    SparseSet* future = &ra->future_active[class];
-    FOR_N(i, 0, aarray_length(future->stack)) {
-        uint32_t og = future->stack[i];
-        TB_Node* other = ra->gvn2node[og];
-        int ov = og < aarray_length(ctx->vreg_map) ? ctx->vreg_map[og] : 0;
-        if (other == NULL || ov <= 0 || ov == vreg_id) { continue; }
+//
+// Both scans below used to walk every sleeping gvn / every vreg for each
+// pre-colored definition, i.e. "defs x vregs" per round. On a big function
+// that is the whole compile (core/encoding/entity generated.odin's 4877-block
+// switch: ~170s against LLVM's 1s). The register classes now answer from
+// structures built lazily per round:
+//
+//   block table   for a "narrow" vreg (below): the sleepers and fixed-mask
+//                 vregs that are live in its block or defined in it, read
+//                 off the block's live-in / live-out sets.
+//   pc_bkt        the sleepers, filed under every register they cover.
+//   pc_fixed      the fixed-mask vregs, per pinned register.
+//
+//   narrow        a vreg whose one node n is a plain (non-PHI, non-PROJ)
+//                 node, is not live-out of its defining block B, has no user
+//                 outside B and no phi behind it in B: it is dead at B's end.
+//                 interfere_in_block for it against a node m of another
+//                 block answers yes, in B, only if m is live-out of B or is
+//                 used in B past n (an upward-exposed use puts m in live_in;
+//                 a phi input of B does not, but sits before n so it answers
+//                 no anyway), and answers no in m's block (ordinals start at
+//                 1, so the "last use defaults to 1" case cannot fire). So
+//                 only values live in B or defined in B can be in the way.
+//
+// The candidates are the scans' (pc_bkt / pc_fixed in scan order, the block
+// table in bitset order — the pre-allocate loop reads "other" only for the
+// stack class, which never takes these paths), so the allocation is
+// unchanged. TB_PC_AUDIT=1 checks that claim query by query. Anything the
+// structures don't model (a class with more than PC_MAX_REGS registers) takes
+// the original scan.
 
+static void pc_push(TB_Arena* arena, void** arr, uint32_t* len, uint32_t* cap, size_t elem_size, const void* v) {
+    if (*len == *cap) {
+        uint32_t new_cap = *cap ? *cap * 2 : 16;
+        void* new_arr = tb_arena_alloc(arena, new_cap * elem_size);
+        if (*len) { memcpy(new_arr, *arr, *len * elem_size); }
+        *arr = new_arr;
+        *cap = new_cap;
+    }
+    memcpy((char*)*arr + (*len) * elem_size, v, elem_size);
+    (*len)++;
+}
+
+static void pc_index_future(Ctx* ctx, Rogers* ra, int class) {
+    SparseSet* future = &ra->future_active[class];
+    while (ra->pc_upto[class] < aarray_length(future->stack)) {
+        uint32_t og = future->stack[ra->pc_upto[class]++];
+        int ov = og < aarray_length(ctx->vreg_map) ? ctx->vreg_map[og] : 0;
+        if (ov <= 0) { continue; }
         VReg* o = &ctx->vregs[ov];
-        if (o->class != class || o->assigned < 0 ||
-            o->assigned + o->reg_width <= vreg->assigned || vreg->assigned + vreg->reg_width <= o->assigned) {
-            continue;
+        if (o->class != class || o->assigned < 0) { continue; }
+        if (o->assigned + o->reg_width > PC_MAX_REGS) {
+            ra->pc_scan[class] = true;
+            return;
+        }
+        FOR_N(r, 0, o->reg_width) {
+            int reg = o->assigned + r;
+            pc_push(ra->arena, (void**)&ra->pc_bkt[class][reg], &ra->pc_bkt_len[class][reg], &ra->pc_bkt_cap[class][reg], sizeof(uint32_t), &og);
+        }
+    }
+}
+
+static void pc_index_fixed(Ctx* ctx, Rogers* ra, int class) {
+    FOR_N(i, 1, aarray_length(ctx->vregs)) {
+        VReg* o = &ctx->vregs[i];
+        if (o->n == NULL || o->n->type == TB_NULL || o->mask == NULL || o->mask->class != class) { continue; }
+        int reg = fixed_reg_mask(o->mask);
+        if (reg < 0) { continue; }
+        if (reg >= PC_MAX_REGS) {
+            ra->pc_scan[class] = true;
+            return;
+        }
+        uint32_t idx = (uint32_t)i;
+        pc_push(ra->arena, (void**)&ra->pc_fixed[class][reg], &ra->pc_fixed_len[class][reg], &ra->pc_fixed_cap[class][reg], sizeof(uint32_t), &idx);
+    }
+}
+
+// is `gvn` live in block `bb`, or defined in it? (see `narrow` above)
+static bool pc_touches_block(TB_BasicBlock** scheduled, TB_BasicBlock* bb, uint32_t gvn) {
+    return scheduled[gvn] == bb || set_get(&bb->live_in, gvn) || set_get(&bb->live_out, gvn);
+}
+
+// file the sleepers / fixed-mask vregs that `gvn` is a member of into the block table
+static void pc_add_gvn(Ctx* ctx, Rogers* ra, uint32_t gvn) {
+    int ov = gvn < aarray_length(ctx->vreg_map) ? ctx->vreg_map[gvn] : 0;
+    if (ov <= 0) { return; }
+    VReg* o = &ctx->vregs[ov];
+
+    int cls = o->class;
+    if (cls > 0 && cls != REG_CLASS_STK && cls < ctx->num_classes && o->assigned >= 0 &&
+        sparse_set_test(&ra->future_active[cls], gvn)) {
+        if (o->assigned + o->reg_width > PC_MAX_REGS) {
+            ra->pc_scan[cls] = true;
+        } else {
+            FOR_N(r, 0, o->reg_width) {
+                PCEnty entry = { PC_SLEEPER | ((uint32_t)cls << 8) | (uint32_t)(o->assigned + r), gvn };
+                pc_push(ra->arena, (void**)&ra->pc_ent, &ra->pc_ent_len, &ra->pc_ent_cap, sizeof(PCEnty), &entry);
+            }
+        }
+    }
+
+    int mcls = o->mask != NULL ? o->mask->class : -1;
+    if (mcls > 0 && mcls != REG_CLASS_STK && mcls < ctx->num_classes) {
+        int reg = fixed_reg_mask(o->mask);
+        if (reg >= PC_MAX_REGS) {
+            ra->pc_scan[mcls] = true;
+            return;
+        }
+        if (reg >= 0) {
+            PCEnty entry = { PC_FIXEDV | ((uint32_t)mcls << 8) | (uint32_t)reg, (uint32_t)ov };
+            pc_push(ra->arena, (void**)&ra->pc_ent, &ra->pc_ent_len, &ra->pc_ent_cap, sizeof(PCEnty), &entry);
+        }
+    }
+}
+
+// candidates for the narrow queries in `bb`. Built once per block per round
+// from the block's live-in / live-out sets and its items (all read in order),
+// then extended with the sleepers that go to rest while the block is walked.
+// A value enters twice if it is both live-in and live-out; that only repeats a
+// check.
+static void pc_block_table(Ctx* ctx, Rogers* ra, TB_BasicBlock* bb) {
+    if (ra->pc_bb != bb) {
+        ra->pc_bb = bb;
+        ra->pc_ent_len = 0;
+        FOR_N(c, 0, ctx->num_classes) {
+            ra->pc_seen[c] = aarray_length(ra->future_active[c].stack);
         }
 
-        if (sets_interfere(ctx, ra, cnt, set, other)) {
+        Set* sets[2] = { &bb->live_in, &bb->live_out };
+        FOR_N(s, 0, 2) {
+            Set* set = sets[s];
+            FOR_N(j, 0, set->capacity / 64) {
+                uint64_t w = set->data[j];
+                while (w) {
+                    int b = tb_ffs64(w) - 1;
+                    w &= w - 1;
+                    pc_add_gvn(ctx, ra, (uint32_t)(j * 64 + b));
+                }
+            }
+        }
+        FOR_N(j, 0, aarray_length(bb->items)) {
+            pc_add_gvn(ctx, ra, bb->items[j]->gvn);
+        }
+    }
+
+    FOR_N(c, 0, ctx->num_classes) {
+        SparseSet* fut = &ra->future_active[c];
+        while (ra->pc_seen[c] < aarray_length(fut->stack)) {
+            uint32_t og = fut->stack[ra->pc_seen[c]++];
+            if (ra->gvn2node[og] != NULL && pc_touches_block(ctx->f->scheduled, bb, og)) {
+                pc_add_gvn(ctx, ra, og);
+            }
+        }
+    }
+}
+
+// one sleeping gvn against the pre-colored vreg's coalesce set
+static bool pc_sleeper_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t og, int vreg_id, VReg* vreg, size_t cnt, TB_Node** set, VReg** out_other) {
+    TB_Node* other = ra->gvn2node[og];
+    int ov = og < aarray_length(ctx->vreg_map) ? ctx->vreg_map[og] : 0;
+    if (other == NULL || ov <= 0 || ov == vreg_id) { return false; }
+
+    VReg* o = &ctx->vregs[ov];
+    if (o->class != class || o->assigned < 0 ||
+        o->assigned + o->reg_width <= vreg->assigned || vreg->assigned + vreg->reg_width <= o->assigned) {
+        return false;
+    }
+
+    if (sets_interfere(ctx, ra, cnt, set, other)) {
+        *out_other = o;
+        return true;
+    }
+    return false;
+}
+
+// vreg `i` (fixed to register `reg`) against the pre-colored vreg's coalesce set
+static bool pc_fixed_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t i, int vreg_id, int reg, size_t cnt, TB_Node** set, VReg** out_other) {
+    VReg* o = &ctx->vregs[i];
+    if (i == (uint32_t)vreg_id || o->n == NULL || o->n->type == TB_NULL || o->mask == NULL ||
+        o->mask->class != class || fixed_reg_mask(o->mask) != reg) {
+        return false;
+    }
+
+    size_t ocnt;
+    TB_Node* on = o->n;
+    TB_Node** oset = coalesce_set_array(ctx, ra, &on, &ocnt);
+    FOR_N(k, 0, ocnt) {
+        if (oset[k]->type != TB_NULL && sets_interfere(ctx, ra, cnt, set, oset[k])) {
             *out_other = o;
             return true;
         }
     }
+    return false;
+}
 
+// the original scans, kept as the reference for TB_PC_AUDIT
+static bool precolor_conflicts_scan(Ctx* ctx, Rogers* ra, int vreg_id, size_t cnt, TB_Node** set, VReg** out_other) {
+    VReg* vreg = &ctx->vregs[vreg_id];
+    int class = vreg->class;
+    SparseSet* future = &ra->future_active[class];
+    FOR_N(i, 0, aarray_length(future->stack)) {
+        if (pc_sleeper_conflicts(ctx, ra, class, future->stack[i], vreg_id, vreg, cnt, set, out_other)) { return true; }
+    }
     if (class != REG_CLASS_STK) {
         FOR_N(i, 1, aarray_length(ctx->vregs)) {
-            VReg* o = &ctx->vregs[i];
-            if (i == vreg_id || o->n == NULL || o->n->type == TB_NULL || o->mask == NULL ||
-                o->mask->class != class || fixed_reg_mask(o->mask) != vreg->assigned) {
-                continue;
-            }
-
-            size_t ocnt;
-            TB_Node* on = o->n;
-            TB_Node** oset = coalesce_set_array(ctx, ra, &on, &ocnt);
-            FOR_N(k, 0, ocnt) {
-                if (oset[k]->type != TB_NULL && sets_interfere(ctx, ra, cnt, set, oset[k])) {
-                    *out_other = o;
-                    return true;
-                }
-            }
+            if (pc_fixed_conflicts(ctx, ra, class, (uint32_t)i, vreg_id, vreg->assigned, cnt, set, out_other)) { return true; }
         }
     }
     return false;
+}
+
+static bool precolor_conflicts_index(Ctx* ctx, Rogers* ra, int vreg_id, size_t cnt, TB_Node** set, VReg** out_other) {
+    VReg* vreg = &ctx->vregs[vreg_id];
+    int class = vreg->class;
+    SparseSet* future = &ra->future_active[class];
+    TB_BasicBlock** scheduled = ctx->f->scheduled;
+
+    // true while the indexes model this query; any surprise falls back to the scans
+    bool indexed = class != REG_CLASS_STK && !ra->pc_scan[class] && vreg->assigned >= 0 && vreg->assigned < PC_MAX_REGS;
+
+    // one plain node, no user outside its own block, dead at the block's end,
+    // with no phi behind it: only values live in (or defined in) that block
+    // can be in the way
+    bool narrow = false;
+    TB_BasicBlock* bb = NULL;
+    if (cnt == 1 && set[0]->type != TB_PHI && set[0]->type != TB_PROJ) {
+        bb = scheduled[set[0]->gvn];
+        narrow = !set_get(&bb->live_out, set[0]->gvn);
+        FOR_USERS(u, set[0]) {
+            if (scheduled[USERN(u)->gvn] != bb) { narrow = false; break; }
+        }
+        if (narrow) {
+            // ordinals are item index + 1
+            for (size_t k = (size_t)ra->order[set[0]->gvn]; narrow && k < aarray_length(bb->items); k++) {
+                narrow = bb->items[k]->type != TB_PHI;
+            }
+        }
+    }
+
+    if (indexed && narrow) {
+        pc_block_table(ctx, ra, bb);
+        if (!ra->pc_scan[class]) {
+            uint32_t class_key = (uint32_t)class << 8;
+            PCEnty* ent = ra->pc_ent;
+            FOR_N(t, 0, ra->pc_ent_len) {
+                if ((ent[t].key & 0xFF00) != class_key) { continue; }
+                int reg = ent[t].key & 0xFF;
+                if ((ent[t].key >> 16) == PC_SLEEPER) {
+                    // the sleeper covers `reg`; n covers its own registers
+                    if (reg < vreg->assigned || reg >= vreg->assigned + vreg->reg_width) { continue; }
+                    if (pc_sleeper_conflicts(ctx, ra, class, ent[t].id, vreg_id, vreg, cnt, set, out_other)) { return true; }
+                } else {
+                    if (reg != vreg->assigned) { continue; }
+                    if (pc_fixed_conflicts(ctx, ra, class, ent[t].id, vreg_id, vreg->assigned, cnt, set, out_other)) { return true; }
+                }
+            }
+            return false;
+        }
+    }
+
+    if (indexed && vreg->reg_width == 1) {
+        pc_index_future(ctx, ra, class);
+        if (!ra->pc_scan[class]) {
+            int reg = vreg->assigned;
+            uint32_t* ids = ra->pc_bkt[class][reg];
+            FOR_N(i, 0, ra->pc_bkt_len[class][reg]) {
+                if (pc_sleeper_conflicts(ctx, ra, class, ids[i], vreg_id, vreg, cnt, set, out_other)) { return true; }
+            }
+            goto fixed;
+        }
+    }
+
+    FOR_N(i, 0, aarray_length(future->stack)) {
+        if (pc_sleeper_conflicts(ctx, ra, class, future->stack[i], vreg_id, vreg, cnt, set, out_other)) { return true; }
+    }
+
+    fixed:
+    if (class == REG_CLASS_STK) { return false; }
+
+    if (indexed) {
+        pc_index_fixed(ctx, ra, class);
+        if (!ra->pc_scan[class]) {
+            int reg = vreg->assigned;
+            uint32_t* ids = ra->pc_fixed[class][reg];
+            FOR_N(t, 0, ra->pc_fixed_len[class][reg]) {
+                if (pc_fixed_conflicts(ctx, ra, class, ids[t], vreg_id, reg, cnt, set, out_other)) { return true; }
+            }
+            return false;
+        }
+    }
+
+    FOR_N(i, 1, aarray_length(ctx->vregs)) {
+        if (pc_fixed_conflicts(ctx, ra, class, (uint32_t)i, vreg_id, vreg->assigned, cnt, set, out_other)) { return true; }
+    }
+    return false;
+}
+
+static bool precolor_conflicts(Ctx* ctx, Rogers* ra, int vreg_id, size_t cnt, TB_Node** set, VReg** out_other) {
+    // TB_PC_AUDIT=1: answer from the original scans and check the indexes
+    // against them (see the Rogers fields pc_audit_*).
+    static int audit_on = -1;
+    if (audit_on < 0) { audit_on = getenv("TB_PC_AUDIT") != NULL; }
+    if (!audit_on) {
+        return precolor_conflicts_index(ctx, ra, vreg_id, cnt, set, out_other);
+    }
+
+    VReg* ref_other = NULL;
+    VReg* got_other = NULL;
+    bool ref = precolor_conflicts_scan(ctx, ra, vreg_id, cnt, set, &ref_other);
+    bool got = precolor_conflicts_index(ctx, ra, vreg_id, cnt, set, &got_other);
+    ra->pc_audit_checked++;
+    // only the answer is compared: the block table visits candidates in bitset
+    // order, so "other" may differ, and the pre-allocate loop only reads it
+    // for the stack class (which never takes the index path).
+    if (ref != got) {
+        ra->pc_audit_bad++;
+        TB_Node* n0 = set[0];
+        TB_Node* m = ref_other ? ref_other->n : NULL;
+        TB_BasicBlock** sc = ctx->f->scheduled;
+        TB_BasicBlock* bb = sc[n0->gvn];
+        fprintf(stderr, "[pc-audit] %s: V%d scan=%d index=%d (other %td vs %td) narrow=%d cnt=%zu reg=%d width=%d\n", ctx->f->super.name, vreg_id, ref, got,
+            ref ? ref_other - ctx->vregs : (ptrdiff_t)-1, got ? got_other - ctx->vregs : (ptrdiff_t)-1,
+            (int)(cnt == 1 && n0->type != TB_PHI && n0->type != TB_PROJ), cnt, ctx->vregs[vreg_id].assigned, ctx->vregs[vreg_id].reg_width);
+        fprintf(stderr, "[pc-audit]   n gvn=%u type=%d blk=%td order=%d live_out=%d users=%u", n0->gvn, n0->type, bb - ctx->cfg.blocks, ra->order[n0->gvn],
+            (int)set_get(&bb->live_out, n0->gvn), n0->user_count);
+        FOR_USERS(u, n0) { fprintf(stderr, " [u gvn=%u type=%d blk=%td]", USERN(u)->gvn, USERN(u)->type, sc[USERN(u)->gvn] ? sc[USERN(u)->gvn] - ctx->cfg.blocks : (ptrdiff_t)-1); }
+        fprintf(stderr, "\n");
+        if (m) {
+            int cls = ctx->vregs[vreg_id].class, reg = ctx->vregs[vreg_id].assigned;
+            int in_fixed = 0, fixed_len = -1, bucket_len = -1, in_table = 0;
+            if (reg >= 0 && reg < PC_MAX_REGS) {
+                fixed_len = (int)ra->pc_fixed_len[cls][reg], bucket_len = (int)ra->pc_bkt_len[cls][reg];
+                FOR_N(t, 0, ra->pc_fixed_len[cls][reg]) { if (ra->pc_fixed[cls][reg][t] == (uint32_t)(ref_other - ctx->vregs)) { in_fixed = 1; } }
+            }
+            FOR_N(t, 0, ra->pc_ent_len) { if (ra->pc_ent[t].id == m->gvn || ra->pc_ent[t].id == (uint32_t)(ref_other - ctx->vregs)) { in_table++; } }
+            fprintf(stderr, "[pc-audit]   m gvn=%u type=%d blk=%td in_future=%d fixed=%d sched_bb=%d live_in=%d live_out=%d | cls=%d mcls=%d mreg=%d scan=%d fixed_len=%d in_fixed=%d bucket_len=%d table=%u in_table=%d\n", m->gvn, m->type,
+                sc[m->gvn] ? sc[m->gvn] - ctx->cfg.blocks : (ptrdiff_t)-1, (int)sparse_set_test(&ra->future_active[ctx->vregs[ref_other - ctx->vregs].class], m->gvn),
+                (int)(ref_other->mask ? fixed_reg_mask(ref_other->mask) : -2), (int)(sc[m->gvn] == bb),
+                (int)set_get(&bb->live_in, m->gvn), (int)set_get(&bb->live_out, m->gvn),
+                cls, ref_other->class, ref_other->assigned, (int)ra->pc_scan[cls], fixed_len, in_fixed, bucket_len, ra->pc_ent_len, in_table);
+        }
+    }
+    if (ref) { *out_other = ref_other; }
+    return ref;
 }
 
 static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
@@ -2433,8 +2768,11 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
     if (hint_vreg < 0) {
         hint_vreg = -hint_vreg;
 
-        int hint_class = hint_vreg >> 16;
-        hint_reg = hint_class == mask->class ? hint_vreg & 0xFFFF : -1;
+        // PATCH(odin-tilde): the packed eviction hint is class<<24 | reg
+        // (was class<<16 | reg): stack slot numbers can exceed 65535 in
+        // very large functions now that VReg.assigned is an int.
+        int hint_class = hint_vreg >> 24;
+        hint_reg = hint_class == mask->class ? (hint_vreg & 0xFFFFFF) : -1;
     }
 
     int spilled = -1;
@@ -2476,7 +2814,7 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
         } else {
             // leave uncolored but we'll ideally steal the same reg as was evicted.
             TB_ASSERT(evicted_reg >= 0);
-            vreg->hint_vreg = -((mask->class << 16u) | evicted_reg);
+            vreg->hint_vreg = -((mask->class << 24) | evicted_reg);
             set_put(&ra->been_spilled, vreg_id);
             dyn_array_put(ra->prio_alloc, n);
             cuikperf_region_end();
@@ -2688,6 +3026,21 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     FOR_N(i, 0, ctx->num_classes) {
         ra->future_active[i] = sparse_set_alloc(arena, ctx->f->node_count);
     }
+
+    // PATCH(odin-tilde): the precolor_conflicts indexes only describe this
+    // round's future_active (fresh above) and start empty.
+    memset(ra->pc_upto, 0, sizeof ra->pc_upto);
+    memset(ra->pc_scan, 0, sizeof ra->pc_scan);
+    memset(ra->pc_bkt, 0, sizeof ra->pc_bkt);
+    memset(ra->pc_bkt_len, 0, sizeof ra->pc_bkt_len);
+    memset(ra->pc_bkt_cap, 0, sizeof ra->pc_bkt_cap);
+    memset(ra->pc_fixed, 0, sizeof ra->pc_fixed);
+    memset(ra->pc_fixed_len, 0, sizeof ra->pc_fixed_len);
+    memset(ra->pc_fixed_cap, 0, sizeof ra->pc_fixed_cap);
+    memset(ra->pc_seen, 0, sizeof ra->pc_seen);
+    ra->pc_bb = NULL;
+    ra->pc_ent = NULL;
+    ra->pc_ent_len = ra->pc_ent_cap = 0;
 
     TB_BasicBlock** scheduled = ctx->f->scheduled;
     TB_Node* root = ctx->f->root_node;

@@ -184,7 +184,15 @@ static uint64_t mulhs(uint64_t u, uint64_t v, int bits) {
 static bool mul_overflow(uint64_t u, uint64_t v, int bits, int64_t* out) {
     *out = u * v;
     uint64_t high = mulhs(u, v, bits);
-    return (*out < 0 ? high + 1 : high) != 0;
+    // PATCH(odin-tilde): the product fits in signed `bits` when its high half is
+    // just the sign extension of the low half's top bit. The test below used the
+    // 64-bit sign of *out, which for a narrower op is never the op's sign bit:
+    // i16 15*3329 = 49935 (high half 0, bit 15 set) was reported as fitting, so
+    // value_arith built the range [0, -15601] (min<=max asserted in
+    // _mlkem@poly_decompress) and will_mul_overflow said no on a real overflow.
+    // Same answer as before at 64 bits.
+    int64_t sign = (*out >> (bits - 1)) & 1;
+    return (sign ? high + 1 : high) != 0;
 }
 
 static bool add_overflow(uint64_t u, uint64_t v, int bits, int64_t* out) {
@@ -272,11 +280,13 @@ static void known_bits_add(uint64_t a_zeros, uint64_t a_ones, uint64_t b_zeros, 
 static Lattice* value_arith_raw(TB_Function* f, TB_NodeTypeEnum type, TB_DataType dt, Lattice* a, Lattice* b, bool congruent, bool at_top) {
     // PATCH(odin-tilde): the Odin backend feeds pointer values directly into
     // integer-typed arith (ptr/int punning via transmute), so an operand's
-    // lattice can be ptr-family while the op's dt is an int type. Model any
-    // ptr lattice as the full int range for this op — upstream never emits
-    // this shape (asserts in fmt@fmt_write_array at stage>=1).
-    if (a->tag >= LATTICE_ALLPTR && a->tag <= LATTICE_PTRCON) { a = lattice_from_dt(f, dt); }
-    if (b->tag >= LATTICE_ALLPTR && b->tag <= LATTICE_PTRCON) { b = lattice_from_dt(f, dt); }
+    // lattice can be ptr-family while the op's dt is an int type — upstream
+    // never emits this shape (asserts in fmt@fmt_write_array at stage>=1).
+    // Any non-int operand is an unknown integer (see lattice_as_int); a BOT
+    // in particular must not fall through, an NDEBUG build would read its
+    // zeroed union as the constant 0.
+    a = lattice_as_int(f, dt, a);
+    b = lattice_as_int(f, dt, b);
     int bits = tb_data_type_bit_size(NULL, dt.type);
     int64_t mask = tb__mask(bits);
     int64_t imin = lattice_int_min(bits);
@@ -349,6 +359,15 @@ static Lattice* value_arith_raw(TB_Function* f, TB_NodeTypeEnum type, TB_DataTyp
     // sign extend our integers now
     min |= min & imin ? ~mask : 0;
     max |= max & imin ? ~mask : 0;
+
+    // PATCH(odin-tilde): an operand range that is not a canonical signed value
+    // of the op's width (a narrow node carrying a wider or unsigned range) can
+    // slip past the overflow checks, and the wrap then reorders the endpoints
+    // after the sign extension above (min=0, max=-15601 asserted in
+    // lattice_gimme_int3). Such a range says nothing: full signed range.
+    if (min > max) {
+        min = imin, max = imax;
+    }
 
     if (min == max) {
         Lattice* t = lattice_intern(f, (Lattice){ LATTICE_INT, ._int = { min, min, ~min, min } });
