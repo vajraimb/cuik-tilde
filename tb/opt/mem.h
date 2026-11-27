@@ -70,6 +70,14 @@ typedef struct {
 
     size_t postorder_len;
     MemoryState** postorder_states;
+
+    // PATCH(odin-tilde): the local that owns an address, by the address's gvn
+    // (1 + index, 0 = none) — see find_local_idx
+    int32_t* addr_idx;
+    size_t addr_idx_cap;
+
+    // PATCH(odin-tilde): the local phis that are still stubs (see PhiStub)
+    ArenaArray(TB_Node*) stub_phis;
 } LocalSplitter;
 
 static int bits_in_data_type(int pointer_size, TB_DataType dt);
@@ -124,6 +132,14 @@ static int find_local_idx(LocalSplitter* restrict ctx, TB_Node* n) {
         n = n->inputs[1];
     }
 
+    // PATCH(odin-tilde): looked up by gvn. The scan below ran over every
+    // local for every load and store of the function — on
+    // named_xml_entity_to_rune, 7224 locals x 31k memory operations.
+    if (ctx->addr_idx != NULL) {
+        uint32_t g = n->gvn;
+        return g < ctx->addr_idx_cap ? ctx->addr_idx[g] : 0;
+    }
+
     FOR_N(i, 0, ctx->local_count) {
         if (ctx->renames[i].addr == n) {
             return 1 + i;
@@ -139,6 +155,89 @@ enum {
 
 static TB_Node* node_or_poison(TB_Function* f, TB_Node* n, TB_DataType dt) {
     return n ? n : make_poison(f, dt);
+}
+
+// PATCH(odin-tilde): a local phi starts as a stub. The pass used to build
+// every local's phi at every merge in full: input arrays for each
+// predecessor, a poison node for every path that never defined the local
+// (GVN discarded nearly all of them, but each was still allocated, linked
+// into the root and hashed), and one set_input per (path x local). Whether
+// the phi is wanted at all is only known once the merge's successors have
+// been walked — a load of the local there is what gives it a user.
+// named_xml_entity_to_rune: 7224 locals x 2408 paths, 17.4M poison edges,
+// and not one of the phis was ever read.
+//
+// A stub has no input arrays (phi->inputs == NULL), holds its real inputs
+// in a PhiStub in the tmp arena (through phi->use_pos, which nothing reads
+// while there are no inputs) and is not in the worklist. The first time it
+// is used as an operand it is built in full — same inputs as before, poison
+// where the path never defined the local — and marked; a stub nobody read is
+// dropped at the end of the walk.
+typedef struct {
+    TB_Node* region;
+    int pred_count;
+    int cnt, cap;
+    int* slots;
+    TB_Node** vals;
+} PhiStub;
+
+static inline bool phi_is_stub(TB_Node* n) {
+    return n != NULL && n->type == TB_PHI && n->inputs == NULL;
+}
+
+static void phi_stub_record(TB_Function* f, TB_Node* phi, int slot, TB_Node* val) {
+    PhiStub* s = (PhiStub*) phi->use_pos;
+    // a later fill of a slot replaces the earlier one, as set_input would on
+    // a built phi; an empty value clears it (poison, once materialized)
+    int w = 0;
+    FOR_N(k, 0, s->cnt) {
+        if (s->slots[k] != slot) {
+            s->slots[w] = s->slots[k];
+            s->vals[w] = s->vals[k];
+            w++;
+        }
+    }
+    s->cnt = w;
+    if (val == NULL) { return; }
+
+    if (s->cnt == s->cap) {
+        int new_cap = s->cap ? s->cap * 2 : 2;
+        int* slots = tb_arena_alloc(&f->tmp_arena, new_cap * sizeof(int));
+        TB_Node** vals = tb_arena_alloc(&f->tmp_arena, new_cap * sizeof(TB_Node*));
+        memcpy(slots, s->slots, s->cnt * sizeof(int));
+        memcpy(vals, s->vals, s->cnt * sizeof(TB_Node*));
+        s->slots = slots, s->vals = vals, s->cap = new_cap;
+    }
+    s->slots[s->cnt] = slot;
+    s->vals[s->cnt] = val;
+    s->cnt++;
+}
+
+static void phi_stub_materialize(TB_Function* f, TB_Node* phi) {
+    PhiStub* s = (PhiStub*) phi->use_pos;
+    int n = s->pred_count;
+
+    phi->input_cap = n;
+    phi->input_count = n;
+    phi->inputs = tb_arena_alloc(&f->arena, n * sizeof(TB_Node*));
+    phi->use_pos = tb_arena_alloc(&f->arena, n * sizeof(uint32_t));
+    FOR_N(i, 0, n) {
+        phi->inputs[i] = NULL;
+        phi->use_pos[i] = UINT32_MAX;
+    }
+    set_input(f, phi, s->region, 0);
+    FOR_N(k, 0, s->cnt) {
+        TB_Node* in = s->vals[k];
+        if (phi_is_stub(in)) { phi_stub_materialize(f, in); }
+        if (in != NULL) { set_input(f, phi, in, s->slots[k]); }
+    }
+    // the paths that never defined the local read poison
+    TB_Node* poison = NULL;
+    FOR_N(j, 1, n) if (phi->inputs[j] == NULL) {
+        poison = poison ? poison : make_poison(f, phi->dt);
+        set_input(f, phi, poison, j);
+    }
+    mark_node(f, phi);
 }
 
 static SimpleMemRef find_simple_mem_ref(TB_Function* f, LocalSplitter* ctx, TB_Node* mem, TB_Node** out_base) {
@@ -420,18 +519,26 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                     continue;
                 }*/
 
-                TB_Node* new_phi = tb_alloc_node(f, TB_PHI, ctx->renames[i].dt, curr->input_count, 0);
-                set_input(f, new_phi, region, 0);
-                mark_node(f, new_phi);
-
-                phis[i] = latest[1 + i] = new_phi;
-                TB_OPTLOG(MEMORY, printf("  PHI %%%u\n", new_phi->gvn));
-
+                TB_Node* new_phi;
                 if (ctx->renames[i].is_mem) {
+                    new_phi = tb_alloc_node(f, TB_PHI, ctx->renames[i].dt, curr->input_count, 0);
+                    set_input(f, new_phi, region, 0);
+                    mark_node(f, new_phi);
+
                     // they're all part of the same set
                     state->refs += 1;
                     nl_table_put(sese2set, new_phi, state);
+                } else {
+                    // PATCH(odin-tilde): a stub until something reads the local past this merge (see PhiStub)
+                    new_phi = tb_alloc_node_dyn(f, TB_PHI, ctx->renames[i].dt, 0, 0, 0);
+                    PhiStub* stub = tb_arena_alloc(&f->tmp_arena, sizeof(PhiStub));
+                    *stub = (PhiStub){ .region = region, .pred_count = curr->input_count };
+                    new_phi->use_pos = (uint32_t*) stub;
+                    aarray_push(ctx->stub_phis, new_phi);
                 }
+
+                phis[i] = latest[1 + i] = new_phi;
+                TB_OPTLOG(MEMORY, printf("  PHI %%%u\n", new_phi->gvn));
             }
 
             state->phis = phis;
@@ -456,12 +563,21 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
             FOR_N(j, 1, curr->input_count) {
                 MemoryState* pred = start_of_memory_sese(sese2set, curr->inputs[j]);
                 FOR_N(i, 0, ctx->local_count) {
-                    if (state->phis[i]) {
-                        if (pred->latest[1 + i] == NULL) {
-                            pred->latest[1 + i] = make_poison(f, state->phis[i]->dt);
-                        }
+                    TB_Node* phi = state->phis[i];
+                    if (phi == NULL) { continue; }
 
-                        set_input(f, state->phis[i], pred->latest[1 + i], j);
+                    TB_Node* val = pred->latest[1 + i];
+                    // a predecessor's value may itself be a stub from an earlier merge
+                    if (phi_is_stub(val)) { phi_stub_materialize(f, val); }
+                    if (phi_is_stub(phi)) {
+                        // PATCH(odin-tilde): recorded, not linked — poison stays implicit until the phi is materialized
+                        phi_stub_record(f, phi, j, val);
+                    } else {
+                        if (val == NULL) {
+                            val = make_poison(f, phi->dt);
+                            pred->latest[1 + i] = val;
+                        }
+                        set_input(f, phi, val, j);
                     }
                 }
 
@@ -477,10 +593,10 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                     continue;
                 }
 
-                if (n->dt.type == TB_TAG_VOID && n->user_count == 0) {
-                    TB_OPTLOG(MEMORY, printf("  KILL %%%u\n", n->gvn));
+                    if (n->dt.type == TB_TAG_VOID && n->user_count == 0) {
+                        TB_OPTLOG(MEMORY, printf("  KILL %%%u\n", n->gvn));
 
-                    tb_violent_kill(f, state->phis[i]);
+                        tb_violent_kill(f, state->phis[i]);
                     state->phis[i] = NULL;
                     if (latest) {
                         latest[1 + i] = NULL;
@@ -802,20 +918,23 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                 if (latest) {
                     TB_OPTLOG(MEMORY, printf("      ELIM %%%u => %%%u\n", use_n->gvn, val->gvn));
 
+                    // PATCH(odin-tilde): the first read of the local past its merge is what the stub was waiting for
+                    if (phi_is_stub(val)) { phi_stub_materialize(f, val); }
+
                     if (use_n->dt.raw != val->dt.raw) {
                         // it's one of the half constructed phis we've got laying around
                         if (val->type == TB_PHI && val->dt.type == TB_TAG_VOID) {
                             val->dt = use_n->dt;
                         } else {
-                            // insert bitcast
-                            TB_Node* cast = tb_alloc_node(f, TB_BITCAST, use_n->dt, 2, 0);
-                            set_input(f, cast, val, 1);
-                            val = cast;
-                        }
+                        // insert bitcast
+                        TB_Node* cast = tb_alloc_node(f, TB_BITCAST, use_n->dt, 2, 0);
+                        set_input(f, cast, val, 1);
+                        val = cast;
                     }
+                }
 
-                    int old = val->user_count;
-                    subsume_node(f, use_n, val);
+                int old = val->user_count;
+                subsume_node(f, use_n, val);
                     if (val->user_count != old) {
                         CUIK_TIMED_BLOCK("mark") {
                             mark_node_n_users(f, val);
@@ -952,6 +1071,8 @@ int tb_opt_locals(TB_Function* f) {
     // find all locals
     LocalSplitter ctx = { 0 };
     TB_ArenaSavepoint sp = tb_arena_save(&f->tmp_arena);
+    // PATCH(odin-tilde): the stubs live in the same savepoint
+    ctx.stub_phis = aarray_create(&f->tmp_arena, TB_Node*, 64);
     ArenaArray(TB_Node*) locals = aarray_create(&f->tmp_arena, TB_Node*, 32);
 
     FOR_USERS(u, f->root_node) {
@@ -1021,6 +1142,15 @@ int tb_opt_locals(TB_Function* f) {
     }
 
     ctx.local_count = j;
+
+    // PATCH(odin-tilde): find_local_idx's table. Filled from the top so that
+    // the lowest index wins, as the scan it replaces did.
+    ctx.addr_idx_cap = tb_next_pow2(f->node_count + 64);
+    ctx.addr_idx = tb_arena_alloc(&f->tmp_arena, ctx.addr_idx_cap * sizeof(int32_t));
+    memset(ctx.addr_idx, 0, ctx.addr_idx_cap * sizeof(int32_t));
+    FOR_REV_N(i, 0, ctx.local_count) {
+        ctx.addr_idx[ctx.renames[i].addr->gvn] = 1 + i;
+    }
 
     // let's rewrite values & memory
     TB_Node* first_mem = next_mem_user(f->params[1]);
@@ -1196,6 +1326,18 @@ int tb_opt_locals(TB_Function* f) {
             }
             nl_table_free(non_aliasing);
             nl_table_free(sese2set);
+        }
+
+        // PATCH(odin-tilde): local phis nobody read past their merge (see PhiStub)
+        CUIK_TIMED_BLOCK("drop stubs") {
+            aarray_for(i, ctx.stub_phis) {
+                TB_Node* phi = ctx.stub_phis[i];
+                if (phi_is_stub(phi)) {
+                    // never an operand: no load of the local past its merge
+                    TB_ASSERT(phi->user_count == 0);
+                    phi->type = TB_NULL;
+                }
+            }
         }
 
         CUIK_TIMED_BLOCK("phi identities") {

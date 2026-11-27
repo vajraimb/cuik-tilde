@@ -134,12 +134,17 @@ typedef struct {
     unsigned long pc_audit_checked, pc_audit_bad;
     unsigned long pc_reg_checked, pc_reg_bad, pc_audit_stale, pc_exp_checked;
     // TB_PC_STATS=1 prints them per function
-    unsigned long long pc_stat[16];
-    // ra_split.c: per value, the blocks it is live-in / live-out of, read off
-    // the block bitsets once per allocate_loop call (liveness does not change
-    // while the round runs); pc_lv_count is the node count they were built
-    // for — later batches of the round see newer nodes, which have no bits
-    bool pc_lv_built;
+    unsigned long long pc_stat[18];
+    // per round: for each block its live-in and then its live-out vregs in
+    // ascending gvn order — the one walk the allocator makes over the
+    // liveness bitsets (see pc_liv_build)
+    uint32_t* pc_liv;
+    uint32_t pc_liv_len, pc_liv_cap;
+    size_t* pc_lin_at;   // [bb] -> first live-in entry, [bb_count] -> end
+    size_t* pc_lout_at;  // [bb] -> first live-out entry; they run to pc_lin_at[bb + 1]
+    // and the transpose, per value: the blocks it is live-in / live-out of.
+    // pc_lv_count is the node count they were built for — nodes the round's
+    // splitter creates later have no blocks
     size_t pc_lv_count;
     int32_t* pc_lv_in_start;
     uint32_t* pc_lv_in;
@@ -633,6 +638,38 @@ static void gimme_lifetime(Ctx* ctx, Rogers* ra, TB_BasicBlock** scheduled, TB_B
     range[1] = end_t;
 }
 
+// PATCH(odin-tilde): one block of mark_node_as_hrp
+static void hrp_mark_block(Ctx* ctx, Rogers* ra, TB_BasicBlock** scheduled, size_t bb_id, TB_Node* n, TB_Node* failed, int reg_class) {
+    TB_BasicBlock* bb = &ctx->cfg.blocks[bb_id];
+    HRPRegion* hrp = &ra->hrp[bb_id];
+
+    // Fully HRP already
+    if (hrp->start[reg_class] == 0 && hrp->end[reg_class] == aarray_length(bb->items)-1) {
+        return;
+    }
+
+    int A[2], B[2];
+    gimme_lifetime(ctx, ra, scheduled, bb, n,      A);
+    gimme_lifetime(ctx, ra, scheduled, bb, failed, B);
+
+    int start_t = TB_MAX(A[0], B[0]);
+    int end_t   = TB_MIN(A[1], B[1]);
+    if (end_t < 0) {
+        return;
+    }
+
+    // TB_OPTDEBUG(REGALLOC6)(printf("#         BB%zu [%d (%%%u), %d (%%%u)] (%u items)\n", bb_id, start_t, bb->items[start_t]->gvn, end_t, bb->items[end_t]->gvn, aarray_length(bb->items)));
+
+    if (hrp->start[reg_class] < 0) {
+        hrp->start[reg_class] = start_t;
+        hrp->end[reg_class]   = end_t;
+    } else {
+        hrp->start[reg_class] = TB_MIN(hrp->start[reg_class], start_t);
+        hrp->end[reg_class]   = TB_MAX(hrp->end[reg_class], end_t);
+    }
+    // stats_aaa++;
+}
+
 static void mark_node_as_hrp(Ctx* ctx, Rogers* ra, uint32_t gvn, uint32_t failed_gvn, int reg_class) {
     TB_ASSERT(reg_class > 0);
     TB_ASSERT(ctx->vreg_map[gvn]);
@@ -653,35 +690,44 @@ static void mark_node_as_hrp(Ctx* ctx, Rogers* ra, uint32_t gvn, uint32_t failed
 
     // each active range outside of the def BB is live in
 
-    FOR_N(bb_id, 0, ctx->bb_count) {
-        TB_BasicBlock* bb = &ctx->cfg.blocks[bb_id];
-        HRPRegion* hrp = &ra->hrp[bb_id];
+    // PATCH(odin-tilde): this went through every block of the function,
+    // twice asking whether each value is live into it — two cache misses a
+    // block a mark, and last_use_in_bb walking the users on each hit. A
+    // block only counts where both lifetimes exist, and a value exists
+    // where it is defined or is live into: those blocks are the per-round
+    // lists (see pc_liv_build).
+    if (ra->pc_lv_in == NULL || gvn >= ra->pc_lv_count || failed_gvn >= ra->pc_lv_count) {
+        FOR_N(bb_id, 0, ctx->bb_count) {
+            hrp_mark_block(ctx, ra, scheduled, bb_id, n, failed, reg_class);
+        }
+    } else {
+        TB_BasicBlock* blocks = ctx->cfg.blocks;
+        size_t def_n = (size_t)(scheduled[gvn] - blocks);
+        size_t def_f = (size_t)(scheduled[failed_gvn] - blocks);
 
-        // Fully HRP already
-        if (hrp->start[reg_class] == 0 && hrp->end[reg_class] == aarray_length(bb->items)-1) {
-            continue;
+        // where both are defined
+        if (def_n == def_f) {
+            hrp_mark_block(ctx, ra, scheduled, def_n, n, failed, reg_class);
         }
 
-        int A[2], B[2];
-        gimme_lifetime(ctx, ra, scheduled, bb, n,      A);
-        gimme_lifetime(ctx, ra, scheduled, bb, failed, B);
-
-        int start_t = TB_MAX(A[0], B[0]);
-        int end_t   = TB_MIN(A[1], B[1]);
-        if (end_t < 0) {
-            continue;
+        // where n is live into, and failed is live into or defined
+        FOR_N(t, ra->pc_lv_in_start[gvn], ra->pc_lv_in_start[gvn + 1]) {
+            uint32_t b = ra->pc_lv_in[t];
+            if (def_f == b || set_get(&blocks[b].live_in, failed_gvn)) {
+                hrp_mark_block(ctx, ra, scheduled, b, n, failed, reg_class);
+            }
         }
 
-        // TB_OPTDEBUG(REGALLOC6)(printf("#         BB%zu [%d (%%%u), %d (%%%u)] (%u items)\n", bb_id, start_t, bb->items[start_t]->gvn, end_t, bb->items[end_t]->gvn, aarray_length(bb->items)));
-
-        if (hrp->start[reg_class] < 0) {
-            hrp->start[reg_class] = start_t;
-            hrp->end[reg_class]   = end_t;
-        } else {
-            hrp->start[reg_class] = TB_MIN(hrp->start[reg_class], start_t);
-            hrp->end[reg_class]   = TB_MAX(hrp->end[reg_class], end_t);
+        // where failed is live into and n is defined (n not live there too,
+        // or the loop above had it)
+        if (def_n != def_f && !set_get(&blocks[def_n].live_in, gvn)) {
+            FOR_N(t, ra->pc_lv_in_start[failed_gvn], ra->pc_lv_in_start[failed_gvn + 1]) {
+                if (ra->pc_lv_in[t] == (uint32_t)def_n) {
+                    hrp_mark_block(ctx, ra, scheduled, def_n, n, failed, reg_class);
+                    break;
+                }
+            }
         }
-        // stats_aaa++;
     }
     cuikperf_region_end();
 }
@@ -1514,10 +1560,10 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                 // precolor: narrow queries / other queries / narrow sleeper candidates (of which sure) / narrow fixed candidates /
                 //           register-bucket sleeper candidates / fixed-index candidates;
                 // allocate_reg: narrow queries / their candidates / full scans; interfere() calls / last_use_in_bb misses
-                fprintf(stderr, "[pc-stats] %s: rounds=%d nodes=%zu vregs=%zu | precolor narrow=%llu other=%llu cand=%llu sure=%llu fcand=%llu bucket=%llu fidx=%llu | allocate_reg narrow=%llu cand=%llu full=%llu | interfere=%llu lastuse_miss=%llu\n",
+                fprintf(stderr, "[pc-stats] %s: rounds=%d nodes=%zu vregs=%zu | precolor narrow=%llu other=%llu cand=%llu sure=%llu fcand=%llu bucket=%llu fidx=%llu | allocate_reg narrow=%llu cand=%llu full=%llu | interfere=%llu lastuse_miss=%llu | live_len=%llu active=%llu\n",
                     f->super.name, rounds, f->node_count, aarray_length(ctx->vregs),
                     ra.pc_stat[0], ra.pc_stat[1], ra.pc_stat[2], ra.pc_stat[8], ra.pc_stat[3], ra.pc_stat[4], ra.pc_stat[5],
-                    ra.pc_stat[6], ra.pc_stat[7], ra.pc_stat[9], ra.pc_stat[10], ra.pc_stat[11]);
+                    ra.pc_stat[6], ra.pc_stat[7], ra.pc_stat[9], ra.pc_stat[10], ra.pc_stat[11], ra.pc_stat[12], ra.pc_stat[13]);
             }
             return;
         }
@@ -2551,25 +2597,36 @@ static void pc_index_fixed(Ctx* ctx, Rogers* ra, int class) {
 // takes the original scan instead
 enum { PC_WINDOW_MAX = 4096 };
 
-// gvns live-in or live-out of `bb`, rebuilt when the block changes
+// the live-out entries of block `b` run to where the next block's live-in
+// entries start (the last block's to pc_lin_at[bb_count]) — see pc_liv_build
+static inline size_t pc_lout_end(Rogers* restrict ra, size_t b) {
+    return ra->pc_lin_at[b + 1];
+}
+
+// gvns live-in or live-out of `bb` that have a vreg, rebuilt when the block
+// changes.
+//
+// PATCH(odin-tilde): read off the per-round lists (see pc_liv_build); it used
+// to walk the block's two bitsets on every visit of every walk, and almost
+// everything a block keeps live has no register to lose — constants, symbols,
+// control and memory tokens (core/encoding/entity/example: 548M entries
+// walked per compile before the vreg filter, 0.16% of them with a vreg). The
+// query still checks vreg_map: a value can lose its vreg during the round,
+// never gain one.
 static void pc_live_list(Ctx* restrict ctx, Rogers* restrict ra, TB_BasicBlock* bb) {
     if (ra->pc_live_bb == bb) { return; }
     ra->pc_live_bb = bb;
     ra->pc_live_len = 0;
 
-    Set* sets[2] = { &bb->live_in, &bb->live_out };
-    FOR_N(s, 0, 2) {
-        Set* set = sets[s];
-        FOR_N(j, 0, set->capacity / 64) {
-            uint64_t w = set->data[j];
-            while (w) {
-                int b = tb_ffs64(w) - 1;
-                w &= w - 1;
-                uint32_t g = (uint32_t)(j * 64 + b);
-                if (s == 0 || !set_get(&bb->live_in, g)) {
-                    pc_push(ra->arena, (void**)&ra->pc_live, &ra->pc_live_len, &ra->pc_live_cap, sizeof(uint32_t), &g);
-                }
-            }
+    size_t b = (size_t)(bb - ctx->cfg.blocks);
+    FOR_N(t, ra->pc_lin_at[b], ra->pc_lout_at[b]) {
+        uint32_t g = ra->pc_liv[t];
+        pc_push(ra->arena, (void**)&ra->pc_live, &ra->pc_live_len, &ra->pc_live_cap, sizeof(uint32_t), &g);
+    }
+    FOR_N(t, ra->pc_lout_at[b], pc_lout_end(ra, b)) {
+        uint32_t g = ra->pc_liv[t];
+        if (!set_get(&bb->live_in, g)) {
+            pc_push(ra->arena, (void**)&ra->pc_live, &ra->pc_live_len, &ra->pc_live_cap, sizeof(uint32_t), &g);
         }
     }
 }
@@ -2630,6 +2687,8 @@ static void pc_narrow_candidates(Ctx* restrict ctx, Rogers* restrict ra, int cla
     // another block, or this one above n: live-in or live-out of bb (a value
     // of bb defined at or after n is met by the window below)
     pc_live_list(ctx, ra, bb);
+    ra->pc_stat[12] += ra->pc_live_len;
+    ra->pc_stat[13] += future->count;
     FOR_N(t, 0, ra->pc_live_len) {
         uint32_t g = ra->pc_live[t];
         bool here = scheduled[g] == bb;
@@ -3414,6 +3473,99 @@ static void compute_ordinals(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* a
     }
 }
 
+// PATCH(odin-tilde): the vregs of `set`, in gvn order, appended to pc_liv
+static void pc_liv_add_set(Rogers* ra, Set* set, size_t words) {
+    size_t n = set->capacity / 64;
+    if (n > words) { n = words; }
+    FOR_N(wi, 0, n) {
+        uint64_t w = set->data[wi] & ra->is_vreg[wi];
+        while (w) {
+            int bit = tb_ffs64(w) - 1;
+            w &= w - 1;
+            uint32_t g = (uint32_t)(wi * 64 + bit);
+            pc_push(ra->arena, (void**)&ra->pc_liv, &ra->pc_liv_len, &ra->pc_liv_cap, sizeof(uint32_t), &g);
+        }
+    }
+}
+
+// PATCH(odin-tilde): the liveness bitsets are indexed by gvn and sized by the
+// node count, and what a block keeps live is almost all without a vreg —
+// constants, symbols, control and memory tokens (named_xml_entity_to_rune:
+// 0.16% of the bits; 19 KiB per block, 4877 blocks). Every pass that walked
+// them streamed all of it again, several times per round. They are read once
+// per round into per-block lists of the live vregs; the bitsets stay for the
+// point tests.
+static void pc_liv_build(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* arena) {
+    size_t node_count = ctx->f->node_count;
+    size_t words = (node_count + 63) / 64;
+
+    ra->is_vreg = tb_arena_alloc(arena, words * sizeof(uint64_t));
+    FOR_N(i, 0, words) {
+        uint64_t mask = 0;
+        size_t end = i * 64 + 64;
+        if (end > node_count) { end = node_count; }
+        FOR_N(j, 0, end - i * 64) {
+            if (ctx->vreg_map[i * 64 + j] > 0) {
+                mask |= 1ull << j;
+            }
+        }
+        ra->is_vreg[i] = mask;
+    }
+
+    ra->pc_lin_at = tb_arena_alloc(arena, (ctx->bb_count + 1) * sizeof(size_t));
+    ra->pc_lout_at = tb_arena_alloc(arena, (ctx->bb_count + 1) * sizeof(size_t));
+    ra->pc_liv = NULL;
+    ra->pc_liv_len = ra->pc_liv_cap = 0;
+    FOR_N(b, 0, ctx->bb_count) {
+        TB_BasicBlock* bb = &ctx->cfg.blocks[b];
+        ra->pc_lin_at[b] = ra->pc_liv_len;
+        pc_liv_add_set(ra, &bb->live_in, words);
+        ra->pc_lout_at[b] = ra->pc_liv_len;
+        pc_liv_add_set(ra, &bb->live_out, words);
+    }
+    ra->pc_lin_at[ctx->bb_count] = ra->pc_liv_len;
+    ra->pc_lout_at[ctx->bb_count] = ra->pc_liv_len;
+
+    // the transpose: per value, the blocks it is live-in (or live-out) of,
+    // in block order, as a start index into one flat array. mark_node_as_hrp
+    // walks them instead of every block of the function, and the splitter
+    // reads them where it used to walk the bitsets again.
+    int32_t* in_start = tb_arena_alloc(arena, (node_count + 1) * sizeof(int32_t));
+    int32_t* out_start = tb_arena_alloc(arena, (node_count + 1) * sizeof(int32_t));
+    memset(in_start, 0, (node_count + 1) * sizeof(int32_t));
+    memset(out_start, 0, (node_count + 1) * sizeof(int32_t));
+    FOR_N(k, 0, ctx->bb_count) {
+        FOR_N(t, ra->pc_lin_at[k], ra->pc_lout_at[k]) { in_start[ra->pc_liv[t] + 1]++; }
+        FOR_N(t, ra->pc_lout_at[k], pc_lout_end(ra, k)) { out_start[ra->pc_liv[t] + 1]++; }
+    }
+    FOR_N(g, 0, node_count) {
+        in_start[g + 1] += in_start[g];
+        out_start[g + 1] += out_start[g];
+    }
+    ra->pc_lv_in = tb_arena_alloc(arena, (in_start[node_count] + 1) * sizeof(uint32_t));
+    ra->pc_lv_out = tb_arena_alloc(arena, (out_start[node_count] + 1) * sizeof(uint32_t));
+    FOR_N(k, 0, ctx->bb_count) {
+        FOR_N(t, ra->pc_lin_at[k], ra->pc_lout_at[k]) {
+            uint32_t g = ra->pc_liv[t];
+            ra->pc_lv_in[in_start[g]++] = (uint32_t)k;
+        }
+        FOR_N(t, ra->pc_lout_at[k], pc_lout_end(ra, k)) {
+            uint32_t g = ra->pc_liv[t];
+            ra->pc_lv_out[out_start[g]++] = (uint32_t)k;
+        }
+    }
+    // the starts now sit at the ends of their ranges
+    for (size_t g = node_count; g > 0; g--) {
+        in_start[g] = in_start[g - 1];
+        out_start[g] = out_start[g - 1];
+    }
+    in_start[0] = out_start[0] = 0;
+
+    ra->pc_lv_in_start = in_start;
+    ra->pc_lv_out_start = out_start;
+    ra->pc_lv_count = node_count;
+}
+
 // Probably slow...
 static void compute_areas(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* arena) {
     size_t node_count = ctx->f->node_count;
@@ -3427,7 +3579,7 @@ static void compute_areas(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     // just give the root node a fake ordinal
     TB_ASSERT(ctx->f->root_node->gvn == 0);
     ra->order[0] = 1;
-    ra->is_vreg = tb_arena_alloc(arena, ((node_count + 63) / 64) * sizeof(uint64_t));
+    // PATCH(odin-tilde): is_vreg is built by pc_liv_build, which runs first
 
     CUIK_TIMED_BLOCK("areas") {
         // Sparse set repr
@@ -3439,19 +3591,8 @@ static void compute_areas(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
             ctx->vregs[i].area = 0;
         }
 
-        FOR_N(i, 0, (node_count + 63) / 64) {
-            uint64_t mask = 0;
-            size_t end = i*64 + 64;
-            if (end > node_count) { end = node_count; }
-
-            FOR_N(j, 0, end - i*64) {
-                size_t k = i*64 + j;
-                if (ctx->vreg_map[k] > 0) {
-                    mask |= 1ull << j;
-                }
-                array[k] = -1;
-            }
-            ra->is_vreg[i] = mask;
+        FOR_N(i, 0, node_count) {
+            array[i] = -1;
         }
 
         FOR_REV_N(i, 0, ctx->bb_count) {
@@ -3474,7 +3615,11 @@ static void compute_areas(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
             uint64_t inst_count = aarray_length(bb->items) - last_phi;
 
             // start intervals
-            BITS64_FOR_AND(j, bb->live_out.data, ra->is_vreg, bb->live_out.capacity) {
+            // PATCH(odin-tilde): the block's live-out vregs, from the
+            // per-round list (see pc_liv_build). Same values, same order.
+            FOR_N(t, ra->pc_lout_at[i], pc_lout_end(ra, i)) {
+                int j = (int)ra->pc_liv[t];
+
                 int vreg_id = ctx->vreg_map[j];
                 TB_ASSERT(vreg_id > 0);
 
@@ -3573,7 +3718,6 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     // interference calls, runtime@write_write_type 105M more — 98% of the
     // package's interference work, in two functions of a few thousand nodes.
     memset(ra->pc_fixed_built, 0, sizeof ra->pc_fixed_built);
-    ra->pc_lv_built = false;
     ra->pc_walk_bb = SIZE_MAX;
     ra->pc_item_pos = INT_MAX;
     ra->pc_last_walk = false;
@@ -3592,20 +3736,6 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     memset(ra->pc_slept, 0, (pc_words + 1) * sizeof(uint64_t));
     memset(ra->pc_fxbits, 0, (pc_words + 1) * sizeof(uint64_t));
     ra->pc_blocks = ctx->bb_count;
-
-    // PATCH(odin-tilde): expire_interval used to test, for every node it
-    // ends, every block before the node's own — O(blocks) cache misses per
-    // node, quadratic on a many-block function. The answer is the lowest
-    // block index whose live_out holds the node; the sets do not change
-    // while the round runs, so it is computed once here.
-    ra->pc_min_lo = tb_arena_alloc(arena, ctx->f->node_count * sizeof(uint32_t));
-    FOR_N(i, 0, ctx->f->node_count) { ra->pc_min_lo[i] = UINT32_MAX; }
-    FOR_N(k, 0, ctx->bb_count) {
-        Set* s = &ctx->cfg.blocks[k].live_out;
-        BITS64_FOR(j, s->data, s->capacity) {
-            if (ra->pc_min_lo[j] > (uint32_t)k) { ra->pc_min_lo[j] = (uint32_t)k; }
-        }
-    }
 
     // per-block "asleep behind the walk's back" lists, and the slot table of
     // the pre-allocate walk's live fixed-mask members
@@ -3663,7 +3793,23 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     }
 
     // Compute areas (probably slow...)
+    pc_liv_build(ctx, ra, arena);
     compute_areas(ctx, ra, arena);
+
+    // PATCH(odin-tilde): expire_interval used to test, for every node it
+    // ends, every block before the node's own — O(blocks) cache misses per
+    // node, quadratic on a many-block function. The answer is the lowest
+    // block index whose live_out holds the node; the sets do not change
+    // while the round runs, so it is computed once here from the per-round
+    // live-out lists (only values with a vreg: both callers end one).
+    ra->pc_min_lo = tb_arena_alloc(arena, ctx->f->node_count * sizeof(uint32_t));
+    FOR_N(i, 0, ctx->f->node_count) { ra->pc_min_lo[i] = UINT32_MAX; }
+    FOR_N(k, 0, ctx->bb_count) {
+        FOR_N(t, ra->pc_lout_at[k], pc_lout_end(ra, k)) {
+            uint32_t j = ra->pc_liv[t];
+            if (ra->pc_min_lo[j] == UINT32_MAX) { ra->pc_min_lo[j] = (uint32_t)k; }
+        }
+    }
 
     // PATCH(odin-tilde): the members of fixed-mask vregs at their item
     // positions — after compute_areas, which hands out this round's
@@ -3819,17 +3965,37 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
         cuikperf_region_start("head", NULL);
         // expire intervals for block:
         //   FOR EACH LIVE & ~LIVE_OUT
-        BITS64_FOR_ANDN(j, ra->live.data, live_out->data, ra->is_vreg, live_out->capacity) {
-            int vreg_id = ctx->vreg_map[j];
-            TB_ASSERT(vreg_id > 0);
-            TB_ASSERT(set_get(&ra->live, j) && !set_get(live_out, j));
-            expire_interval(ctx, ra, ra->gvn2node[j], bb_id, vreg_id);
-            set_remove(&ra->live, j);
+        // PATCH(odin-tilde): walked a word at a time over ra->live (one array
+        // for the whole walk) instead of bit by bit through the block's
+        // live_out bitset; same values in the same order.
+        {
+            size_t iv_words = (ctx->f->node_count + 63) / 64;
+            size_t live_words = ra->live.capacity / 64;
+            if (live_words > iv_words) { live_words = iv_words; }
+            FOR_N(wi, 0, live_words) {
+                uint64_t w = ra->live.data[wi] & ra->is_vreg[wi];
+                while (w) {
+                    int bit = tb_ffs64(w) - 1;
+                    w &= w - 1;
+                    int j = (int)(wi * 64 + bit);
+                    if (set_get(live_out, j)) { continue; }
+
+                    int vreg_id = ctx->vreg_map[j];
+                    TB_ASSERT(vreg_id > 0);
+                    TB_ASSERT(set_get(&ra->live, j) && !set_get(live_out, j));
+                    expire_interval(ctx, ra, ra->gvn2node[j], bb_id, vreg_id);
+                    set_remove(&ra->live, j);
+                }
+            }
         }
 
         // start intervals:
         //   FOR EACH ~LIVE & LIVE_OUT
-        BITS64_FOR_ANDN(j, live_out->data, ra->live.data, ra->is_vreg, live_out->capacity) {
+        // PATCH(odin-tilde): the block's live-out vregs, from the per-round list
+        FOR_N(t, ra->pc_lout_at[bb_id], pc_lout_end(ra, bb_id)) {
+            int j = (int)ra->pc_liv[t];
+            if (set_get(&ra->live, j)) { continue; }
+
             int vreg_id = ctx->vreg_map[j];
             TB_Node* n = ra->gvn2node[j];
             TB_ASSERT(vreg_id > 0);

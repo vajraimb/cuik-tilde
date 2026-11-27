@@ -989,48 +989,6 @@ static TB_Node* capture_pre_store(Ctx* ctx, Rogers* ra, RegSplitter* splitter, T
     return cpy;
 }
 
-// PATCH(odin-tilde): per value, the blocks it is live-in (or live-out) of,
-// as a start index into one flat array. The block bitsets are walked in two
-// sequential passes.
-static void build_live_lists(TB_Arena* arena, size_t node_count, size_t bb_count, TB_BasicBlock* blocks, bool live_out, int32_t** out_start, uint32_t** out_blocks) {
-    int32_t* start = tb_arena_alloc(arena, (node_count + 1) * sizeof(int32_t));
-    memset(start, 0, (node_count + 1) * sizeof(int32_t));
-
-    FOR_N(k, 0, bb_count) {
-        Set* s = live_out ? &blocks[k].live_out : &blocks[k].live_in;
-        FOR_N(wpt, 0, s->capacity / 64) {
-            uint64_t bits = s->data[wpt];
-            while (bits) {
-                int b = tb_ffs64(bits) - 1;
-                bits &= bits - 1;
-                uint32_t g = (uint32_t)(wpt * 64 + b);
-                if (g < node_count) { start[g + 1]++; }
-            }
-        }
-    }
-    FOR_N(g, 0, node_count) { start[g + 1] += start[g]; }
-
-    uint32_t* list = tb_arena_alloc(arena, (start[node_count] + 1) * sizeof(uint32_t));
-    FOR_N(k, 0, bb_count) {
-        Set* s = live_out ? &blocks[k].live_out : &blocks[k].live_in;
-        FOR_N(wpt, 0, s->capacity / 64) {
-            uint64_t bits = s->data[wpt];
-            while (bits) {
-                int b = tb_ffs64(bits) - 1;
-                bits &= bits - 1;
-                uint32_t g = (uint32_t)(wpt * 64 + b);
-                if (g < node_count) { list[start[g]++] = (uint32_t)k; }
-            }
-        }
-    }
-    // start[g] now sits at the end of g's range
-    for (size_t g = node_count; g > 0; g--) { start[g] = start[g - 1]; }
-    start[0] = 0;
-
-    *out_start = start;
-    *out_blocks = list;
-}
-
 static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* splits, size_t num_spills) {
     TB_Arena* arena = ra->arena;
     TB_Function* f = ctx->f;
@@ -1041,12 +999,10 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
     TB_OPTDEBUG(REGSPLIT)(printf("== INSERT NODES ==\n"));
 
     size_t old_node_count = f->node_count;
-    if (!ra->pc_lv_built) {
-        build_live_lists(ra->arena, old_node_count, ctx->bb_count, ctx->cfg.blocks, false, &ra->pc_lv_in_start, &ra->pc_lv_in);
-        build_live_lists(ra->arena, old_node_count, ctx->bb_count, ctx->cfg.blocks, true, &ra->pc_lv_out_start, &ra->pc_lv_out);
-        ra->pc_lv_count = old_node_count;
-        ra->pc_lv_built = true;
-    }
+    // PATCH(odin-tilde): the per-value live-in / live-out block lists come
+    // from the round (pc_liv_build); they used to be walked out of every
+    // block's bitsets here, twice per call.
+    TB_ASSERT(ra->pc_lv_in_start != NULL && ra->pc_lv_out_start != NULL);
     cuikperf_region_start("alloc", NULL);
 
     // we can only spill 64 vregs at once due to some bitsets i don't feel like changing
