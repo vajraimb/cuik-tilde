@@ -139,18 +139,42 @@ void tb_clear_anti_deps(TB_Function* f, TB_Worklist* ws) {
 
 // PATCH(odin-tilde): true-dependency 可达性（只走 inputs[0..input_count)，
 // 不走 extra 反依赖边）。用于 add_anti_deps 的成环防护。
-static bool node_true_dep_reaches(TB_Function* f, TB_Node* from, TB_Node* to) {
-    if (from == to) { return true; }
+//
+// The anti-dependency passes ask this about every memory writer against the
+// same load, and a load's input cone does not change while they run (they
+// add extra inputs, which this walk does not follow). So the reachable set
+// is walked once per load, into a stamp array that is never cleared: the
+// walk used to allocate and zero a node_count bitmap per query, which was a
+// fifth of the compile of core/encoding/entity's 100k-node function.
+// node_true_dep_begin starts the set for `from`; the passes call it at
+// their entry, and node_true_dep_reaches also restarts it on its own when
+// asked about another node.
+static _Thread_local uint32_t* dep_stamp;
+static _Thread_local TB_Node** dep_stack;
+static _Thread_local size_t dep_cap;
+static _Thread_local uint32_t dep_cur;
+static _Thread_local TB_Node* dep_from;
 
-    Set visited = set_create_in_arena(&f->tmp_arena, f->node_count);
-    ArenaArray(TB_Node*) stack = aarray_create(&f->tmp_arena, TB_Node*, 64);
-    aarray_push(stack, from);
+static void node_true_dep_begin(TB_Function* f, TB_Node* from) {
+    if (f->node_count + 16 > dep_cap) {
+        size_t new_cap = tb_next_pow2(f->node_count + 16);
+        dep_stamp = (uint32_t*)realloc(dep_stamp, new_cap * sizeof(uint32_t));
+        dep_stack = (TB_Node**)realloc(dep_stack, new_cap * sizeof(TB_Node*));
+        memset(dep_stamp + dep_cap, 0, (new_cap - dep_cap) * sizeof(uint32_t));
+        dep_cap = new_cap;
+    }
+    dep_cur++;
+    if (dep_cur == 0) {
+        memset(dep_stamp, 0, dep_cap * sizeof(uint32_t));
+        dep_cur = 1;
+    }
+    dep_from = from;
 
-    bool found = false;
-    while (aarray_length(stack) && !found) {
-        TB_Node* n = aarray_pop(stack);
-        if (set_get(&visited, n->gvn)) { continue; }
-        set_put(&visited, n->gvn);
+    size_t top = 0;
+    dep_stamp[from->gvn] = dep_cur;
+    dep_stack[top++] = from;
+    while (top > 0) {
+        TB_Node* n = dep_stack[--top];
         // phi/region inputs come from earlier iterations or predecessor blocks.
         // root and the callgraph list every call, and constants are anchored
         // on the root, so walking either makes every constant user "depend"
@@ -163,12 +187,17 @@ static bool node_true_dep_reaches(TB_Function* f, TB_Node* from, TB_Node* to) {
         }
         FOR_N(i, 0, n->input_count) {
             TB_Node* in = n->inputs[i];
-            if (in == NULL) { continue; }
-            if (in == to) { found = true; break; }
-            aarray_push(stack, in);
+            if (in == NULL || in->gvn >= dep_cap || dep_stamp[in->gvn] == dep_cur) { continue; }
+            dep_stamp[in->gvn] = dep_cur;
+            dep_stack[top++] = in;
         }
     }
-    return found;
+}
+
+static bool node_true_dep_reaches(TB_Function* f, TB_Node* from, TB_Node* to) {
+    if (from == to) { return true; }
+    if (from != dep_from) { node_true_dep_begin(f, from); }
+    return to->gvn < dep_cap && dep_stamp[to->gvn] == dep_cur;
 }
 
 static void anti_dep_walk_mem_out(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* un, int depth);
@@ -237,6 +266,8 @@ static void anti_dep_walk_mem_out(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_N
 }
 
 static void add_anti_deps(TB_Function* f, TB_CFG* cfg, TB_Node* ld, TB_Node* mem, TB_BasicBlock* early) {
+    // ld's true dependencies do not change while the anti-deps are added
+    node_true_dep_begin(f, ld);
     add_anti_deps_rec(f, cfg, ld, mem, 0);
 }
 
@@ -568,6 +599,7 @@ void tb_global_schedule(TB_Function* f, TB_Worklist* ws, TB_CFG cfg, bool early_
 
                         lca = tb_late_sched(f, &cfg, lca, n);
                         if (lca != NULL && anti_mem != NULL) {
+                            node_true_dep_begin(f, n);
                             lca = anti_dep_lca(f, lca, n, anti_mem, 0);
                         }
 

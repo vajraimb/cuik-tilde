@@ -28,7 +28,173 @@ typedef struct {
 
     NL_Table spill_map;
     NL_Table uses_spill;
+
+    // PATCH(odin-tilde): index of vreg_map for the last re-coalesce pass
+    // (see vm_index_build). Per vreg: the nodes vreg_map mapped to it when
+    // the pass started (ascending gvn), the split defs that joined it since,
+    // and the split defs whose leader's vreg it is.
+    int32_t* vm_base_start;   // [vreg] -> range in vm_base_list
+    uint32_t* vm_base_list;   // gvns
+    int32_t* vm_join_head;    // [vreg] -> newest node that joined it, -1 = none
+    int32_t* vm_join_next;    // [gvn] -> next node that joined the same vreg
+    int32_t* vm_def_start;    // [vreg] -> range in vm_def_list
+    uint32_t* vm_def_list;    // indexes into all_defs
+    int* vm_leader_vreg;      // [index into all_defs] -> leader's vreg
+    uint32_t* vm_scratch;     // vreg_members output (vm_scratch2: the audit's)
+    uint32_t* vm_scratch2;
 } RegSplitter;
+
+static unsigned long long vm_audit_checked, vm_audit_bad, vm_dup_entries;
+
+// the nodes vreg_map maps to vreg_id, in ascending gvn order — a walk over
+// the whole vreg_map, which is what the re-coalesce pass used to do for
+// every split def it touched (up to four times each)
+static size_t vreg_members_scan(Ctx* ctx, Rogers* ra, int vreg_id, uint32_t* out) {
+    size_t vmap_len = aarray_length(ctx->vreg_map);
+    size_t g2n_cap = ra->order_cap; // gvn2node is only order_cap long
+    size_t cnt = 0;
+    for (size_t mi = 0; mi < vmap_len && mi < g2n_cap; mi++) {
+        if (ctx->vreg_map[mi] == vreg_id) { out[cnt++] = (uint32_t)mi; }
+    }
+    return cnt;
+}
+
+// same answer from the index: the nodes mapped when the pass started that
+// still are, plus the ones that joined the vreg since. TB_PC_AUDIT=1 walks
+// vreg_map as well, compares and answers from the walk.
+static size_t vreg_members(Ctx* ctx, Rogers* ra, RegSplitter* splitter, int vreg_id, uint32_t* out) {
+    TB_ASSERT(splitter->vm_base_start != NULL);
+    size_t vmap_len = aarray_length(ctx->vreg_map);
+    size_t g2n_cap = ra->order_cap;
+    size_t scan_len = vmap_len < g2n_cap ? vmap_len : g2n_cap;
+    size_t cnt = 0;
+    FOR_N(t, splitter->vm_base_start[vreg_id], splitter->vm_base_start[vreg_id + 1]) {
+        uint32_t g = splitter->vm_base_list[t];
+        if (ctx->vreg_map[g] == vreg_id) { out[cnt++] = g; }
+    }
+    for (int32_t g = splitter->vm_join_head[vreg_id]; g >= 0; g = splitter->vm_join_next[g]) {
+        // the walk only covers as far as gvn2node goes — nodes the splitter
+        // created this batch lie beyond it and never took part
+        if ((size_t)g >= scan_len || ctx->vreg_map[g] != vreg_id) { continue; }
+        // the base list is ascending, keep it that way (a node that was
+        // mapped all along — a leader — is already in it)
+        size_t pos = cnt;
+        while (pos > 0 && out[pos - 1] > g) { pos--; }
+        if (pos > 0 && out[pos - 1] == g) { continue; }
+        memmove(&out[pos + 1], &out[pos], (cnt - pos) * sizeof(uint32_t));
+        out[pos] = g;
+        cnt++;
+    }
+    if (pc_audit_enabled()) {
+        uint32_t* ref = splitter->vm_scratch2;
+        size_t rcnt = vreg_members_scan(ctx, ra, vreg_id, ref);
+        vm_audit_checked++;
+        if (rcnt != cnt || memcmp(ref, out, cnt * sizeof(uint32_t)) != 0) {
+            vm_audit_bad++;
+            fprintf(stderr, "[ra-split-audit] %s: vreg %d members: index=%zu scan=%zu\n", ctx->f->super.name, vreg_id, cnt, rcnt);
+        }
+        memcpy(out, ref, rcnt * sizeof(uint32_t));
+        cnt = rcnt;
+    }
+    return cnt;
+}
+
+static void vm_index_join(RegSplitter* splitter, int vreg_id, uint32_t gvn) {
+    // A def joins its vreg once. all_defs may list a node twice (the pass
+    // just recomputed its mask); a second entry must not link the join
+    // list to itself, or the walk in vreg_members never ends.
+    if (splitter->vm_join_next[gvn] >= 0) {
+        if (pc_audit_enabled()) { vm_dup_entries++; }
+        return;
+    }
+    splitter->vm_join_next[gvn] = splitter->vm_join_head[vreg_id];
+    splitter->vm_join_head[vreg_id] = gvn;
+}
+
+// is any split def mapped to vreg_id (through its leader) a real op
+static bool vm_split_defs_real_op(Ctx* ctx, Rogers* ra, RegSplitter* splitter, int vreg_id, bool indexed) {
+    if (indexed) {
+        FOR_N(t, splitter->vm_def_start[vreg_id], splitter->vm_def_start[vreg_id + 1]) {
+            TB_Node* m = splitter->all_defs[splitter->vm_def_list[t]];
+            int t = m->type;
+            if (t != TB_MACH_COPY && t != TB_PHI && t != TB_MACH_PROJ && t != TB_MACH_TEMP && t != TB_NULL) { return true; }
+        }
+        return false;
+    }
+    aarray_for(i, splitter->all_defs) {
+        TB_Node* m = splitter->all_defs[i];
+        int t = m->type;
+        if (t == TB_MACH_COPY || t == TB_PHI || t == TB_MACH_PROJ || t == TB_MACH_TEMP || t == TB_NULL) { continue; }
+        int ml = uf_find(ra->uf, ra->uf_len, m->gvn);
+        if (ctx->vreg_map[ml] == vreg_id) { return true; }
+    }
+    return false;
+}
+
+// Called at the top of the last re-coalesce pass in tb__insert_splits: by
+// then every split def has vreg_map 0 except the leaders, and nothing but
+// that pass changes vreg_map until it ends.
+static void vm_index_build(Ctx* ctx, Rogers* ra, RegSplitter* splitter) {
+    TB_Arena* arena = ra->arena;
+    size_t nvregs = aarray_length(ctx->vregs);
+    size_t vmap_len = aarray_length(ctx->vreg_map);
+    size_t g2n_cap = ra->order_cap; // gvn2node is only order_cap long
+    size_t scan_len = vmap_len < g2n_cap ? vmap_len : g2n_cap;
+
+    int32_t* base_start = tb_arena_alloc(arena, (nvregs + 1) * sizeof(int32_t));
+    memset(base_start, 0, (nvregs + 1) * sizeof(int32_t));
+    FOR_N(mi, 0, scan_len) {
+        int v = ctx->vreg_map[mi];
+        if (v > 0 && (size_t)v < nvregs) { base_start[v + 1]++; }
+    }
+    FOR_N(v, 0, nvregs) { base_start[v + 1] += base_start[v]; }
+    uint32_t* base_list = tb_arena_alloc(arena, (base_start[nvregs] + 1) * sizeof(uint32_t));
+    FOR_N(mi, 0, scan_len) {
+        int v = ctx->vreg_map[mi];
+        if (v > 0 && (size_t)v < nvregs) { base_list[base_start[v]++] = (uint32_t)mi; }
+    }
+    // base_start[v] now sits at the end of v's range
+    for (size_t v = nvregs; v > 0; v--) { base_start[v] = base_start[v - 1]; }
+    base_start[0] = 0;
+
+    int32_t* join_head = tb_arena_alloc(arena, (nvregs + 1) * sizeof(int32_t));
+    FOR_N(v, 0, nvregs + 1) { join_head[v] = -1; }
+    int32_t* join_next = tb_arena_alloc(arena, (vmap_len + 1) * sizeof(int32_t));
+
+    size_t ndefs = aarray_length(splitter->all_defs);
+    // only split defs join; -1 = has not yet
+    FOR_N(i, 0, ndefs) { join_next[splitter->all_defs[i]->gvn] = -1; }
+    int* leader_vreg = tb_arena_alloc(arena, (ndefs + 1) * sizeof(int));
+    int32_t* def_start = tb_arena_alloc(arena, (nvregs + 1) * sizeof(int32_t));
+    memset(def_start, 0, (nvregs + 1) * sizeof(int32_t));
+    aarray_for(i, splitter->all_defs) {
+        TB_Node* n = splitter->all_defs[i];
+        int v = ctx->vreg_map[uf_find(ra->uf, ra->uf_len, n->gvn)];
+        TB_ASSERT(v > 0 && (size_t)v < nvregs);
+        leader_vreg[i] = v;
+        def_start[v + 1]++;
+    }
+    FOR_N(v, 0, nvregs) { def_start[v + 1] += def_start[v]; }
+    uint32_t* def_list = tb_arena_alloc(arena, (def_start[nvregs] + 1) * sizeof(uint32_t));
+    FOR_N(i, 0, ndefs) {
+        def_list[def_start[leader_vreg[i]]++] = (uint32_t)i;
+    }
+    for (size_t v = nvregs; v > 0; v--) { def_start[v] = def_start[v - 1]; }
+    def_start[0] = 0;
+
+    size_t scratch_cap = base_start[nvregs] + ndefs + 1;
+    splitter->vm_scratch = tb_arena_alloc(arena, scratch_cap * sizeof(uint32_t));
+    if (pc_audit_enabled()) {
+        splitter->vm_scratch2 = tb_arena_alloc(arena, (scan_len + 1) * sizeof(uint32_t));
+    }
+    splitter->vm_base_start = base_start;
+    splitter->vm_base_list = base_list;
+    splitter->vm_join_head = join_head;
+    splitter->vm_join_next = join_next;
+    splitter->vm_def_start = def_start;
+    splitter->vm_def_list = def_list;
+    splitter->vm_leader_vreg = leader_vreg;
+}
 
 // PATCH(odin-tilde): a stack pin may only be applied to a vreg whose
 // entire def class is slot-capable (copies/phis/projections/temps). A
@@ -46,18 +212,20 @@ static bool spill_pin_is_pure(Ctx* ctx, Rogers* ra, RegSplitter* splitter, int v
         int t = arr[i]->type;
         if (t != TB_MACH_COPY && t != TB_PHI && t != TB_MACH_PROJ && t != TB_MACH_TEMP) return false;
     }
-    aarray_for(i, splitter->all_defs) {
-        TB_Node* m = splitter->all_defs[i];
-        int t = m->type;
-        if (t == TB_MACH_COPY || t == TB_PHI || t == TB_MACH_PROJ || t == TB_MACH_TEMP || t == TB_NULL) continue;
-        int ml = uf_find(ra->uf, ra->uf_len, m->gvn);
-        if (ctx->vreg_map[ml] == vreg_id) return false;
+    bool real_op = vm_split_defs_real_op(ctx, ra, splitter, vreg_id, true);
+    if (pc_audit_enabled()) {
+        bool ref = vm_split_defs_real_op(ctx, ra, splitter, vreg_id, false);
+        vm_audit_checked++;
+        if (ref != real_op) {
+            vm_audit_bad++;
+            fprintf(stderr, "[ra-split-audit] %s: vreg %d split defs real op: index=%d scan=%d\n", ctx->f->super.name, vreg_id, real_op, ref);
+        }
+        real_op = ref;
     }
-    size_t vmap_len = aarray_length(ctx->vreg_map);
-    size_t g2n_cap = ra->order_cap; // gvn2node is only order_cap long
-    for (size_t mi = 0; mi < vmap_len && mi < g2n_cap; mi++) {
-        if (ctx->vreg_map[mi] != vreg_id) continue;
-        TB_Node* mn = ra->gvn2node[mi];
+    if (real_op) { return false; }
+    size_t mc = vreg_members(ctx, ra, splitter, vreg_id, splitter->vm_scratch);
+    FOR_N(mi, 0, mc) {
+        TB_Node* mn = ra->gvn2node[splitter->vm_scratch[mi]];
         if (mn == NULL) continue;
         int t = mn->type;
         if (t != TB_MACH_COPY && t != TB_PHI && t != TB_MACH_PROJ && t != TB_MACH_TEMP && t != TB_NULL) return false;
@@ -821,6 +989,48 @@ static TB_Node* capture_pre_store(Ctx* ctx, Rogers* ra, RegSplitter* splitter, T
     return cpy;
 }
 
+// PATCH(odin-tilde): per value, the blocks it is live-in (or live-out) of,
+// as a start index into one flat array. The block bitsets are walked in two
+// sequential passes.
+static void build_live_lists(TB_Arena* arena, size_t node_count, size_t bb_count, TB_BasicBlock* blocks, bool live_out, int32_t** out_start, uint32_t** out_blocks) {
+    int32_t* start = tb_arena_alloc(arena, (node_count + 1) * sizeof(int32_t));
+    memset(start, 0, (node_count + 1) * sizeof(int32_t));
+
+    FOR_N(k, 0, bb_count) {
+        Set* s = live_out ? &blocks[k].live_out : &blocks[k].live_in;
+        FOR_N(wpt, 0, s->capacity / 64) {
+            uint64_t bits = s->data[wpt];
+            while (bits) {
+                int b = tb_ffs64(bits) - 1;
+                bits &= bits - 1;
+                uint32_t g = (uint32_t)(wpt * 64 + b);
+                if (g < node_count) { start[g + 1]++; }
+            }
+        }
+    }
+    FOR_N(g, 0, node_count) { start[g + 1] += start[g]; }
+
+    uint32_t* list = tb_arena_alloc(arena, (start[node_count] + 1) * sizeof(uint32_t));
+    FOR_N(k, 0, bb_count) {
+        Set* s = live_out ? &blocks[k].live_out : &blocks[k].live_in;
+        FOR_N(wpt, 0, s->capacity / 64) {
+            uint64_t bits = s->data[wpt];
+            while (bits) {
+                int b = tb_ffs64(bits) - 1;
+                bits &= bits - 1;
+                uint32_t g = (uint32_t)(wpt * 64 + b);
+                if (g < node_count) { list[start[g]++] = (uint32_t)k; }
+            }
+        }
+    }
+    // start[g] now sits at the end of g's range
+    for (size_t g = node_count; g > 0; g--) { start[g] = start[g - 1]; }
+    start[0] = 0;
+
+    *out_start = start;
+    *out_blocks = list;
+}
+
 static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* splits, size_t num_spills) {
     TB_Arena* arena = ra->arena;
     TB_Function* f = ctx->f;
@@ -831,6 +1041,12 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
     TB_OPTDEBUG(REGSPLIT)(printf("== INSERT NODES ==\n"));
 
     size_t old_node_count = f->node_count;
+    if (!ra->pc_lv_built) {
+        build_live_lists(ra->arena, old_node_count, ctx->bb_count, ctx->cfg.blocks, false, &ra->pc_lv_in_start, &ra->pc_lv_in);
+        build_live_lists(ra->arena, old_node_count, ctx->bb_count, ctx->cfg.blocks, true, &ra->pc_lv_out_start, &ra->pc_lv_out);
+        ra->pc_lv_count = old_node_count;
+        ra->pc_lv_built = true;
+    }
     cuikperf_region_start("alloc", NULL);
 
     // we can only spill 64 vregs at once due to some bitsets i don't feel like changing
@@ -984,18 +1200,24 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         }
 
         // append the liveness info
-        FOR_N(k, 0, ctx->bb_count) {
-            TB_BasicBlock* bb = &ctx->cfg.blocks[k];
-            bool live_in = false, live_out = false;
-
-            FOR_N(j, 0, cnt) {
-                TB_Node* n = arr[j];
-                live_in  |= set_get(&bb->live_in, n->gvn);
-                live_out |= set_get(&bb->live_out, n->gvn);
+        // PATCH(odin-tilde): this used to test every block's live_in and
+        // live_out bitset for every spilled member — blocks x 2 scattered
+        // loads out of a region of a hundred MB per spill, for each batch of
+        // 64, though liveness is the same for all of them. The per-value
+        // block lists are read off the bitsets once per allocate_loop call.
+        FOR_N(j, 0, cnt) {
+            TB_Node* n = arr[j];
+            uint32_t g = n->gvn;
+            // past what the lists cover (set_get answered false there too):
+            // either newer than the round's liveness, or created by an
+            // earlier batch of this round
+            if (g >= ra->pc_lv_count) { continue; }
+            FOR_N(t, ra->pc_lv_in_start[g], ra->pc_lv_in_start[g + 1]) {
+                splitter.live_in[ra->pc_lv_in[t]] |= 1ull << spill_i;
             }
-
-            splitter.live_in[k]  |= ((uint64_t)live_in) << spill_i;
-            splitter.live_out[k] |= ((uint64_t)live_out) << spill_i;
+            FOR_N(t, ra->pc_lv_out_start[g], ra->pc_lv_out_start[g + 1]) {
+                splitter.live_out[ra->pc_lv_out[t]] |= 1ull << spill_i;
+            }
         }
 
         if (cnt == 1) {
@@ -1956,6 +2178,11 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         }
     }
 
+    // PATCH(odin-tilde): index vreg_map for the pass below (spill_pin_is_pure
+    // and the hardware-pin scans answer "who else is mapped to this vreg"
+    // from it instead of walking every node for every split def)
+    vm_index_build(ctx, ra, &splitter);
+
     aarray_for(i, splitter.all_defs) {
         TB_Node* n = splitter.all_defs[i];
         int leader = uf_find(ra->uf, ra->uf_len, n->gvn);
@@ -2023,6 +2250,7 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
                         stk_vreg->spill_bias = -100.0f;
                         stk_vreg->spill_cost = INFINITY;
                         ctx->vreg_map[n->gvn] = stk_vreg_id;
+                        vm_index_join(&splitter, stk_vreg_id, n->gvn);
                         continue;
                     }
                 }
@@ -2068,6 +2296,7 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             if (pure) {
                 ctx->vregs[vreg_id].mask = old_vm;
                 ctx->vreg_map[n->gvn] = vreg_id;
+                vm_index_join(&splitter, vreg_id, n->gvn);
                 continue;
             }
         }
@@ -2120,11 +2349,9 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             // coalesce sets are keyed by uf-leader and miss nodes that were
             // hard-split onto this vreg (vreg_map says they belong, uf says
             // otherwise) — e.g. umulpair's RDX-pinned hi projection.
-            size_t vmap_len = aarray_length(ctx->vreg_map);
-            size_t g2n_cap = ra->order_cap; // gvn2node is only order_cap long
-            for (size_t mi = 0; mi < vmap_len && mi < g2n_cap; mi++) {
-                if (ctx->vreg_map[mi] != vreg_id) { continue; }
-                TB_Node* mn = ra->gvn2node[mi];
+            size_t mc = vreg_members(ctx, ra, &splitter, vreg_id, splitter.vm_scratch);
+            FOR_N(mi, 0, mc) {
+                TB_Node* mn = ra->gvn2node[splitter.vm_scratch[mi]];
                 if (mn == NULL || mn->type == TB_MACH_COPY || mn->type == TB_NULL) { continue; }
                 RegMask* mm = ctx->constraint(ctx, mn, NULL);
                 if (mm && mm != &TB_REG_EMPTY && fixed_reg_mask(mm) >= 0 &&
@@ -2170,11 +2397,9 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
             // by the parent instruction; relaxing the mask detaches it
             // (observed: div-by-10 magic wrong, assign loops forever).
             if (!intrinsic) {
-                size_t vmap_len = aarray_length(ctx->vreg_map);
-                size_t g2n_cap = ra->order_cap; // gvn2node is only order_cap long
-                for (size_t mi = 0; mi < vmap_len && mi < g2n_cap; mi++) {
-                    if (ctx->vreg_map[mi] != vreg_id) { continue; }
-                    TB_Node* mn = ra->gvn2node[mi];
+                size_t mc = vreg_members(ctx, ra, &splitter, vreg_id, splitter.vm_scratch);
+                FOR_N(mi, 0, mc) {
+                    TB_Node* mn = ra->gvn2node[splitter.vm_scratch[mi]];
                     if (mn && mn->type != TB_MACH_COPY && mn->type != TB_NULL &&
                         fixed_reg_mask(ctx->constraint(ctx, mn, NULL)) >= 0) {
                         intrinsic = true;
@@ -2231,6 +2456,7 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
         }
         ctx->vregs[vreg_id].mask = mask;
         ctx->vreg_map[n->gvn] = vreg_id;
+        vm_index_join(&splitter, vreg_id, n->gvn);
     }
 
     // hint every copy across vregs
@@ -2312,6 +2538,11 @@ static void tb__insert_splits(Ctx* ctx, Rogers* restrict ra, SplitDecision* spli
 
     nl_table_free(splitter.spill_map);
     nl_table_free(splitter.uses_spill);
+
+    if (pc_audit_enabled() && vm_dup_entries) {
+        fprintf(stderr, "[ra-split-audit] %s: split defs listed twice in all_defs=%llu\n", f->super.name, vm_dup_entries);
+        vm_dup_entries = 0;
+    }
 
     TB_OPTDEBUG(SERVER)(dbg_submit_event_sched(&ctx->cfg, f, "Post-split"));
     TB_OPTDEBUG(REGSPLIT)(rogers_dump_sched(ctx, old_node_count));

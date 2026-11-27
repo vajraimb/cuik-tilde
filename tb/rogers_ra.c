@@ -81,6 +81,7 @@ typedef struct {
     uint32_t* pc_fixed[MAX_REG_CLASSES][PC_MAX_REGS];
     uint32_t pc_fixed_len[MAX_REG_CLASSES][PC_MAX_REGS];
     uint32_t pc_fixed_cap[MAX_REG_CLASSES][PC_MAX_REGS];
+    bool pc_fixed_built[MAX_REG_CLASSES];
 
     // PATCH(odin-tilde): the per-round structures both sleeper scans answer
     // from (see the comments before pc_sleeper_hits and at precolor_conflicts).
@@ -132,6 +133,18 @@ typedef struct {
     // TB_PC_AUDIT=1 runs the original scans as well and reports any disagreement
     unsigned long pc_audit_checked, pc_audit_bad;
     unsigned long pc_reg_checked, pc_reg_bad, pc_audit_stale, pc_exp_checked;
+    // TB_PC_STATS=1 prints them per function
+    unsigned long long pc_stat[16];
+    // ra_split.c: per value, the blocks it is live-in / live-out of, read off
+    // the block bitsets once per allocate_loop call (liveness does not change
+    // while the round runs); pc_lv_count is the node count they were built
+    // for — later batches of the round see newer nodes, which have no bits
+    bool pc_lv_built;
+    size_t pc_lv_count;
+    int32_t* pc_lv_in_start;
+    uint32_t* pc_lv_in;
+    int32_t* pc_lv_out_start;
+    uint32_t* pc_lv_out;
 
     HRPRegion* hrp;
 
@@ -1497,6 +1510,15 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
                 fprintf(stderr, "[pc-audit] %s: rounds=%d vregs=%zu precolor checked=%lu bad=%lu | allocate_reg checked=%lu bad=%lu stale=%lu | expire checked=%lu\n", f->super.name, rounds, aarray_length(ctx->vregs),
                     ra.pc_audit_checked, ra.pc_audit_bad, ra.pc_reg_checked, ra.pc_reg_bad, ra.pc_audit_stale, ra.pc_exp_checked);
             }
+            if (getenv("TB_PC_STATS") != NULL) {
+                // precolor: narrow queries / other queries / narrow sleeper candidates (of which sure) / narrow fixed candidates /
+                //           register-bucket sleeper candidates / fixed-index candidates;
+                // allocate_reg: narrow queries / their candidates / full scans; interfere() calls / last_use_in_bb misses
+                fprintf(stderr, "[pc-stats] %s: rounds=%d nodes=%zu vregs=%zu | precolor narrow=%llu other=%llu cand=%llu sure=%llu fcand=%llu bucket=%llu fidx=%llu | allocate_reg narrow=%llu cand=%llu full=%llu | interfere=%llu lastuse_miss=%llu\n",
+                    f->super.name, rounds, f->node_count, aarray_length(ctx->vregs),
+                    ra.pc_stat[0], ra.pc_stat[1], ra.pc_stat[2], ra.pc_stat[8], ra.pc_stat[3], ra.pc_stat[4], ra.pc_stat[5],
+                    ra.pc_stat[6], ra.pc_stat[7], ra.pc_stat[9], ra.pc_stat[10], ra.pc_stat[11]);
+            }
             return;
         }
 
@@ -1715,6 +1737,7 @@ static int last_use_in_bb(TB_BasicBlock* blocks, TB_BasicBlock** scheduled, Roge
         return ra->inactive_cache[hash_index].last_use;
     }
 
+    ra->pc_stat[11]++;
     #if TB_OPTDEBUG_STATS
     stats_miss += 1;
     #endif
@@ -1810,6 +1833,7 @@ static bool interfere_in_block(TB_BasicBlock* blocks, int* order, TB_BasicBlock*
 }
 
 static bool interfere(Ctx* restrict ctx, Rogers* restrict ra, TB_Node* lhs, TB_Node* rhs) {
+    ra->pc_stat[10]++;
     TB_BasicBlock** scheduled = ctx->f->scheduled;
     int* order = ra->order;
 
@@ -2505,6 +2529,10 @@ static void pc_index_future(Ctx* ctx, Rogers* ra, int class) {
 }
 
 static void pc_index_fixed(Ctx* ctx, Rogers* ra, int class) {
+    // built once per round: nothing it files changes while the pre-allocate
+    // loop runs (a re-pin keeps the register it was already fixed to)
+    if (ra->pc_fixed_built[class]) { return; }
+    ra->pc_fixed_built[class] = true;
     FOR_N(i, 1, aarray_length(ctx->vregs)) {
         VReg* o = &ctx->vregs[i];
         if (o->n == NULL || o->n->type == TB_NULL || o->mask == NULL || o->mask->class != class) { continue; }
@@ -2575,7 +2603,18 @@ static bool pc_dies_here(Ctx* restrict ctx, Rogers* restrict ra, TB_Node* n, siz
 
 // what can be in the way of a value that dies inside its own block (see
 // `narrow` above): sleepers into pc_cand (gvns), and with `with_fixed` the
-// fixed-mask vregs into pc_fcand (vreg indices).
+// fixed-mask vregs into pc_fcand. Both lists hold pairs.
+//
+// The second element says whether the interference test can be skipped.
+// interfere_in_block(n, m) in the block of both compares the earlier value's
+// last use with the later value's definition (or answers yes at once when
+// both are live-out). For a narrow n every candidate of its own block was
+// picked by exactly that comparison — defined between n and n's last use,
+// or live across n's definition — so the answer is known: pc_cand carries
+// (gvn, 1) and the caller only blocks the register. Candidates of other
+// blocks carry 0 and take the real test. For the fixed-mask vregs of
+// pc_fcand the pair is (vreg index, the member that is known to interfere,
+// or 0).
 static void pc_narrow_candidates(Ctx* restrict ctx, Rogers* restrict ra, int class, TB_Node* n, int last_use, bool with_fixed) {
     TB_BasicBlock** scheduled = ctx->f->scheduled;
     TB_BasicBlock* bb = scheduled[n->gvn];
@@ -2586,34 +2625,47 @@ static void pc_narrow_candidates(Ctx* restrict ctx, Rogers* restrict ra, int cla
     ra->pc_fcand_len = 0;
 
     int self = ra->order[n->gvn]; // n's ordinal (item index + 1)
+    uint32_t pair[2];
 
     // another block, or this one above n: live-in or live-out of bb (a value
     // of bb defined at or after n is met by the window below)
     pc_live_list(ctx, ra, bb);
     FOR_N(t, 0, ra->pc_live_len) {
         uint32_t g = ra->pc_live[t];
-        if (scheduled[g] == bb && ra->order[g] >= self) { continue; }
+        bool here = scheduled[g] == bb;
+        if (here && ra->order[g] >= self) { continue; }
         int ov = g < aarray_length(ctx->vreg_map) ? ctx->vreg_map[g] : 0;
         if (ov <= 0) { continue; }
         VReg* o = &ctx->vregs[ov];
+        // live-out of bb: the rule compares n's last use with m's definition
+        uint32_t sure = (here && set_get(&bb->live_out, g)) ? 1 : 0;
         if (future->array[g] >= 0 && o->class == class && o->assigned >= 0) {
-            pc_push(ra->arena, (void**)&ra->pc_cand, &ra->pc_cand_len, &ra->pc_cand_cap, sizeof(uint32_t), &g);
+            pair[0] = g, pair[1] = sure;
+            pc_push(ra->arena, (void**)&ra->pc_cand, &ra->pc_cand_len, &ra->pc_cand_cap, sizeof(pair), pair);
         }
         if (with_fixed && o->mask != NULL && o->mask->class == class && fixed_reg_mask(o->mask) >= 0) {
-            pc_push(ra->arena, (void**)&ra->pc_fcand, &ra->pc_fcand_len, &ra->pc_fcand_cap, sizeof(uint32_t), &ov);
+            pair[0] = (uint32_t)ov, pair[1] = sure ? g : 0;
+            pc_push(ra->arena, (void**)&ra->pc_fcand, &ra->pc_fcand_len, &ra->pc_fcand_cap, sizeof(pair), pair);
         }
     }
 
-    // same block, defined between n and n's last use (ordinals are item index + 1)
+    // same block, defined between n and n's last use (ordinals are item index + 1):
+    // the item positions [self, last use - 1)
     for (size_t iw = (size_t)(self - 1) / 64; iw * 64 < (size_t)(last_use - 1); iw++) {
         uint64_t slept = ra->pc_slept[base + iw];
         uint64_t fxd = with_fixed ? ra->pc_fxbits[base + iw] : 0;
+        // first word: only what is above n
+        uint64_t keep = ~0ull;
         if (iw * 64 <= (size_t)(self - 1)) {
-            // first word: only what is above n
-            uint64_t keep = ((self - 1) % 64 == 63) ? 0 : ~0ull << ((self - 1) % 64 + 1);
-            slept &= keep;
-            fxd &= keep;
+            keep = ((self - 1) % 64 == 63) ? 0 : ~0ull << ((self - 1) % 64 + 1);
         }
+        // last word: only what is below n's last use
+        size_t past = (size_t)(last_use - 1) - iw * 64;
+        if (past < 64) {
+            keep &= past == 0 ? 0 : ~0ull >> (64 - past);
+        }
+        slept &= keep;
+        fxd &= keep;
         while (slept | fxd) {
             int bit = tb_ffs64(slept | fxd) - 1;
             uint64_t mask = 1ull << bit;
@@ -2622,12 +2674,14 @@ static void pc_narrow_candidates(Ctx* restrict ctx, Rogers* restrict ra, int cla
             if (slept & mask) {
                 slept &= ~mask;
                 if (ov > 0 && future->array[m->gvn] >= 0) {
-                    pc_push(ra->arena, (void**)&ra->pc_cand, &ra->pc_cand_len, &ra->pc_cand_cap, sizeof(uint32_t), &m->gvn);
+                    pair[0] = m->gvn, pair[1] = 1;
+                    pc_push(ra->arena, (void**)&ra->pc_cand, &ra->pc_cand_len, &ra->pc_cand_cap, sizeof(pair), pair);
                 }
             } else {
                 fxd &= ~mask;
                 if (ov > 0) {
-                    pc_push(ra->arena, (void**)&ra->pc_fcand, &ra->pc_fcand_len, &ra->pc_fcand_cap, sizeof(uint32_t), &ov);
+                    pair[0] = (uint32_t)ov, pair[1] = m->gvn;
+                    pc_push(ra->arena, (void**)&ra->pc_fcand, &ra->pc_fcand_len, &ra->pc_fcand_cap, sizeof(pair), pair);
                 }
             }
         }
@@ -2635,19 +2689,23 @@ static void pc_narrow_candidates(Ctx* restrict ctx, Rogers* restrict ra, int cla
 
     // same block, defined above n
     if (with_fixed) {
-        // the pre-allocate loop: the sleepers put to sleep behind its back,
-        // and the fixed-mask members live across the current point (the
-        // query is always at n's own position there)
+        // the pre-allocate loop: the sleepers put to sleep behind its back
+        // (not picked by the rule, they take the real test), and the
+        // fixed-mask members live across n's definition (the query is always
+        // at n's own position there; a member whose last use is at n itself
+        // dies there and never interferes)
         FOR_N(t, 0, ra->pc_pre_len[b]) {
             uint32_t g = ra->pc_pre[b][t];
             if (scheduled[g] == bb && ra->order[g] < self && future->array[g] >= 0) {
-                pc_push(ra->arena, (void**)&ra->pc_cand, &ra->pc_cand_len, &ra->pc_cand_cap, sizeof(uint32_t), &g);
+                pair[0] = g, pair[1] = 0;
+                pc_push(ra->arena, (void**)&ra->pc_cand, &ra->pc_cand_len, &ra->pc_cand_cap, sizeof(pair), pair);
             }
         }
         FOR_N(t, 0, ra->pc_fx_act_len) {
-            int ov = ctx->vreg_map[ra->pc_fx_act[t]];
-            if (ov > 0) {
-                pc_push(ra->arena, (void**)&ra->pc_fcand, &ra->pc_fcand_len, &ra->pc_fcand_cap, sizeof(uint32_t), &ov);
+            uint32_t g = ra->pc_fx_act[t];
+            if (ra->pc_fx_act_last[t] > (uint32_t)self && ctx->vreg_map[g] > 0) {
+                pair[0] = (uint32_t)ctx->vreg_map[g], pair[1] = g;
+                pc_push(ra->arena, (void**)&ra->pc_fcand, &ra->pc_fcand_len, &ra->pc_fcand_cap, sizeof(pair), pair);
             }
         }
     } else {
@@ -2670,23 +2728,26 @@ static void pc_narrow_candidates(Ctx* restrict ctx, Rogers* restrict ra, int cla
         }
         FOR_N(t, 0, ra->pc_fx_act_len) {
             uint32_t g = ra->pc_fx_act[t];
-            if (ra->order[g] < self && (!ra->pc_prio || ra->pc_fx_act_last[t] > (uint32_t)self) && future->array[g] >= 0) {
-                pc_push(ra->arena, (void**)&ra->pc_cand, &ra->pc_cand_len, &ra->pc_cand_cap, sizeof(uint32_t), &g);
+            if (ra->order[g] < self && ra->pc_fx_act_last[t] > (uint32_t)self && future->array[g] >= 0) {
+                pair[0] = g, pair[1] = 1;
+                pc_push(ra->arena, (void**)&ra->pc_cand, &ra->pc_cand_len, &ra->pc_cand_cap, sizeof(pair), pair);
             }
         }
         if (!ra->pc_prio) {
             for (uint32_t t = ra->pc_fx_cursor; t < ra->pc_fx_sorted && ra->pc_fx_sort[t * 2 + 1] > (uint32_t)self; t++) {
                 uint32_t g = ra->pc_fx_sort[t * 2];
                 if (ra->order[g] < self && future->array[g] >= 0) {
-                    pc_push(ra->arena, (void**)&ra->pc_cand, &ra->pc_cand_len, &ra->pc_cand_cap, sizeof(uint32_t), &g);
+                    pair[0] = g, pair[1] = 1;
+                    pc_push(ra->arena, (void**)&ra->pc_cand, &ra->pc_cand_len, &ra->pc_cand_cap, sizeof(pair), pair);
                 }
             }
         }
     }
 }
 
-// one sleeping gvn against the pre-colored vreg's coalesce set
-static bool pc_sleeper_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t og, int vreg_id, VReg* vreg, size_t cnt, TB_Node** set, VReg** out_other) {
+// one sleeping gvn against the pre-colored vreg's coalesce set; `sure`: the
+// interference is known (see pc_narrow_candidates)
+static bool pc_sleeper_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t og, int vreg_id, VReg* vreg, size_t cnt, TB_Node** set, VReg** out_other, bool sure) {
     TB_Node* other = ra->gvn2node[og];
     int ov = og < aarray_length(ctx->vreg_map) ? ctx->vreg_map[og] : 0;
     if (other == NULL || ov <= 0 || ov == vreg_id) { return false; }
@@ -2697,7 +2758,7 @@ static bool pc_sleeper_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t og, i
         return false;
     }
 
-    if (sets_interfere(ctx, ra, cnt, set, other)) {
+    if (sure || sets_interfere(ctx, ra, cnt, set, other)) {
         *out_other = o;
         return true;
     }
@@ -2705,7 +2766,7 @@ static bool pc_sleeper_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t og, i
 }
 
 // vreg `i` (fixed to register `reg`) against the pre-colored vreg's coalesce set
-static bool pc_fixed_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t i, int vreg_id, int reg, size_t cnt, TB_Node** set, VReg** out_other) {
+static bool pc_fixed_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t i, int vreg_id, int reg, size_t cnt, TB_Node** set, VReg** out_other, uint32_t sure_gvn) {
     VReg* o = &ctx->vregs[i];
     if (i == (uint32_t)vreg_id || o->n == NULL || o->n->type == TB_NULL || o->mask == NULL ||
         o->mask->class != class || fixed_reg_mask(o->mask) != reg) {
@@ -2715,6 +2776,16 @@ static bool pc_fixed_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t i, int 
     size_t ocnt;
     TB_Node* on = o->n;
     TB_Node** oset = coalesce_set_array(ctx, ra, &on, &ocnt);
+    // `sure_gvn`: this member is known to interfere with n (see
+    // pc_narrow_candidates) — any one of them is enough
+    if (sure_gvn != 0) {
+        FOR_N(k, 0, ocnt) {
+            if (oset[k]->gvn == sure_gvn && oset[k]->type != TB_NULL) {
+                *out_other = o;
+                return true;
+            }
+        }
+    }
     FOR_N(k, 0, ocnt) {
         if (oset[k]->type != TB_NULL && sets_interfere(ctx, ra, cnt, set, oset[k])) {
             *out_other = o;
@@ -2730,15 +2801,21 @@ static bool precolor_conflicts_scan(Ctx* ctx, Rogers* ra, int vreg_id, size_t cn
     int class = vreg->class;
     SparseSet* future = &ra->future_active[class];
     FOR_N(i, 0, aarray_length(future->stack)) {
-        if (pc_sleeper_conflicts(ctx, ra, class, future->stack[i], vreg_id, vreg, cnt, set, out_other)) { return true; }
+        if (pc_sleeper_conflicts(ctx, ra, class, future->stack[i], vreg_id, vreg, cnt, set, out_other, false)) { return true; }
     }
     if (class != REG_CLASS_STK) {
         FOR_N(i, 1, aarray_length(ctx->vregs)) {
-            if (pc_fixed_conflicts(ctx, ra, class, (uint32_t)i, vreg_id, vreg->assigned, cnt, set, out_other)) { return true; }
+            if (pc_fixed_conflicts(ctx, ra, class, (uint32_t)i, vreg_id, vreg->assigned, cnt, set, out_other, 0)) { return true; }
         }
     }
     return false;
 }
+
+// a candidate as pc_narrow_candidates files it: a gvn and what is known about it
+typedef struct {
+    uint32_t gvn;
+    uint32_t sure;
+} PCCand;
 
 static bool precolor_conflicts_index(Ctx* ctx, Rogers* ra, int vreg_id, size_t cnt, TB_Node** set, VReg** out_other) {
     VReg* vreg = &ctx->vregs[vreg_id];
@@ -2753,30 +2830,41 @@ static bool precolor_conflicts_index(Ctx* ctx, Rogers* ra, int vreg_id, size_t c
     // block and the ones live in it (see `narrow` above)
     int last_use = 0;
     if (class != REG_CLASS_STK && pc_dies_here(ctx, ra, set[0], cnt, set, scheduled, &last_use)) {
+        ra->pc_stat[0]++;
         pc_narrow_candidates(ctx, ra, class, set[0], last_use, true);
+        ra->pc_stat[2] += ra->pc_cand_len, ra->pc_stat[3] += ra->pc_fcand_len;
+        PCCand* cand = (PCCand*)ra->pc_cand;
         FOR_N(t, 0, ra->pc_cand_len) {
-            if (pc_sleeper_conflicts(ctx, ra, class, ra->pc_cand[t], vreg_id, vreg, cnt, set, out_other)) { return true; }
+            ra->pc_stat[8] += cand[t].sure != 0;
+            if (pc_sleeper_conflicts(ctx, ra, class, cand[t].gvn, vreg_id, vreg, cnt, set, out_other, cand[t].sure != 0)) {
+                return true;
+            }
         }
+        PCCand* fcand = (PCCand*)ra->pc_fcand;
         FOR_N(t, 0, ra->pc_fcand_len) {
-            if (pc_fixed_conflicts(ctx, ra, class, ra->pc_fcand[t], vreg_id, vreg->assigned, cnt, set, out_other)) { return true; }
+            if (pc_fixed_conflicts(ctx, ra, class, fcand[t].gvn, vreg_id, vreg->assigned, cnt, set, out_other, fcand[t].sure)) {
+                return true;
+            }
         }
         return false;
     }
+    ra->pc_stat[1]++;
 
     if (indexed && vreg->reg_width == 1) {
         pc_index_future(ctx, ra, class);
         if (!ra->pc_scan[class]) {
             int reg = vreg->assigned;
             uint32_t* ids = ra->pc_bkt[class][reg];
+            ra->pc_stat[4] += ra->pc_bkt_len[class][reg];
             FOR_N(i, 0, ra->pc_bkt_len[class][reg]) {
-                if (pc_sleeper_conflicts(ctx, ra, class, ids[i], vreg_id, vreg, cnt, set, out_other)) { return true; }
+                if (pc_sleeper_conflicts(ctx, ra, class, ids[i], vreg_id, vreg, cnt, set, out_other, false)) { return true; }
             }
             goto fixed;
         }
     }
 
     FOR_N(i, 0, aarray_length(future->stack)) {
-        if (pc_sleeper_conflicts(ctx, ra, class, future->stack[i], vreg_id, vreg, cnt, set, out_other)) { return true; }
+        if (pc_sleeper_conflicts(ctx, ra, class, future->stack[i], vreg_id, vreg, cnt, set, out_other, false)) { return true; }
     }
 
     fixed:
@@ -2787,15 +2875,16 @@ static bool precolor_conflicts_index(Ctx* ctx, Rogers* ra, int vreg_id, size_t c
         if (!ra->pc_scan[class]) {
             int reg = vreg->assigned;
             uint32_t* ids = ra->pc_fixed[class][reg];
+            ra->pc_stat[5] += ra->pc_fixed_len[class][reg];
             FOR_N(t, 0, ra->pc_fixed_len[class][reg]) {
-                if (pc_fixed_conflicts(ctx, ra, class, ids[t], vreg_id, reg, cnt, set, out_other)) { return true; }
+                if (pc_fixed_conflicts(ctx, ra, class, ids[t], vreg_id, reg, cnt, set, out_other, 0)) { return true; }
             }
             return false;
         }
     }
 
     FOR_N(i, 1, aarray_length(ctx->vregs)) {
-        if (pc_fixed_conflicts(ctx, ra, class, (uint32_t)i, vreg_id, vreg->assigned, cnt, set, out_other)) { return true; }
+        if (pc_fixed_conflicts(ctx, ra, class, (uint32_t)i, vreg_id, vreg->assigned, cnt, set, out_other, 0)) { return true; }
     }
     return false;
 }
@@ -2876,8 +2965,10 @@ static bool precolor_conflicts(Ctx* ctx, Rogers* ra, int vreg_id, size_t cnt, TB
 // leaves them. TB_PC_AUDIT=1 runs the scan (pc_sleepers_full) as well and
 // compares the two, hit by hit.
 
-// does the sleeper `other_gvn` block the coalesce set `arr`?
-static bool pc_sleeper_hits(Ctx* restrict ctx, Rogers* restrict ra, int def_class, RegMask* mask, uint64_t* ra_mask, uint32_t other_gvn, TB_Node** arr, size_t cnt) {
+// does the sleeper `other_gvn` block the coalesce set `arr`? With `sure` the
+// interference is known (see pc_narrow_candidates) and only the register is
+// asked about.
+static bool pc_sleeper_hits(Ctx* restrict ctx, Rogers* restrict ra, int def_class, RegMask* mask, uint64_t* ra_mask, uint32_t other_gvn, TB_Node** arr, size_t cnt, bool sure) {
     TB_Node* other = ra->gvn2node[other_gvn];
     if (other == NULL) { return false; }
 
@@ -2897,6 +2988,7 @@ static bool pc_sleeper_hits(Ctx* restrict ctx, Rogers* restrict ra, int def_clas
     if ((ra_mask[other_assigned / 64ull] & need_bits) == need_bits) {
         return false;
     }
+    if (sure) { return true; }
 
     TB_BasicBlock** scheduled = ctx->f->scheduled;
     int* order = ra->order;
@@ -2942,7 +3034,7 @@ static void pc_sleepers_full(Ctx* restrict ctx, Rogers* restrict ra, int def_cla
             continue;
         }
 
-        if (pc_sleeper_hits(ctx, ra, def_class, mask, ra_mask, other_gvn, arr, cnt)) {
+        if (pc_sleeper_hits(ctx, ra, def_class, mask, ra_mask, other_gvn, arr, cnt, false)) {
             if (record) {
                 pc_push(ra->arena, (void**)&ra->pc_ref, &ra->pc_ref_len, &ra->pc_ref_cap, sizeof(uint32_t), &other_gvn);
             }
@@ -2958,16 +3050,16 @@ static void pc_sleepers_here(Ctx* restrict ctx, Rogers* restrict ra, int def_cla
     // the scan visits the stack from its top; the set's index array says
     // where each candidate sits in it
     SparseSet* future = &ra->future_active[def_class];
-    uint32_t* cand = ra->pc_cand;
+    PCCand* cand = (PCCand*)ra->pc_cand;
     for (size_t i = 1; i < ra->pc_cand_len; i++) {
-        uint32_t g = cand[i];
-        int at = future->array[g];
+        PCCand c = cand[i];
+        int at = future->array[c.gvn];
         size_t j = i;
-        while (j > 0 && future->array[cand[j - 1]] < at) {
+        while (j > 0 && future->array[cand[j - 1].gvn] < at) {
             cand[j] = cand[j - 1];
             j--;
         }
-        cand[j] = g;
+        cand[j] = c;
     }
 }
 
@@ -3102,6 +3194,7 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
         TB_BasicBlock** scheduled = ctx->f->scheduled;
         int last_use = 0;
         bool here = pc_dies_here(ctx, ra, n, cnt, arr, scheduled, &last_use);
+        ra->pc_stat[6] += here, ra->pc_stat[9] += !here;
 
         if (pc_audit_enabled()) {
             // TB_PC_AUDIT=1: run the scan on a copy of the mask, run the
@@ -3117,10 +3210,10 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
             if (here) {
                 pc_sleepers_here(ctx, ra, def_class, n, last_use);
                 FOR_N(t, 0, ra->pc_cand_len) {
-                    uint32_t g = ra->pc_cand[t];
-                    if (pc_sleeper_hits(ctx, ra, def_class, mask, got_mask, g, arr, cnt)) {
-                        pc_push(ra->arena, (void**)&ra->pc_got, &ra->pc_got_len, &ra->pc_got_cap, sizeof(uint32_t), &g);
-                        pc_sleeper_block(ctx, ra, got_mask, g);
+                    PCCand c = ((PCCand*)ra->pc_cand)[t];
+                    if (pc_sleeper_hits(ctx, ra, def_class, mask, got_mask, c.gvn, arr, cnt, c.sure != 0)) {
+                        pc_push(ra->arena, (void**)&ra->pc_got, &ra->pc_got_len, &ra->pc_got_cap, sizeof(uint32_t), &c.gvn);
+                        pc_sleeper_block(ctx, ra, got_mask, c.gvn);
                     }
                 }
             } else {
@@ -3161,10 +3254,11 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
             }
         } else if (here) {
             pc_sleepers_here(ctx, ra, def_class, n, last_use);
+            ra->pc_stat[7] += ra->pc_cand_len;
             FOR_N(t, 0, ra->pc_cand_len) {
-                uint32_t g = ra->pc_cand[t];
-                if (pc_sleeper_hits(ctx, ra, def_class, mask, ra_mask, g, arr, cnt)) {
-                    pc_sleeper_block(ctx, ra, ra_mask, g);
+                PCCand c = ((PCCand*)ra->pc_cand)[t];
+                if (pc_sleeper_hits(ctx, ra, def_class, mask, ra_mask, c.gvn, arr, cnt, c.sure != 0)) {
+                    pc_sleeper_block(ctx, ra, ra_mask, c.gvn);
                 }
             }
         } else {
@@ -3264,6 +3358,28 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
 // interference (tank miscompiled). The copy's true position is what the
 // interference semantics need, so rebuild the block timeline in place.
 static void rogers_renumber_block(TB_BasicBlock* bb, Rogers* restrict ra) {
+    // PATCH(odin-tilde): the arrays were sized for the node count at
+    // compute_ordinals, rounded up to a power of two — next to a boundary
+    // the slack is barely a dozen — while the loops that call this create
+    // nodes. A block holding a node past the end grew nothing and the
+    // ordinals went through the chunk into whatever the allocator had put
+    // next (tests/core/encoding/json: the IR arena's chunk header).
+    uint32_t max_gvn = 0;
+    aarray_for(j, bb->items) {
+        TB_Node* n = bb->items[j];
+        if (n->gvn > max_gvn) { max_gvn = n->gvn; }
+    }
+    if (max_gvn >= ra->order_cap) {
+        size_t new_cap = tb_next_pow2(max_gvn + 16);
+        int* order = tb_arena_alloc(ra->arena, new_cap * sizeof(int));
+        TB_Node** gvn2node = tb_arena_alloc(ra->arena, new_cap * sizeof(TB_Node*));
+        memcpy(order, ra->order, ra->order_cap * sizeof(int));
+        memcpy(gvn2node, ra->gvn2node, ra->order_cap * sizeof(TB_Node*));
+        memset(gvn2node + ra->order_cap, 0, (new_cap - ra->order_cap) * sizeof(TB_Node*));
+        ra->order = order;
+        ra->gvn2node = gvn2node;
+        ra->order_cap = new_cap;
+    }
     int timeline = 1;
     aarray_for(j, bb->items) {
         TB_Node* n = bb->items[j];
@@ -3450,6 +3566,14 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     memset(ra->pc_fixed, 0, sizeof ra->pc_fixed);
     memset(ra->pc_fixed_len, 0, sizeof ra->pc_fixed_len);
     memset(ra->pc_fixed_cap, 0, sizeof ra->pc_fixed_cap);
+    // PATCH(odin-tilde): pc_index_fixed used to append the whole index again
+    // on every call. A query that is not answered by the narrow path calls it
+    // once, so the k-th such query of a round walked k copies of it:
+    // reflect@write_type_writer 5748 queries → 91.6M candidate tests and 94M
+    // interference calls, runtime@write_write_type 105M more — 98% of the
+    // package's interference work, in two functions of a few thousand nodes.
+    memset(ra->pc_fixed_built, 0, sizeof ra->pc_fixed_built);
+    ra->pc_lv_built = false;
     ra->pc_walk_bb = SIZE_MAX;
     ra->pc_item_pos = INT_MAX;
     ra->pc_last_walk = false;
