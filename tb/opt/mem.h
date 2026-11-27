@@ -697,14 +697,13 @@ static TB_Node* process_sese(TB_Function* f, NL_Table* sese2set, LocalSplitter* 
                 if (base->type == TB_PTR_OFFSET) {
                     TB_Node* root = base;
                     while (root->type == TB_PTR_OFFSET) root = root->inputs[1];
-                    nl_table_for(e, non_aliasing) {
-                        MemorySet* old = e->v;
-                        TB_Node* old_root = old->base;
-                        while (old_root->type == TB_PTR_OFFSET) old_root = old_root->inputs[1];
-                        if (old_root == root) {
-                            nl_table_remove(non_aliasing, e->k);
-                        }
-                    }
+                    // PATCH(odin-tilde): this went through every entry of the
+                    // table to drop the ones with this root — on
+                    // named_xml_entity_to_rune, thousands of entries for each
+                    // store through an offset. Entries are only ever made in
+                    // the else below, for a base that is not an offset, so an
+                    // entry's root is its own key: there is at most one to drop.
+                    nl_table_remove(non_aliasing, root);
                 } else {
                 MemorySet* set = memory_set_find_or_create(f, non_aliasing, base);
                 if (set->cnt == 0) {

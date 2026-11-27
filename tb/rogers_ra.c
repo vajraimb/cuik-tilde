@@ -45,6 +45,30 @@ typedef struct {
 // per-round index width for precolor_conflicts (see the PATCH there)
 enum { PC_MAX_REGS = 64 };
 
+// per round, what a coalesce set needs to answer "does this value interfere
+// with some member" without walking the members (see pc_set_interferes)
+typedef struct {
+    uint32_t nblk;
+    uint32_t* blk;         // member blocks, in block order
+    int32_t* min_all;      // the lowest member definition ordinal in each
+    int32_t* min_lo;       // the same among the members live-out of it (INT_MAX: none)
+    // the members of each block that die inside it, by definition ordinal
+    uint32_t* nd_at;       // [block] -> first of them, [nblk] -> end
+    int32_t* nd;           // definition ordinal
+    int32_t* npu;          // the highest last-use ordinal from the first up to here
+    uint8_t* mphi;         // the block has a phi member
+    uint32_t nlout;
+    uint32_t* lout;        // the blocks a member is live-out of beyond its own, in block order
+    uint32_t nuse;
+    uint32_t* ublk;        // the blocks members have uses in, in block order
+    int32_t* umax_before;  // the highest use ordinal there, of a member of an earlier block
+    int32_t* umax_same;    // ... of a member of that block
+    int32_t* umax_after;   // ... of a member of a later block
+} PCSetInfo;
+
+static bool pc_audit_enabled(void);
+static int pc_u32_find(const uint32_t* list, size_t n, uint32_t b);
+
 typedef struct {
     Ctx* ctx;
     TB_Arena* arena;
@@ -106,6 +130,7 @@ typedef struct {
     uint32_t** pc_pre;
     uint32_t* pc_pre_len;
     uint32_t* pc_pre_cap;
+    int32_t* pc_pre_in;      // [gvn] -> the block whose list holds it (+1)
     size_t pc_walk_bb;
     int pc_item_pos;
     bool pc_last_walk;
@@ -134,7 +159,8 @@ typedef struct {
     unsigned long pc_audit_checked, pc_audit_bad;
     unsigned long pc_reg_checked, pc_reg_bad, pc_audit_stale, pc_exp_checked;
     // TB_PC_STATS=1 prints them per function
-    unsigned long long pc_stat[18];
+    //   [12] and [13] are free; 14–16: the set interference (see pc_set_interferes)
+    unsigned long long pc_stat[17];
     // per round: for each block its live-in and then its live-out vregs in
     // ascending gvn order — the one walk the allocator makes over the
     // liveness bitsets (see pc_liv_build)
@@ -150,6 +176,35 @@ typedef struct {
     uint32_t* pc_lv_in;
     int32_t* pc_lv_out_start;
     uint32_t* pc_lv_out;
+    // the round's liveness lists are current (between pc_liv_build and the
+    // end of allocate_loop); pc_sets is by leader gvn, built on first use
+    bool pc_liv_ok;
+    PCSetInfo** pc_sets;
+    unsigned long pc_set_checked, pc_set_bad;
+    // per round: the vreg inputs of the items, per block from its last item
+    // down — where a value is used in a block (see pc_clobbered_sleepers and
+    // pc_sleepers_range)
+    uint32_t* pc_use;      // gvns
+    uint32_t* pc_use_at;   // [item] -> entries above it in pc_use, [pc_use_items] -> end
+    uint32_t* pc_use_blk;  // [bb] -> its first item, [bb_count] -> end
+    uint32_t* pc_use_base; // [bb] -> its first entry in pc_use
+    size_t pc_use_items;
+    uint32_t* pc_clob_seen;  // [gvn] -> stamp of the query that took it
+    uint32_t pc_clob_stamp;
+    uint32_t* pc_clob_cand;  // scratch: the gvns of one query
+    size_t pc_clob_cap;
+    unsigned long pc_clob_checked, pc_clob_bad;
+    // per round: the vreg definitions of each block in ordinal order, with
+    // their ordinals (see pc_sleepers_range)
+    uint32_t* pc_def;
+    int32_t* pc_def_ord;
+    uint32_t* pc_def_at;     // [bb] -> first of them, [bb_count] -> end
+    // scratch of one such query
+    uint32_t* pc_rng;
+    size_t pc_rng_cap;
+    uint32_t* pc_rng_seen;
+    uint32_t pc_rng_stamp;
+    unsigned long pc_rng_checked, pc_rng_bad;
 
     HRPRegion* hrp;
 
@@ -638,8 +693,9 @@ static void gimme_lifetime(Ctx* ctx, Rogers* ra, TB_BasicBlock** scheduled, TB_B
     range[1] = end_t;
 }
 
-// PATCH(odin-tilde): one block of mark_node_as_hrp
-static void hrp_mark_block(Ctx* ctx, Rogers* ra, TB_BasicBlock** scheduled, size_t bb_id, TB_Node* n, TB_Node* failed, int reg_class) {
+// PATCH(odin-tilde): mark_node_as_hrp, for one block: its HRP region of
+// `reg_class` grows to hold [start_t, end_t]
+static void hrp_mark_span(Ctx* ctx, Rogers* ra, size_t bb_id, int reg_class, int start_t, int end_t) {
     TB_BasicBlock* bb = &ctx->cfg.blocks[bb_id];
     HRPRegion* hrp = &ra->hrp[bb_id];
 
@@ -648,12 +704,6 @@ static void hrp_mark_block(Ctx* ctx, Rogers* ra, TB_BasicBlock** scheduled, size
         return;
     }
 
-    int A[2], B[2];
-    gimme_lifetime(ctx, ra, scheduled, bb, n,      A);
-    gimme_lifetime(ctx, ra, scheduled, bb, failed, B);
-
-    int start_t = TB_MAX(A[0], B[0]);
-    int end_t   = TB_MIN(A[1], B[1]);
     if (end_t < 0) {
         return;
     }
@@ -668,6 +718,22 @@ static void hrp_mark_block(Ctx* ctx, Rogers* ra, TB_BasicBlock** scheduled, size
         hrp->end[reg_class]   = TB_MAX(hrp->end[reg_class], end_t);
     }
     // stats_aaa++;
+}
+
+// the same, from the two lifetimes in the block
+static void hrp_mark_block(Ctx* ctx, Rogers* ra, TB_BasicBlock** scheduled, size_t bb_id, TB_Node* n, TB_Node* failed, int reg_class) {
+    TB_BasicBlock* bb = &ctx->cfg.blocks[bb_id];
+
+    int A[2], B[2];
+    gimme_lifetime(ctx, ra, scheduled, bb, n,      A);
+    gimme_lifetime(ctx, ra, scheduled, bb, failed, B);
+
+    hrp_mark_span(ctx, ra, bb_id, reg_class, TB_MAX(A[0], B[0]), TB_MIN(A[1], B[1]));
+}
+
+// is `b` among the blocks listed for `g` (they are in block order)
+static bool pc_lv_has(const uint32_t* list, int32_t from, int32_t to, uint32_t b) {
+    return from < to && pc_u32_find(list + from, (size_t)(to - from), b) >= 0;
 }
 
 static void mark_node_as_hrp(Ctx* ctx, Rogers* ra, uint32_t gvn, uint32_t failed_gvn, int reg_class) {
@@ -692,10 +758,13 @@ static void mark_node_as_hrp(Ctx* ctx, Rogers* ra, uint32_t gvn, uint32_t failed
 
     // PATCH(odin-tilde): this went through every block of the function,
     // twice asking whether each value is live into it — two cache misses a
-    // block a mark, and last_use_in_bb walking the users on each hit. A
-    // block only counts where both lifetimes exist, and a value exists
-    // where it is defined or is live into: those blocks are the per-round
-    // lists (see pc_liv_build).
+    // block a mark, and last_use_in_bb on each hit. A block only counts
+    // where both lifetimes exist, and a value exists where it is defined or
+    // is live into: those blocks are the per-round lists (see pc_liv_build).
+    // Values that live through a block have the whole block as their
+    // lifetime there, which the live-out lists say without a lookup: on
+    // named_xml_entity_to_rune the marks used to miss last_use_in_bb's cache
+    // 20.9M times for exactly that case.
     if (ra->pc_lv_in == NULL || gvn >= ra->pc_lv_count || failed_gvn >= ra->pc_lv_count) {
         FOR_N(bb_id, 0, ctx->bb_count) {
             hrp_mark_block(ctx, ra, scheduled, bb_id, n, failed, reg_class);
@@ -704,29 +773,45 @@ static void mark_node_as_hrp(Ctx* ctx, Rogers* ra, uint32_t gvn, uint32_t failed
         TB_BasicBlock* blocks = ctx->cfg.blocks;
         size_t def_n = (size_t)(scheduled[gvn] - blocks);
         size_t def_f = (size_t)(scheduled[failed_gvn] - blocks);
+        bool n_live_into_def = pc_lv_has(ra->pc_lv_in, ra->pc_lv_in_start[gvn], ra->pc_lv_in_start[gvn + 1], (uint32_t)def_n);
 
         // where both are defined
         if (def_n == def_f) {
             hrp_mark_block(ctx, ra, scheduled, def_n, n, failed, reg_class);
         }
 
-        // where n is live into, and failed is live into or defined
+        // where n is live into, and failed is live into or defined; cursors
+        // in the other lists answer the membership questions in order
+        size_t f_in = ra->pc_lv_in_start[failed_gvn], f_in_end = ra->pc_lv_in_start[failed_gvn + 1];
+        size_t n_out = ra->pc_lv_out_start[gvn], n_out_end = ra->pc_lv_out_start[gvn + 1];
+        size_t f_out = ra->pc_lv_out_start[failed_gvn], f_out_end = ra->pc_lv_out_start[failed_gvn + 1];
         FOR_N(t, ra->pc_lv_in_start[gvn], ra->pc_lv_in_start[gvn + 1]) {
             uint32_t b = ra->pc_lv_in[t];
-            if (def_f == b || set_get(&blocks[b].live_in, failed_gvn)) {
-                hrp_mark_block(ctx, ra, scheduled, b, n, failed, reg_class);
-            }
-        }
 
-        // where failed is live into and n is defined (n not live there too,
-        // or the loop above had it)
-        if (def_n != def_f && !set_get(&blocks[def_n].live_in, gvn)) {
-            FOR_N(t, ra->pc_lv_in_start[failed_gvn], ra->pc_lv_in_start[failed_gvn + 1]) {
-                if (ra->pc_lv_in[t] == (uint32_t)def_n) {
-                    hrp_mark_block(ctx, ra, scheduled, def_n, n, failed, reg_class);
-                    break;
+            while (f_in < f_in_end && ra->pc_lv_in[f_in] < b) { f_in++; }
+            bool f_live_in = f_in < f_in_end && ra->pc_lv_in[f_in] == b;
+            if (!f_live_in && def_f != b) { continue; }
+
+            // a value defined in the block starts there, not at its entry
+            bool n_here = b == (uint32_t)def_n, f_here = b == (uint32_t)def_f;
+            if (!n_here && !f_here) {
+                while (n_out < n_out_end && ra->pc_lv_out[n_out] < b) { n_out++; }
+                while (f_out < f_out_end && ra->pc_lv_out[f_out] < b) { f_out++; }
+                bool n_thru = n_out < n_out_end && ra->pc_lv_out[n_out] == b;
+                bool f_thru = f_out < f_out_end && ra->pc_lv_out[f_out] == b;
+                if (n_thru && f_thru) {
+                    hrp_mark_span(ctx, ra, b, reg_class, 0, (int)aarray_length(blocks[b].items) - 1);
+                    continue;
                 }
             }
+            hrp_mark_block(ctx, ra, scheduled, b, n, failed, reg_class);
+        }
+
+        // where failed is live into and n is only defined (when n is live
+        // there too, the loop above had it)
+        if (def_n != def_f && !n_live_into_def &&
+            pc_lv_has(ra->pc_lv_in, ra->pc_lv_in_start[failed_gvn], ra->pc_lv_in_start[failed_gvn + 1], (uint32_t)def_n)) {
+            hrp_mark_block(ctx, ra, scheduled, def_n, n, failed, reg_class);
         }
     }
     cuikperf_region_end();
@@ -1553,17 +1638,19 @@ void tb__rogers(Ctx* restrict ctx, TB_Arena* arena) {
             ctx->num_spills += ra.num_spills - starting_spills;
             // printf("ROUNDS ON %s: %d\n", f->super.name, rounds);
             if (ra.pc_audit_checked || ra.pc_reg_checked) {
-                fprintf(stderr, "[pc-audit] %s: rounds=%d vregs=%zu precolor checked=%lu bad=%lu | allocate_reg checked=%lu bad=%lu stale=%lu | expire checked=%lu\n", f->super.name, rounds, aarray_length(ctx->vregs),
-                    ra.pc_audit_checked, ra.pc_audit_bad, ra.pc_reg_checked, ra.pc_reg_bad, ra.pc_audit_stale, ra.pc_exp_checked);
+                fprintf(stderr, "[pc-audit] %s: rounds=%d vregs=%zu precolor checked=%lu bad=%lu | allocate_reg checked=%lu bad=%lu stale=%lu | expire checked=%lu | set checked=%lu bad=%lu | clobber checked=%lu bad=%lu\n", f->super.name, rounds, aarray_length(ctx->vregs),
+                    ra.pc_audit_checked, ra.pc_audit_bad, ra.pc_reg_checked, ra.pc_reg_bad, ra.pc_audit_stale, ra.pc_exp_checked, ra.pc_set_checked, ra.pc_set_bad, ra.pc_clob_checked, ra.pc_clob_bad);
             }
             if (getenv("TB_PC_STATS") != NULL) {
                 // precolor: narrow queries / other queries / narrow sleeper candidates (of which sure) / narrow fixed candidates /
                 //           register-bucket sleeper candidates / fixed-index candidates;
-                // allocate_reg: narrow queries / their candidates / full scans; interfere() calls / last_use_in_bb misses
-                fprintf(stderr, "[pc-stats] %s: rounds=%d nodes=%zu vregs=%zu | precolor narrow=%llu other=%llu cand=%llu sure=%llu fcand=%llu bucket=%llu fidx=%llu | allocate_reg narrow=%llu cand=%llu full=%llu | interfere=%llu lastuse_miss=%llu | live_len=%llu active=%llu\n",
+                // allocate_reg: narrow queries / their candidates / full scans; interfere() calls / last_use_in_bb misses;
+                // set interference: answered from the set's tables / member by member, one member / member by member, several;
+                // clobber: the kill-mask scans of the coloring walk
+                fprintf(stderr, "[pc-stats] %s: rounds=%d nodes=%zu vregs=%zu | precolor narrow=%llu other=%llu cand=%llu sure=%llu fcand=%llu bucket=%llu fidx=%llu | allocate_reg narrow=%llu cand=%llu full=%llu | interfere=%llu lastuse_miss=%llu | set table=%llu direct1=%llu directN=%llu | clobber=%llu\n",
                     f->super.name, rounds, f->node_count, aarray_length(ctx->vregs),
                     ra.pc_stat[0], ra.pc_stat[1], ra.pc_stat[2], ra.pc_stat[8], ra.pc_stat[3], ra.pc_stat[4], ra.pc_stat[5],
-                    ra.pc_stat[6], ra.pc_stat[7], ra.pc_stat[9], ra.pc_stat[10], ra.pc_stat[11], ra.pc_stat[12], ra.pc_stat[13]);
+                    ra.pc_stat[6], ra.pc_stat[7], ra.pc_stat[9], ra.pc_stat[10], ra.pc_stat[11], ra.pc_stat[14], ra.pc_stat[15], ra.pc_stat[16], ra.pc_clob_checked);
             }
             return;
         }
@@ -1921,7 +2008,12 @@ static bool pc_listed(const uint32_t* list, uint32_t len, uint32_t v) {
 static void pc_note_behind(Rogers* ra, size_t b, uint32_t gvn, int ordinal) {
     if (ra->pc_last_walk) { return; }
     bool behind = b != ra->pc_walk_bb || ordinal < ra->pc_item_pos;
-    if (behind && !pc_listed(ra->pc_pre[b], ra->pc_pre_len[b], gvn)) {
+    // PATCH(odin-tilde): the list used to be searched for the gvn on every
+    // call — a value of a big block is noted once but looked for each time
+    // anything in the block goes to sleep behind the walk. A node lives in
+    // one block and is listed once a round; pc_pre_in says which.
+    if (behind && ra->pc_pre_in[gvn] != (int32_t)(b + 1)) {
+        ra->pc_pre_in[gvn] = (int32_t)(b + 1);
         pc_push(ra->arena, (void**)&ra->pc_pre[b], &ra->pc_pre_len[b], &ra->pc_pre_cap[b], sizeof(uint32_t), &gvn);
     }
 }
@@ -2516,6 +2608,434 @@ static bool sets_interfere(Ctx* ctx, Rogers* ra, size_t cnt, TB_Node** set, TB_N
     return false;
 }
 
+// ---- a value against a whole coalesce set ----------------------------------
+//
+// PATCH(odin-tilde): "does `other` interfere with some member of the set"
+// was answered member by member — interfere_in_block for each, twice when
+// the blocks differ — and a value merged across a big construct has a set
+// with hundreds or thousands of members (named_xml_entity_to_rune: 29M
+// interfere_in_block calls per compile, nearly all for members `other`
+// never comes near).
+//
+// With B a member's block and C the other value's, B != C, the two tests
+// that interfere() makes reduce to this (U_x(b) is what last_use_in_bb
+// answers for x in b: the block's length when x is live-out of it, else the
+// highest position of its uses there):
+//   in B:  other is live-out of B, or
+//          (x is live-out of B, or C lies before B) and U_other(B) > order[x]
+//   in C:  x is live-out of C (other's last use there, at least its own
+//          definition, is past the block's entry), or
+//          (other is live-out of C, or B lies before C) and U_x(C) > order[other]
+// and so, over the members of other blocks:
+//   T1  other is live-out of some member block
+//   T2  some member is live-out of C
+//   T3  other has a use in a member block, past a member there (past any
+//       member when C lies before the block, past a live-out one otherwise)
+//   T4  some member has a use in C past other's definition (of any member
+//       not of C when other is live-out of C, of one of an earlier block
+//       otherwise)
+// A member of C itself meets other in C alone, where the rule compares
+// in-block ranges (definition ordinal d, last use U — the block's length
+// for a live-out value):
+//   both live-out, or
+//   x live-out only: U_other > d_x, or
+//   other live-out only: U_x > d_other, or
+//   neither: the one defined first has a use past the other's definition.
+// A projection takes the member-by-member test (the projection pairs are
+// its own). TB_PC_AUDIT=1 runs both and compares.
+//
+// Sets smaller than this take the member-by-member test as well: for a
+// handful of members the tables cost more than they save.
+enum { PC_SET_MIN = 4 };
+
+typedef struct { uint32_t blk; int32_t val; int32_t use; uint8_t flag; TB_Node* n; } PCSetEntry;
+
+static int pc_set_entry_cmp(const void* a, const void* b) {
+    const PCSetEntry* x = a;
+    const PCSetEntry* y = b;
+    if (x->blk != y->blk) { return x->blk < y->blk ? -1 : 1; }
+    return x->val < y->val ? -1 : x->val > y->val;
+}
+
+static int pc_u32_cmp(const void* a, const void* b) {
+    uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+// where `b` sits in a sorted list, or -1
+static int pc_u32_find(const uint32_t* list, size_t n, uint32_t b) {
+    size_t from = 0, to = n;
+    while (from < to) {
+        size_t mid = from + (to - from) / 2;
+        if (list[mid] < b) { from = mid + 1; } else { to = mid; }
+    }
+    // the bounds meet on the first entry that is not below `b`
+    return from < n && list[from] == b ? (int)from : -1;
+}
+
+static PCSetInfo* pc_set_info(Ctx* restrict ctx, Rogers* restrict ra, TB_Node** arr, size_t cnt) {
+    TB_BasicBlock** scheduled = ctx->f->scheduled;
+    TB_BasicBlock* blocks = ctx->cfg.blocks;
+    TB_Arena* arena = ra->arena;
+
+    PCSetInfo* info = tb_arena_alloc(arena, sizeof(PCSetInfo));
+    memset(info, 0, sizeof *info);
+
+    // the members by block and definition order; flag: live-out of its
+    // block; use: the last use inside it (an extra input, past input_count,
+    // is an anti-dependency edge and no use)
+    PCSetEntry* e = tb_arena_alloc(arena, cnt * sizeof(PCSetEntry));
+    FOR_N(i, 0, cnt) {
+        TB_Node* x = arr[i];
+        TB_BasicBlock* bx = scheduled[x->gvn];
+        int32_t use = ra->order[x->gvn];
+        FOR_USERS(u, x) {
+            TB_Node* un = USERN(u);
+            if (USERI(u) < un->input_count && scheduled[un->gvn] == bx && ra->order[un->gvn] > use) {
+                use = ra->order[un->gvn];
+            }
+        }
+        e[i] = (PCSetEntry){ (uint32_t)(bx - blocks), ra->order[x->gvn], use, set_get(&bx->live_out, x->gvn), x };
+    }
+    qsort(e, cnt, sizeof e[0], pc_set_entry_cmp);
+    info->blk     = tb_arena_alloc(arena, cnt * sizeof(uint32_t));
+    info->min_all = tb_arena_alloc(arena, cnt * sizeof(int32_t));
+    info->min_lo  = tb_arena_alloc(arena, cnt * sizeof(int32_t));
+    info->mphi    = tb_arena_alloc(arena, cnt * sizeof(uint8_t));
+    info->nd_at   = tb_arena_alloc(arena, (cnt + 1) * sizeof(uint32_t));
+    info->nd      = tb_arena_alloc(arena, (cnt + 1) * sizeof(int32_t));
+    info->npu     = tb_arena_alloc(arena, (cnt + 1) * sizeof(int32_t));
+    uint32_t nn = 0;
+    FOR_N(i, 0, cnt) {
+        if (i == 0 || e[i].blk != e[i - 1].blk) {
+            info->blk[info->nblk]     = e[i].blk;
+            info->min_all[info->nblk] = e[i].val;
+            info->min_lo[info->nblk]  = INT_MAX;
+            info->mphi[info->nblk]    = 0;
+            info->nd_at[info->nblk]   = nn;
+            info->nblk++;
+        }
+        uint32_t k = info->nblk - 1;
+        if (e[i].n->type == TB_PHI) { info->mphi[k] = 1; }
+        if (e[i].flag) {
+            if (e[i].val < info->min_lo[k]) { info->min_lo[k] = e[i].val; }
+        } else {
+            int32_t last = e[i].use > e[i].val ? e[i].use : e[i].val;
+            info->nd[nn]  = e[i].val;
+            info->npu[nn] = nn > info->nd_at[k] && info->npu[nn - 1] > last ? info->npu[nn - 1] : last;
+            nn++;
+        }
+    }
+    info->nd_at[info->nblk] = nn;
+
+    // the blocks a member is live-out of beyond its own
+    size_t total = 0;
+    FOR_N(i, 0, cnt) {
+        uint32_t g = arr[i]->gvn;
+        total += (size_t)(ra->pc_lv_out_start[g + 1] - ra->pc_lv_out_start[g]);
+    }
+    uint32_t* lo = tb_arena_alloc(arena, (total + 1) * sizeof(uint32_t));
+    size_t nlo = 0;
+    FOR_N(i, 0, cnt) {
+        uint32_t g = arr[i]->gvn;
+        uint32_t own = (uint32_t)(scheduled[g] - blocks);
+        FOR_N(t, ra->pc_lv_out_start[g], ra->pc_lv_out_start[g + 1]) {
+            if (ra->pc_lv_out[t] != own) { lo[nlo++] = ra->pc_lv_out[t]; }
+        }
+    }
+    qsort(lo, nlo, sizeof lo[0], pc_u32_cmp);
+    info->lout = lo;
+    FOR_N(i, 0, nlo) {
+        if (info->nlout == 0 || lo[info->nlout - 1] != lo[i]) { lo[info->nlout++] = lo[i]; }
+    }
+
+    // the uses of the members by the block they sit in; flag: the member's
+    // block lies before (0), is (1) or lies after (2) that block
+    size_t nu = 0;
+    FOR_N(i, 0, cnt) { nu += arr[i]->user_count; }
+    e = tb_arena_alloc(arena, (nu + 1) * sizeof(PCSetEntry));
+    size_t ne = 0;
+    FOR_N(i, 0, cnt) {
+        TB_Node* x = arr[i];
+        TB_BasicBlock* bx = scheduled[x->gvn];
+        FOR_USERS(u, x) {
+            TB_Node* un = USERN(u);
+            if (USERI(u) >= un->input_count) { continue; }
+            TB_BasicBlock* ub = scheduled[un->gvn];
+            e[ne++] = (PCSetEntry){ (uint32_t)(ub - blocks), ra->order[un->gvn], 0, bx < ub ? 0 : bx == ub ? 1 : 2, un };
+        }
+    }
+    qsort(e, ne, sizeof e[0], pc_set_entry_cmp);
+    info->ublk        = tb_arena_alloc(arena, (ne + 1) * sizeof(uint32_t));
+    info->umax_before = tb_arena_alloc(arena, (ne + 1) * sizeof(int32_t));
+    info->umax_same   = tb_arena_alloc(arena, (ne + 1) * sizeof(int32_t));
+    info->umax_after  = tb_arena_alloc(arena, (ne + 1) * sizeof(int32_t));
+    FOR_N(i, 0, ne) {
+        if (i == 0 || e[i].blk != e[i - 1].blk) {
+            info->ublk[info->nuse]        = e[i].blk;
+            info->umax_before[info->nuse] = 0;
+            info->umax_same[info->nuse]   = 0;
+            info->umax_after[info->nuse]  = 0;
+            info->nuse++;
+        }
+        uint32_t k = info->nuse - 1;
+        int32_t* slot = e[i].flag == 0 ? &info->umax_before[k] : e[i].flag == 1 ? &info->umax_same[k] : &info->umax_after[k];
+        if (e[i].val > *slot) { *slot = e[i].val; }
+    }
+    return info;
+}
+
+// the member-by-member test, as both callers ran it: interfere_in_block for
+// each member, twice when the blocks differ
+static bool pc_set_ref(Ctx* restrict ctx, Rogers* restrict ra, TB_Node** arr, size_t cnt, TB_Node* other) {
+    TB_BasicBlock** scheduled = ctx->f->scheduled;
+    int* order = ra->order;
+    uint32_t other_gvn = other->gvn;
+    TB_BasicBlock* other_block = scheduled[other_gvn];
+
+    FOR_N(j, 0, cnt) {
+        uint32_t lhs_gvn = arr[j]->gvn;
+        TB_BasicBlock* lhs_block = scheduled[lhs_gvn];
+        if (interfere_in_block(ctx->cfg.blocks, order, scheduled, ra, arr[j], other, lhs_gvn, other_gvn, lhs_block)) {
+            return true;
+        }
+        if (lhs_block != other_block && interfere_in_block(ctx->cfg.blocks, order, scheduled, ra, other, arr[j], other_gvn, lhs_gvn, other_block)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// PATCH(odin-tilde): interfere() for one pair, from what the two tests in
+// interfere_in_block actually read. Each of them wants, of a value of the
+// other's block, only whether it is live-out there and where its uses in
+// the block are; interfere_in_block answered from that block's live_out
+// bitset and from last_use_in_bb's cache table, a cache miss apiece for
+// every sleeper a query walks. Here "live-out of the other's block" comes
+// from the value's per-round list, which stays cached while the sleepers
+// go by, and the uses are walked where there are any.
+//
+//   x and m in one block (d: definition ordinal, U: last use in the block,
+//   the block's length for a live-out value; X, M: live-out of it):
+//     both live-out, or
+//     x live-out only: U_m > d_x, or
+//     m live-out only: U_x > d_m, or
+//     neither: the one defined first has a use past the other's definition.
+//   x in B, m in C, B != C:
+//     in B: m is live-out of B, or
+//           (x is live-out of B, or C lies before B) and m has a use in B past x
+//     in C: x is live-out of C (m's last use there, at least its own
+//           definition, is past the block's entry), or
+//           (m is live-out of C, or B lies before C) and x has a use in C past m
+// Same answer. TB_PC_AUDIT=1 compares the two member by member (pc_set_ref).
+static bool pc_pair(Ctx* restrict ctx, Rogers* restrict ra, TB_Node* x, uint32_t x_gvn, TB_Node* m, uint32_t m_gvn) {
+    TB_BasicBlock** scheduled = ctx->f->scheduled;
+    TB_BasicBlock* bx = scheduled[x_gvn];
+    TB_BasicBlock* c = scheduled[m_gvn];
+
+    if (x == m || x_gvn == m_gvn) { return false; }
+    if (x->type == TB_PHI && m->type == TB_PHI && bx != NULL && bx == c) { return true; }
+    if (x->type == TB_PROJ && m->type == TB_PROJ &&
+        x->inputs[0] == m->inputs[0] && x->inputs[0] &&
+        (x->inputs[0]->type == TB_UMULPAIR || x->inputs[0]->type == TB_SMULPAIR)) {
+        return true;
+    }
+    // not expected: the round's lists cover every value the walk meets
+    if (bx == NULL || c == NULL || x_gvn >= ra->pc_lv_count || m_gvn >= ra->pc_lv_count) {
+        int* order = ra->order;
+        if (interfere_in_block(ctx->cfg.blocks, order, scheduled, ra, x, m, x_gvn, m_gvn, bx)) { return true; }
+        return bx != c && interfere_in_block(ctx->cfg.blocks, order, scheduled, ra, m, x, m_gvn, x_gvn, c);
+    }
+
+    int32_t dx = ra->order[x_gvn], dm = ra->order[m_gvn];
+
+    if (bx == c) {
+        int32_t len = (int32_t)aarray_length(c->items);
+        bool X = set_get(&c->live_out, x_gvn);
+        bool M = set_get(&c->live_out, m_gvn);
+        int32_t ux = X ? len : dx, um = M ? len : dm;
+        FOR_USERS(u, x) {
+            TB_Node* un = USERN(u);
+            if (USERI(u) < un->input_count && scheduled[un->gvn] == c && ra->order[un->gvn] > ux) { ux = ra->order[un->gvn]; }
+        }
+        FOR_USERS(u, m) {
+            TB_Node* un = USERN(u);
+            if (USERI(u) < un->input_count && scheduled[un->gvn] == c && ra->order[un->gvn] > um) { um = ra->order[un->gvn]; }
+        }
+        if (X && M) { return true; }
+        if (X) { return um > dx; }
+        if (M) { return ux > dm; }
+        return dx <= dm ? ux > dm : um > dx;
+    }
+
+    // in x's block
+    if (set_get(&bx->live_out, m_gvn)) { return true; }
+
+    // in m's block: x live-out of it is enough — m's last use there (at
+    // least its own definition) is past the block's entry
+    if (pc_lv_has(ra->pc_lv_out, ra->pc_lv_out_start[x_gvn], ra->pc_lv_out_start[x_gvn + 1], (uint32_t)(c - ctx->cfg.blocks))) { return true; }
+
+    bool x_lo_bx = set_get(&bx->live_out, x_gvn);
+    if (x_lo_bx || c < bx) {
+        FOR_USERS(u, m) {
+            TB_Node* un = USERN(u);
+            if (USERI(u) < un->input_count && scheduled[un->gvn] == bx && ra->order[un->gvn] > dx) { return true; }
+        }
+    }
+
+    // in m's block
+    if (bx < c || set_get(&c->live_out, m_gvn)) {
+        FOR_USERS(u, x) {
+            TB_Node* un = USERN(u);
+            if (USERI(u) < un->input_count && scheduled[un->gvn] == c && ra->order[un->gvn] > dm) { return true; }
+        }
+    }
+    return false;
+}
+
+// the member-by-member test on pc_pair
+static bool pc_set_direct(Ctx* restrict ctx, Rogers* restrict ra, TB_Node** arr, size_t cnt, TB_Node* other) {
+    uint32_t other_gvn = other->gvn;
+    FOR_N(j, 0, cnt) {
+        if (pc_pair(ctx, ra, arr[j], arr[j]->gvn, other, other_gvn)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// does `other` interfere with some member of the coalesce set `arr`
+static bool pc_set_interferes(Ctx* restrict ctx, Rogers* restrict ra, TB_Node** arr, size_t cnt, TB_Node* other) {
+    TB_BasicBlock** scheduled = ctx->f->scheduled;
+    TB_BasicBlock* blocks = ctx->cfg.blocks;
+    uint32_t og = other->gvn;
+    TB_BasicBlock* c = scheduled[og];
+
+    bool fast = cnt >= PC_SET_MIN && ra->pc_liv_ok && c != NULL &&
+        other->type != TB_PROJ && og < ra->pc_lv_count;
+    if (fast) {
+        FOR_N(i, 0, cnt) {
+            TB_Node* x = arr[i];
+            if (x == other || x->type == TB_NULL || x->gvn >= ra->pc_lv_count || scheduled[x->gvn] == NULL) {
+                fast = false;
+                break;
+            }
+        }
+    }
+
+    bool got = false;
+    PCSetInfo* info = NULL;
+    // TB_PC_STATS=1: table / one member / several members
+    ra->pc_stat[14] += fast, ra->pc_stat[15] += !fast && cnt == 1, ra->pc_stat[16] += !fast && cnt > 1;
+    if (fast) {
+        uint32_t cid = (uint32_t)(c - blocks);
+        int32_t ordm = ra->order[og];
+
+        uint32_t leader = (uint32_t)uf_find(ra->uf, ra->uf_len, arr[0]->gvn);
+        if (ra->pc_sets == NULL) {
+            ra->pc_sets = tb_arena_alloc(ra->arena, ctx->f->node_count * sizeof(PCSetInfo*));
+            memset(ra->pc_sets, 0, ctx->f->node_count * sizeof(PCSetInfo*));
+        }
+        PCSetInfo* found = ra->pc_sets[leader];
+        if (found == NULL) {
+            found = pc_set_info(ctx, ra, arr, cnt);
+            ra->pc_sets[leader] = found;
+        }
+        info = found;
+
+        int32_t len = (int32_t)aarray_length(c->items);
+        bool thru = set_get(&c->live_out, og);
+
+        // other's last use in its own block
+        int32_t um = thru ? len : ordm;
+        if (!thru) {
+            FOR_USERS(u, other) {
+                TB_Node* un = USERN(u);
+                if (USERI(u) < un->input_count && scheduled[un->gvn] == c && ra->order[un->gvn] > um) {
+                    um = ra->order[un->gvn];
+                }
+            }
+        }
+
+        // the members of C: the in-block ranges
+        int bi = pc_u32_find(info->blk, info->nblk, cid);
+        if (bi >= 0) {
+            uint32_t s = info->nd_at[bi], n = info->nd_at[bi + 1] - s;
+            if (thru) {
+                got = info->min_lo[bi] != INT_MAX || (n > 0 && info->npu[s + n - 1] > ordm);
+            } else {
+                got = info->min_lo[bi] < um;
+                // the members defined no later than other
+                size_t lo = 0, hi = n;
+                while (lo < hi) {
+                    size_t mid = lo + (hi - lo) / 2;
+                    if (info->nd[s + mid] <= ordm) { lo = mid + 1; } else { hi = mid; }
+                }
+                if (!got && lo > 0) { got = info->npu[s + lo - 1] > ordm; }
+                if (!got && lo < n) { got = info->nd[s + lo] < um; }
+            }
+            // the phis of a block are all defined at its entry
+            if (!got && other->type == TB_PHI && info->mphi[bi]) { got = true; }
+        }
+
+        // T2: a member of another block is live-out of C — enough on its own
+        if (!got && pc_u32_find(info->lout, info->nlout, cid) >= 0) {
+            got = true;
+        }
+
+        // T1: the shorter of the two lists is walked
+        size_t from = ra->pc_lv_out_start[og], to = ra->pc_lv_out_start[og + 1];
+        if (!got && to - from <= info->nblk) {
+            FOR_N(t, from, to) {
+                uint32_t b = ra->pc_lv_out[t];
+                if (b != cid && pc_u32_find(info->blk, info->nblk, b) >= 0) { got = true; break; }
+            }
+        } else if (!got) {
+            FOR_N(i, 0, info->nblk) {
+                if (info->blk[i] != cid && pc_u32_find(ra->pc_lv_out + from, to - from, info->blk[i]) >= 0) { got = true; break; }
+            }
+        }
+
+        // T3
+        if (!got) {
+            FOR_USERS(u, other) {
+                TB_Node* un = USERN(u);
+                if (USERI(u) >= un->input_count) { continue; }
+                TB_BasicBlock* ub = scheduled[un->gvn];
+                if (ub == c) { continue; }
+                int i = pc_u32_find(info->blk, info->nblk, (uint32_t)(ub - blocks));
+                if (i < 0) { continue; }
+                int32_t lim = c < ub ? info->min_all[i] : info->min_lo[i];
+                if (lim < ra->order[un->gvn]) { got = true; break; }
+            }
+        }
+
+        // T4
+        if (!got) {
+            int i = pc_u32_find(info->ublk, info->nuse, cid);
+            if (i >= 0) {
+                int32_t mx = info->umax_before[i];
+                if (thru && info->umax_after[i] > mx) { mx = info->umax_after[i]; }
+                got = mx > ordm;
+            }
+        }
+    } else {
+        got = pc_set_direct(ctx, ra, arr, cnt, other);
+    }
+
+    if (pc_audit_enabled()) {
+        ra->pc_set_checked++;
+        bool ref = pc_set_ref(ctx, ra, arr, cnt, other);
+        if (ref != got) {
+            ra->pc_set_bad++;
+            fprintf(stderr, "[pc-audit] %s: set interference other=%%%u (blk=%td order=%d live-out=%d) members=%zu: direct=%d indexed=%d\n",
+                ctx->f->super.name, og, c ? c - blocks : (ptrdiff_t)-1, ra->order[og], (int)set_get(&c->live_out, og), cnt, ref, got);
+        }
+        got = ref;
+    }
+    return got;
+}
+
 // PATCH(odin-tilde): pre-colored vregs skip every interference check (the
 // wake-time conflict fix runs later and only for register classes), but the
 // splits between rounds stretch intervals, so a carried-over color can land on
@@ -2687,8 +3207,6 @@ static void pc_narrow_candidates(Ctx* restrict ctx, Rogers* restrict ra, int cla
     // another block, or this one above n: live-in or live-out of bb (a value
     // of bb defined at or after n is met by the window below)
     pc_live_list(ctx, ra, bb);
-    ra->pc_stat[12] += ra->pc_live_len;
-    ra->pc_stat[13] += future->count;
     FOR_N(t, 0, ra->pc_live_len) {
         uint32_t g = ra->pc_live[t];
         bool here = scheduled[g] == bb;
@@ -2817,7 +3335,7 @@ static bool pc_sleeper_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t og, i
         return false;
     }
 
-    if (sure || sets_interfere(ctx, ra, cnt, set, other)) {
+    if (sure || pc_set_interferes(ctx, ra, set, cnt, other)) {
         *out_other = o;
         return true;
     }
@@ -2846,7 +3364,7 @@ static bool pc_fixed_conflicts(Ctx* ctx, Rogers* ra, int class, uint32_t i, int 
         }
     }
     FOR_N(k, 0, ocnt) {
-        if (oset[k]->type != TB_NULL && sets_interfere(ctx, ra, cnt, set, oset[k])) {
+        if (oset[k]->type != TB_NULL && pc_set_interferes(ctx, ra, set, cnt, oset[k])) {
             *out_other = o;
             return true;
         }
@@ -3049,23 +3567,9 @@ static bool pc_sleeper_hits(Ctx* restrict ctx, Rogers* restrict ra, int def_clas
     }
     if (sure) { return true; }
 
-    TB_BasicBlock** scheduled = ctx->f->scheduled;
-    int* order = ra->order;
-
-    // inlined form of the "interfere()" function because speed reasons
-    TB_BasicBlock* other_block = scheduled[other_gvn];
-    FOR_N(j, 0, cnt) {
-        uint32_t lhs_gvn = arr[j]->gvn;
-        TB_BasicBlock* lhs_block = scheduled[lhs_gvn];
-
-        if (interfere_in_block(ctx->cfg.blocks, order, scheduled, ra, arr[j], other, lhs_gvn, other_gvn, lhs_block)) {
-            return true;
-        }
-        if (lhs_block != other_block && interfere_in_block(ctx->cfg.blocks, order, scheduled, ra, other, arr[j], other_gvn, lhs_gvn, other_block)) {
-            return true;
-        }
-    }
-    return false;
+    // PATCH(odin-tilde): the inlined interfere() loop over the members is
+    // pc_set_direct now; big sets are answered from their tables
+    return pc_set_interferes(ctx, ra, arr, cnt, other);
 }
 
 static void pc_sleeper_block(Ctx* restrict ctx, Rogers* restrict ra, uint64_t* ra_mask, uint32_t other_gvn) {
@@ -3097,6 +3601,141 @@ static void pc_sleepers_full(Ctx* restrict ctx, Rogers* restrict ra, int def_cla
             if (record) {
                 pc_push(ra->arena, (void**)&ra->pc_ref, &ra->pc_ref_len, &ra->pc_ref_cap, sizeof(uint32_t), &other_gvn);
             }
+            pc_sleeper_block(ctx, ra, ra_mask, other_gvn);
+        }
+    }
+}
+
+// a list of gvns in the round's arena
+typedef struct { uint32_t* v; uint32_t len, cap; } PCList;
+
+static void pc_list_push(TB_Arena* arena, PCList* list, uint32_t g) {
+    pc_push(arena, (void**)&list->v, &list->len, &list->cap, sizeof(uint32_t), &g);
+}
+
+// ---- allocate_reg: the sleepers a value that is not "narrow" can meet ----------
+//
+// PATCH(odin-tilde): a value that does not die inside its block, or is a phi
+// or a projection, took the original scan: every sleeper of the class, a
+// pair test each (named_xml_entity_to_rune: 14.8M pair tests per compile for
+// 7.9K queries).
+//
+// A sleeper m, defined in block C, can meet the value x of block B only
+// where (see pc_pair):
+//   C == B:  m is defined in B;
+//   C != B:  m is live-out of B, or
+//            x is live-out of C, or
+//            m is used in B past x (m's block lies after B, or x is
+//            live-out of B), or
+//            x is used in C past m's definition (m is live-out of C, or B
+//            lies before C).
+// The candidates are taken loosely around those — every definition of B, of
+// the blocks x is live-out of, and before x's uses where it has any; the
+// uses of B above x; the vregs live-out of B — and the scan's own test
+// decides each one. They are visited in the scan's order, the stack from
+// its top, so potential_spills and ra_mask come out the same.
+// TB_PC_AUDIT=1 runs the scan as well and compares, hit by hit.
+static inline void pc_rng_take(Rogers* ra, SparseSet* future, uint32_t* cand, size_t* nc, uint32_t stamp, uint32_t g) {
+    if (ra->pc_rng_seen[g] != stamp) {
+        ra->pc_rng_seen[g] = stamp;
+        if (future->array[g] >= 0) { cand[(*nc)++] = g; }
+    }
+}
+
+static _Thread_local const int* pc_rng_key;
+static int pc_rng_cmp(const void* a, const void* b) {
+    // the scan starts at the top of the stack
+    int x = pc_rng_key[*(const uint32_t*)a];
+    int y = pc_rng_key[*(const uint32_t*)b];
+    return x > y ? -1 : x < y;
+}
+
+// can the tables answer for the coalesce set `arr`?
+static bool pc_rng_applies(Ctx* restrict ctx, Rogers* restrict ra, TB_Node** arr, size_t cnt) {
+    return cnt == 1 && ra->pc_def_at != NULL && ra->pc_use_at != NULL && ra->pc_rng_seen != NULL &&
+        ctx->f->node_count <= ra->pc_lv_count && arr[0]->gvn < ra->pc_lv_count && ctx->f->scheduled[arr[0]->gvn] != NULL;
+}
+
+static void pc_sleepers_range(Ctx* restrict ctx, Rogers* restrict ra, int def_class, RegMask* mask, uint64_t* ra_mask, TB_Node** arr, PCList* rec) {
+    TB_BasicBlock** scheduled = ctx->f->scheduled;
+    TB_BasicBlock* blocks = ctx->cfg.blocks;
+    SparseSet* future = &ra->future_active[def_class];
+    TB_Node* x = arr[0];
+    uint32_t xg = x->gvn;
+    TB_BasicBlock* bx = scheduled[xg];
+    size_t bid = (size_t)(bx - blocks);
+    size_t len = aarray_length(bx->items);
+    int32_t dx = ra->order[xg];
+
+    // no sleeper is listed twice, and only sleepers are listed
+    size_t need = aarray_length(future->stack) + 1;
+    if (ra->pc_rng_cap < need) {
+        size_t cap = ra->pc_rng_cap ? ra->pc_rng_cap * 2 : 256;
+        if (cap < need) { cap = need; }
+        ra->pc_rng = tb_arena_alloc(ra->arena, cap * sizeof(uint32_t));
+        ra->pc_rng_cap = cap;
+    }
+    uint32_t* cand = ra->pc_rng;
+    size_t nc = 0;
+    if (++ra->pc_rng_stamp == 0) {
+        memset(ra->pc_rng_seen, 0, ra->pc_lv_count * sizeof(uint32_t));
+        ra->pc_rng_stamp = 1;
+    }
+    uint32_t stamp = ra->pc_rng_stamp;
+
+    // the definitions of x's block, and the uses in it above x
+    FOR_N(t, ra->pc_def_at[bid], ra->pc_def_at[bid + 1]) { pc_rng_take(ra, future, cand, &nc, stamp, ra->pc_def[t]); }
+    size_t item = ra->pc_use_blk[bid] + (size_t)(dx - 1 < 0 ? 0 : dx - 1 < (int32_t)len ? dx - 1 : (int32_t)len - 1);
+    FOR_N(t, ra->pc_use_base[bid], ra->pc_use_at[item]) { pc_rng_take(ra, future, cand, &nc, stamp, ra->pc_use[t]); }
+
+    // the vregs live-out of x's block
+    FOR_N(t, ra->pc_lout_at[bid], pc_lout_end(ra, bid)) { pc_rng_take(ra, future, cand, &nc, stamp, ra->pc_liv[t]); }
+
+    // the definitions of the blocks x is live-out of
+    FOR_N(t, ra->pc_lv_out_start[xg], ra->pc_lv_out_start[xg + 1]) {
+        uint32_t c = ra->pc_lv_out[t];
+        FOR_N(s, ra->pc_def_at[c], ra->pc_def_at[c + 1]) { pc_rng_take(ra, future, cand, &nc, stamp, ra->pc_def[s]); }
+    }
+
+    // the definitions before x's uses in the other blocks
+    FOR_USERS(u, x) {
+        TB_Node* un = USERN(u);
+        if (USERI(u) >= un->input_count) { continue; }
+        TB_BasicBlock* ub = scheduled[un->gvn];
+        if (ub == NULL || ub == bx) { continue; }
+        uint32_t c = (uint32_t)(ub - blocks);
+        int32_t ou = ra->order[un->gvn];
+        FOR_N(s, ra->pc_def_at[c], ra->pc_def_at[c + 1]) {
+            if (ra->pc_def_ord[s] < ou) { pc_rng_take(ra, future, cand, &nc, stamp, ra->pc_def[s]); }
+        }
+    }
+
+    // the stack order the scan had
+    if (nc > 1) {
+        const int* key = future->array;
+        if (nc <= 24) {
+            for (size_t i = 1; i < nc; i++) {
+                uint32_t g = cand[i];
+                size_t k = i;
+                while (k > 0 && key[cand[k - 1]] < key[g]) { cand[k] = cand[k - 1]; k--; }
+                cand[k] = g;
+            }
+        } else {
+            pc_rng_key = key;
+            qsort(cand, nc, sizeof(uint32_t), pc_rng_cmp);
+        }
+    }
+
+    FOR_N(t, 0, nc) {
+        uint32_t other_gvn = cand[t];
+        if (ra->gvn2node[other_gvn] == NULL) {
+            sparse_set_remove(future, other_gvn);
+            ra->pc_audit_stale++;
+            continue;
+        }
+
+        if (pc_sleeper_hits(ctx, ra, def_class, mask, ra_mask, other_gvn, arr, 1, false)) {
+            if (rec) { pc_list_push(ra->arena, rec, other_gvn); }
             pc_sleeper_block(ctx, ra, ra_mask, other_gvn);
         }
     }
@@ -3275,6 +3914,13 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
                         pc_sleeper_block(ctx, ra, got_mask, c.gvn);
                     }
                 }
+            } else if (pc_rng_applies(ctx, ra, arr, cnt)) {
+                // the range candidates (pc_sleepers_range) against the scan
+                PCList got = { 0 };
+                pc_sleepers_range(ctx, ra, def_class, mask, got_mask, arr, &got);
+                FOR_N(t, 0, got.len) {
+                    pc_push(ra->arena, (void**)&ra->pc_got, &ra->pc_got_len, &ra->pc_got_cap, sizeof(uint32_t), &got.v[t]);
+                }
             } else {
                 FOR_N(t, 0, ra->pc_ref_len) {
                     uint32_t g = ra->pc_ref[t];
@@ -3320,6 +3966,11 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
                     pc_sleeper_block(ctx, ra, ra_mask, c.gvn);
                 }
             }
+        } else if (pc_rng_applies(ctx, ra, arr, cnt)) {
+            // PATCH(odin-tilde): only the sleepers defined in, before or
+            // around where the value lives (see pc_sleepers_range); the scan
+            // went through all of them
+            pc_sleepers_range(ctx, ra, def_class, mask, ra_mask, arr, NULL);
         } else {
             pc_sleepers_full(ctx, ra, def_class, mask, ra_mask, arr, cnt, false);
         }
@@ -3564,6 +4215,91 @@ static void pc_liv_build(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* arena
     ra->pc_lv_in_start = in_start;
     ra->pc_lv_out_start = out_start;
     ra->pc_lv_count = node_count;
+    ra->pc_liv_ok = true;
+    ra->pc_sets = NULL;
+    ra->pc_clob_stamp = 0;
+    ra->pc_clob_cand = NULL;
+    ra->pc_clob_cap = 0;
+    ra->pc_clob_seen = tb_arena_alloc(arena, node_count * sizeof(uint32_t));
+    memset(ra->pc_clob_seen, 0, node_count * sizeof(uint32_t));
+
+    // the uses: for each block, its items from the last down, and for each
+    // item the vreg inputs it has, past the control input. A phi's inputs
+    // count where the phi sits (last_use_in_bb does the same) although the
+    // walk does not start them there.
+    size_t items = 0, uses = 0;
+    FOR_N(k, 0, ctx->bb_count) {
+        TB_BasicBlock* bb = &ctx->cfg.blocks[k];
+        items += aarray_length(bb->items);
+        FOR_N(j, 0, aarray_length(bb->items)) {
+            TB_Node* n = bb->items[j];
+            FOR_N(t, 1, n->input_count) {
+                TB_Node* in = n->inputs[t];
+                uses += in != NULL && ctx->vreg_map[in->gvn] > 0;
+            }
+        }
+    }
+    ra->pc_use_items = items;
+    ra->pc_use = tb_arena_alloc(arena, (uses + 1) * sizeof(uint32_t));
+    ra->pc_use_at = tb_arena_alloc(arena, (items + 1) * sizeof(uint32_t));
+    ra->pc_use_blk = tb_arena_alloc(arena, (ctx->bb_count + 1) * sizeof(uint32_t));
+    ra->pc_use_base = tb_arena_alloc(arena, ctx->bb_count * sizeof(uint32_t));
+    size_t u = 0, at = 0;
+    FOR_N(k, 0, ctx->bb_count) {
+        TB_BasicBlock* bb = &ctx->cfg.blocks[k];
+        size_t len = aarray_length(bb->items);
+        ra->pc_use_blk[k] = (uint32_t)at;
+        ra->pc_use_base[k] = (uint32_t)u;
+        FOR_REV_N(j, 0, len) {
+            // the items above are already in
+            ra->pc_use_at[at + j] = (uint32_t)u;
+            TB_Node* n = bb->items[j];
+            FOR_N(t, 1, n->input_count) {
+                TB_Node* in = n->inputs[t];
+                if (in != NULL && ctx->vreg_map[in->gvn] > 0) { ra->pc_use[u++] = in->gvn; }
+            }
+        }
+        at += len;
+    }
+    ra->pc_use_blk[ctx->bb_count] = (uint32_t)at;
+    ra->pc_use_at[at] = (uint32_t)u;
+}
+
+// PATCH(odin-tilde): the vreg definitions of each block, in ordinal order —
+// the sleepers a value can meet are defined in its block, in the blocks it
+// is live-out of, and in the blocks it has uses in (see pc_sleepers_range).
+// Runs after compute_areas, which numbers the items.
+static void pc_defs_build(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* arena) {
+    size_t ndefs = 0;
+    FOR_N(k, 0, ctx->bb_count) {
+        TB_BasicBlock* bb = &ctx->cfg.blocks[k];
+        FOR_N(j, 0, aarray_length(bb->items)) {
+            ndefs += ctx->vreg_map[bb->items[j]->gvn] > 0;
+        }
+    }
+    ra->pc_def = tb_arena_alloc(arena, (ndefs + 1) * sizeof(uint32_t));
+    ra->pc_def_ord = tb_arena_alloc(arena, (ndefs + 1) * sizeof(int32_t));
+    ra->pc_def_at = tb_arena_alloc(arena, (ctx->bb_count + 1) * sizeof(uint32_t));
+    size_t d = 0;
+    FOR_N(k, 0, ctx->bb_count) {
+        TB_BasicBlock* bb = &ctx->cfg.blocks[k];
+        ra->pc_def_at[k] = (uint32_t)d;
+        FOR_N(j, 0, aarray_length(bb->items)) {
+            TB_Node* n = bb->items[j];
+            if (ctx->vreg_map[n->gvn] > 0) {
+                ra->pc_def[d] = n->gvn;
+                ra->pc_def_ord[d] = ra->order[n->gvn];
+                d++;
+            }
+        }
+    }
+    ra->pc_def_at[ctx->bb_count] = (uint32_t)d;
+
+    ra->pc_rng_stamp = 0;
+    ra->pc_rng_cap = 0;
+    ra->pc_rng = NULL;
+    ra->pc_rng_seen = tb_arena_alloc(arena, ctx->f->node_count * sizeof(uint32_t));
+    memset(ra->pc_rng_seen, 0, ctx->f->node_count * sizeof(uint32_t));
 }
 
 // Probably slow...
@@ -3678,6 +4414,148 @@ static void compute_areas(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     }
 }
 
+// ---- the sleepers a clobber reaches ----------------------------------------
+//
+// PATCH(odin-tilde): at every item with a kill mask the coloring walk went
+// through the whole sleeper stack of the class — for a big function
+// thousands of sleepers, two bitset tests each, for every call — and took
+// an array as long as the stack off the tmp arena, to find the few sleepers
+// that are live there and hold a clobbered register.
+//
+// ra->live only ever holds what the walk starts at the uses above the item
+// and what it carries in from the block's live-out (the block head expires
+// everything else), so those are the candidates: the block's uses above the
+// item (pc_use, which lists a phi's inputs too — more candidates, put
+// through the same test) and its live-out vregs (pc_liv). They are visited
+// in stack order and go through the same test, so the list comes out the
+// same. TB_PC_AUDIT=1 walks the stack as well and compares.
+
+// is `gvn` a sleeper the kill reaches? then *out_id is its vreg
+static bool pc_sleeper_clobbered(Ctx* restrict ctx, Rogers* restrict ra, TB_BasicBlock* bb, int kill_class, RegMask* kill, uint32_t gvn, int* out_id) {
+    if (!set_get(&ra->live, gvn) && !set_get(&bb->live_out, gvn)) {
+        return false;
+    }
+
+    int svreg_id = ctx->vreg_map[gvn];
+    if (svreg_id <= 0 || set_get(&ra->been_spilled, svreg_id)) {
+        return false;
+    }
+
+    VReg* svreg = &ctx->vregs[svreg_id];
+    if (svreg->class == kill_class && svreg->assigned >= 0 && within_reg_mask(kill, svreg->assigned)) {
+        *out_id = svreg_id;
+        return true;
+    }
+    return false;
+}
+
+// the vregs of the sleepers the kill mask reaches at item `pos` of block
+// `bb_id`; *out_list is scratch from the tmp arena
+static _Thread_local const int* pc_clob_key;
+static int pc_clob_cmp(const void* a, const void* b) {
+    int x = pc_clob_key[*(const uint32_t*)a];
+    int y = pc_clob_key[*(const uint32_t*)b];
+    return x < y ? -1 : x > y;
+}
+
+static size_t pc_clobbered_sleepers(Ctx* restrict ctx, Rogers* restrict ra, size_t bb_id, size_t pos, int kill_class, RegMask* kill, int** out_list) {
+    TB_BasicBlock* bb = &ctx->cfg.blocks[bb_id];
+    SparseSet* fut = &ra->future_active[kill_class];
+
+    // the walk over the whole stack: what is used when the round's tables
+    // do not apply, and the reference under TB_PC_AUDIT=1
+    bool audit = pc_audit_enabled();
+    bool indexed = ra->pc_use_at != NULL && ra->pc_use_blk != NULL && ctx->f->node_count <= ra->pc_lv_count;
+    int* ref = NULL;
+    size_t ref_n = 0;
+    if (audit || !indexed) {
+        ref = tb_arena_alloc(&ctx->f->tmp_arena, (aarray_length(fut->stack) + 1) * sizeof(int));
+        aarray_for(i, fut->stack) {
+            int id;
+            if (pc_sleeper_clobbered(ctx, ra, bb, kill_class, kill, fut->stack[i], &id)) { ref[ref_n++] = id; }
+        }
+        if (!indexed) {
+            *out_list = ref;
+            return ref_n;
+        }
+    }
+
+    // the candidates, each once, among the sleepers of the class
+    size_t item = ra->pc_use_blk[bb_id] + pos;
+    size_t above = ra->pc_use_at[item] - ra->pc_use_base[bb_id];
+    size_t lout = pc_lout_end(ra, bb_id) - ra->pc_lout_at[bb_id];
+    size_t need = above + lout + 1;
+    if (ra->pc_clob_cap < need) {
+        size_t cap = ra->pc_clob_cap ? ra->pc_clob_cap * 2 : 256;
+        if (cap < need) { cap = need; }
+        ra->pc_clob_cand = tb_arena_alloc(ra->arena, cap * sizeof(uint32_t));
+        ra->pc_clob_cap = cap;
+    }
+    uint32_t* cand = ra->pc_clob_cand;
+    size_t nc = 0;
+    if (++ra->pc_clob_stamp == 0) {
+        memset(ra->pc_clob_seen, 0, ra->pc_lv_count * sizeof(uint32_t));
+        ra->pc_clob_stamp = 1;
+    }
+    uint32_t stamp = ra->pc_clob_stamp;
+    FOR_N(t, 0, above) {
+        uint32_t g = ra->pc_use[ra->pc_use_base[bb_id] + t];
+        if (ra->pc_clob_seen[g] != stamp) {
+            ra->pc_clob_seen[g] = stamp;
+            if (fut->array[g] >= 0) { cand[nc++] = g; }
+        }
+    }
+    FOR_N(t, ra->pc_lout_at[bb_id], pc_lout_end(ra, bb_id)) {
+        uint32_t g = ra->pc_liv[t];
+        if (ra->pc_clob_seen[g] != stamp) {
+            ra->pc_clob_seen[g] = stamp;
+            if (fut->array[g] >= 0) { cand[nc++] = g; }
+        }
+    }
+
+    // the stack order the walk had
+    if (nc > 1) {
+        const int* key = fut->array;
+        if (nc <= 24) {
+            for (size_t i = 1; i < nc; i++) {
+                uint32_t g = cand[i];
+                size_t k = i;
+                while (k > 0 && key[cand[k - 1]] > key[g]) { cand[k] = cand[k - 1]; k--; }
+                cand[k] = g;
+            }
+        } else {
+            pc_clob_key = key;
+            qsort(cand, nc, sizeof(uint32_t), pc_clob_cmp);
+        }
+    }
+
+    size_t n = 0;
+    int* out = tb_arena_alloc(&ctx->f->tmp_arena, ((nc > ref_n ? nc : ref_n) + 1) * sizeof(int));
+    FOR_N(t, 0, nc) {
+        int id;
+        if (pc_sleeper_clobbered(ctx, ra, bb, kill_class, kill, cand[t], &id)) {
+            // a register reserved twice is split once
+            bool dup = false;
+            FOR_N(i, 0, n) {
+                if (out[i] == id) { dup = true; break; }
+            }
+            if (!dup) { out[n++] = id; }
+        }
+    }
+
+    if (audit) {
+        ra->pc_clob_checked++;
+        if (n != ref_n || memcmp(out, ref, n * sizeof(int)) != 0) {
+            ra->pc_clob_bad++;
+            fprintf(stderr, "[pc-audit] %s: clobber sleepers blk=%zu item=%zu class=%d: walk=%zu indexed=%zu\n", ctx->f->super.name, bb_id, pos, kill_class, ref_n, n);
+            memcpy(out, ref, ref_n * sizeof(int));
+            n = ref_n;
+        }
+    }
+    *out_list = out;
+    return n;
+}
+
 static void expire_interval(Ctx* ctx, Rogers* restrict ra, TB_Node* n, size_t bb_i, int vreg_id);
 static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* arena) {
     size_t arena_size_start = tb_arena_current_size(arena);
@@ -3742,6 +4620,8 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     ra->pc_pre = tb_arena_alloc(arena, ctx->bb_count * sizeof(uint32_t*));
     ra->pc_pre_len = tb_arena_alloc(arena, ctx->bb_count * sizeof(uint32_t));
     ra->pc_pre_cap = tb_arena_alloc(arena, ctx->bb_count * sizeof(uint32_t));
+    ra->pc_pre_in = tb_arena_alloc(arena, ctx->f->node_count * sizeof(int32_t));
+    memset(ra->pc_pre_in, 0, ctx->f->node_count * sizeof(int32_t));
     memset(ra->pc_pre, 0, ctx->bb_count * sizeof(uint32_t*));
     memset(ra->pc_pre_len, 0, ctx->bb_count * sizeof(uint32_t));
     memset(ra->pc_pre_cap, 0, ctx->bb_count * sizeof(uint32_t));
@@ -3795,6 +4675,7 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     // Compute areas (probably slow...)
     pc_liv_build(ctx, ra, arena);
     compute_areas(ctx, ra, arena);
+    pc_defs_build(ctx, ra, arena);
 
     // PATCH(odin-tilde): expire_interval used to test, for every node it
     // ends, every block before the node's own — O(blocks) cache misses per
@@ -4123,41 +5004,13 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
                 // across this point whose reserved register is clobbered
                 // and split it around the clobber, like an active occupant.
                 {
-                    SparseSet* fut = &ra->future_active[kill_class];
-                    // PATCH(odin-tilde): sized to the actual sleeper stack.
-                    // Was int sleepers[32] with a TB_ASSERT bound, justified
-                    // by "reserved registers are unique per vreg" — but split
-                    // insertion can leave stale duplicate reservations (the
-                    // TILDE FIX wake-conflict case), and in release builds
-                    // the assert compiles out, so the 33rd sleeper smashed
-                    // the stack and corrupted RA state nondeterministically.
-                    int* sleepers = tb_arena_alloc(&ctx->f->tmp_arena,
-                        (aarray_length(fut->stack) + 1) * sizeof(int));
-                    size_t num_sleepers = 0;
-                    aarray_for(i, fut->stack) {
-                        uint32_t gvn = fut->stack[i];
-                        if (!set_get(&ra->live, gvn) && !set_get(&bb->live_out, gvn)) {
-                            continue;
-                        }
-
-                        int svreg_id = ctx->vreg_map[gvn];
-                        if (svreg_id <= 0 || set_get(&ra->been_spilled, svreg_id)) {
-                            continue;
-                        }
-
-                        VReg* svreg = &ctx->vregs[svreg_id];
-                        if (svreg->class == kill_class && svreg->assigned >= 0 &&
-                            within_reg_mask(kills[k], svreg->assigned)) {
-                            bool dup = false;
-                            FOR_N(j, 0, num_sleepers) {
-                                if (sleepers[j] == svreg_id) { dup = true; break; }
-                            }
-                            if (!dup) {
-                                TB_ASSERT(num_sleepers < aarray_length(fut->stack) + 1);
-                                sleepers[num_sleepers++] = svreg_id;
-                            }
-                        }
-                    }
+                    // PATCH(odin-tilde): only the sleepers the walk can have
+                    // started above this item, or carried in from the block's
+                    // live-out, can be live here (see pc_clobbered_sleepers);
+                    // it used to walk the whole sleeper stack, and take an
+                    // array as long as it off the tmp arena.
+                    int* sleepers;
+                    size_t num_sleepers = pc_clobbered_sleepers(ctx, ra, bb_id, j, kill_class, kills[k], &sleepers);
 
                     FOR_N(i, 0, num_sleepers) {
                         TB_OPTDEBUG(REGALLOC)(printf("#       \x1b[33mSPILLING SLEEPER V%u (CLOBBERED BY %%%u)\x1b[0m\n", sleepers[i], n->gvn));
@@ -4216,8 +5069,15 @@ static bool allocate_loop(Ctx* restrict ctx, Rogers* restrict ra, TB_Arena* aren
     ra->pc_slept = NULL;
     ra->pc_fxbits = NULL;
     ra->pc_pre = NULL;
+    ra->pc_pre_in = NULL;
     ra->pc_fx_slot = NULL;
     ra->pc_min_lo = NULL;
+    // the lists are still read by the splitter, but no more interference
+    // query may trust them
+    ra->pc_liv_ok = false;
+    ra->pc_use_at = NULL;
+    ra->pc_use_blk = NULL;
+    ra->pc_def_at = NULL;
     ra->pc_last_walk = false;
     ra->pc_walk_bb = SIZE_MAX;
     return dyn_array_length(ra->splits) == 0;
