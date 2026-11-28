@@ -1935,6 +1935,79 @@ static bool a64_stores_sp_slot(uint32_t insn, int off) {
     return false;
 }
 
+// PATCH(odin-tilde): the two loop knives below only see the instruction
+// stream, so they have to tell a real loop from a merge point that is entered
+// by a jump from a sibling arm laid out after it. Two facts decide that.
+//
+// 1. An unconditional backward branch at i is the back edge of the loop
+//    [h, i) only if control gets from h to i inside [h, i). runtime@arena_
+//    temp_end's search loop exits through `mov w0,#1; b join`; the arm sat
+//    after the join, promote_invariant_slots read that jump as "second
+//    iteration", parked the spill reloads right before the join, and the arm
+//    skipped them: the free loop then walked whatever the caller had left in
+//    x19..x23 (odin-infer's serve hung in arena_temp_end). Forward walk from
+//    h, confined to [h, i]; targets outside are loop exits.
+static bool a64_latch_reached_from_head(uint32_t* w, int nins, int h, int i) {
+    if (h < 0 || i >= nins || h > i) return false;
+    int n = i - h + 1;
+    uint8_t* seen = calloc((size_t)n, 1);
+    int* queue = malloc(sizeof(int) * (size_t)n);
+    if (!seen || !queue) { free(seen); free(queue); return false; }
+    int qn = 0, qh = 0, ok = 0;
+    queue[qn++] = h;
+    seen[0] = 1;
+    for (; qh < qn && !ok; qh++) {
+        int k = queue[qh];
+        if (k == i) { ok = 1; break; }
+        uint32_t insn = w[k];
+        int nexts[2], nn = 0;
+        if ((insn & 0xFC000000u) == 0x14000000u) {
+            nexts[nn++] = a64_b_target(k, insn, false);
+        } else if ((insn & 0xFF000010u) == 0x54000000u) {
+            nexts[nn++] = k + 1;
+            nexts[nn++] = a64_b_target(k, insn, true);
+        } else if ((insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u) {
+            // cbz/cbnz, tbz/tbnz share b.cond's imm19 layout
+            nexts[nn++] = k + 1;
+            nexts[nn++] = a64_b_target(k, insn, true);
+        } else if ((insn & 0xFFFFFC1Fu) == 0xD61F0000u) {
+            goto done; // br: wherever it goes, we cannot tell
+        } else if (insn != 0xD65F03C0u) {
+            nexts[nn++] = k + 1;
+        }
+        for (int t = 0; t < nn; t++) {
+            if (nexts[t] < h || nexts[t] > i || seen[nexts[t] - h]) continue;
+            seen[nexts[t] - h] = 1;
+            queue[qn++] = nexts[t];
+        }
+    }
+    done:
+    free(seen);
+    free(queue);
+    return ok;
+}
+
+// 2. Code placed just before a loop head is skipped by every entry that
+//    JUMPS to the head instead of falling into it. True when some branch
+//    outside [from, to] lands inside [from, to]; the branch at `to` itself is
+//    the back edge and does not count.
+static bool a64_jumped_into_from_outside(uint32_t* w, int nins, int from, int to) {
+    for (int k = 0; k < nins; k++) {
+        if (k >= from && k <= to) continue;
+        uint32_t insn = w[k];
+        int tgt = -1;
+        if ((insn & 0xFC000000u) == 0x14000000u) {
+            tgt = a64_b_target(k, insn, false);
+        } else if ((insn & 0xFF000010u) == 0x54000000u || (insn & 0x7E000000u) == 0x34000000u || (insn & 0x7E000000u) == 0x36000000u) {
+            tgt = a64_b_target(k, insn, true);
+        } else {
+            continue;
+        }
+        if (tgt >= from && tgt <= to) return true;
+    }
+    return false;
+}
+
 static void a64_hoist_sp_reloads(TB_CGEmitter* e) {
     if (e->count < 16 || (e->count & 3u)) return;
     int nins = (int)(e->count / 4);
@@ -1945,6 +2018,12 @@ static void a64_hoist_sp_reloads(TB_CGEmitter* e) {
         int start = a64_b_target(i, b, false);
         if (start < 0 || start >= i || i - start > 48) continue;
         if (start == 0 || w[start - 1] != 0xD503201Fu) continue;
+        // PATCH(odin-tilde): the reload moves to the NOP before the head, so
+        // the loop must be entered by falling into the head and nowhere else
+        // (see a64_jumped_into_from_outside); and the branch must really be
+        // a back edge (see a64_latch_reached_from_head).
+        if (!a64_latch_reached_from_head(w, nins, start, i)) continue;
+        if (a64_jumped_into_from_outside(w, nins, start, i - 1)) continue;
         int slot = start - 1;
         for (int j = start; j < i; j++) {
             uint32_t insn = w[j];
@@ -3620,6 +3699,12 @@ static void a64_promote_invariant_slots(TB_CGEmitter* e) {
         bool call = false;
         for (int k = h; k < i; k++) if ((w[k] & 0xFC000000u) == 0x94000000u) call = true;
         if (!call) continue;
+        // PATCH(odin-tilde): the parked loads go in right before h and the
+        // branch at i is treated as the back edge, so i must be reached from
+        // h and nothing may jump into [h, i) from outside (see the two
+        // helpers above a64_hoist_sp_reloads).
+        if (!a64_latch_reached_from_head(w, nins, h, i)) continue;
+        if (a64_jumped_into_from_outside(w, nins, h, i - 1)) continue;
         int nld = 0;
         for (int k = h; k < i; k++) {
             uint32_t in = w[k];
