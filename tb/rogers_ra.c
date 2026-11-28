@@ -3868,6 +3868,18 @@ static bool allocate_reg(Ctx* ctx, Rogers* ra, TB_Node* n) {
         if (nr % 64) {
             ra_mask[nr / 64] &= UINT64_MAX >> (64ull - (nr % 64));
         }
+        // PATCH(odin-tilde): the stack class keeps growing while allocating
+        // (stk_new_slot), but ctx->num_regs[REG_CLASS_STK] and with it nr stay
+        // at the size from the prologue, and the scratch is arena memory that
+        // is never cleared. Every word past the old size was whatever the
+        // previous query left behind, so which stack slots looked busy
+        // depended on earlier traffic through the same memory: the same
+        // function came out with a frame 8 or 16 bytes bigger on some runs
+        // than on others (runtime@print_type, runtime@write_write_type).
+        // Past the reserved prefix a slot is free until the active mask or a
+        // sleeper blocks it. Register classes never reach this loop: for
+        // them the bound is mask_word_count itself.
+        FOR_N(j, (nr + 63) / 64, mask_word_count) { ra_mask[j] = 0; }
     }
 
     // interfere live things

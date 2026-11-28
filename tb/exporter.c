@@ -165,6 +165,13 @@ ExportList tb_module_layout_sections(TB_Module* m) {
             qsort(sec->globals, dyn_array_length(sec->globals), sizeof(TB_Symbol*), compare_symbols);
         }
 
+        // Same story for the externs: they are collected in symbol-table
+        // order, i.e. the order parallel codegen happened to create them in,
+        // and every object writer emits the import entries in this order.
+        CUIK_TIMED_BLOCK("sort externs") {
+            qsort(externals, dyn_array_length(externals), sizeof(TB_External*), compare_symbols);
+        }
+
         // layout
         CUIK_TIMED_BLOCK_ARGS("layout", sec->name) {
             // place functions first
@@ -216,6 +223,14 @@ ExportList tb_module_layout_sections(TB_Module* m) {
 size_t tb_helper_write_section(TB_Module* m, size_t write_pos, TB_ModuleSection* section, uint8_t* output, uint32_t pos) {
     assert(write_pos == pos);
     uint8_t* data = &output[pos];
+
+    // the alignment padding between globals (and the gap before the first
+    // one) belongs to no init object, and the output buffer is arena memory:
+    // whatever an earlier user left there went into the object file, so the
+    // same program linked to a different binary now and then (two stray bytes
+    // in map_probe's __DATA). Globals themselves are still zeroed below, the
+    // single memset here covers everything that is not written afterwards.
+    memset(data, 0, section->total_size);
 
     // place functions
     dyn_array_for(i, section->funcs) {
